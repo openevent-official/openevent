@@ -1,0 +1,18 @@
+grpc:
+  listen_addr: "0.0.0.0:9527"
+
+admin:
+  listen_addr: "127.0.0.1:9528"
+
+storage:
+  metadata_path: "/var/lib/openevent/meta"
+
+store:
+  rocksdb:
+    path: "/var/lib/openevent/messages"
+
+limits:
+  max_payload_bytes: 16777216
+
+log:
+  level: "info"
