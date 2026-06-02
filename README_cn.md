@@ -2,11 +2,27 @@
 
 [English version](README.md)
 
-OpenEvent 是一个基于 gRPC 的事件通道服务，适用于需要全局有序事件流和
-Channel 级访问控制的应用。
+OpenEvent 是面向 AI Agent 系统的基础设施，核心组件是一条有序消息队列，系统中的各个模块统一连接到这条消息队列，从而获得全局一致的事件队列。
 
-服务端提供消息发布、历史消息拉取、新消息订阅、Channel 管理和 token 管理
-接口。共享的 Protocol Buffers 协议和 SDK 文档位于 `openevent-sdk` 子模块。
+围绕这条队列，OpenEvent 提供了一组现成的可插拔模块。开发者可以先用这些模块快速搭建
+一个可运行、易调试的 Agent，再按业务场景逐步替换 IM 接入、模型代理、Agent 策略或查看面板。
+
+## 可插拔模块
+
+| 模块 | 项目 | 作用 |
+| --- | --- | --- |
+| IM 模块 | [openevent-modules-im](https://github.com/openevent-official/openevent-modules-im) | 定义 IM payload 协议，提供 IM 同步 worker，把外部会话接入 OpenEvent。 |
+| Model Proxy | [openevent-modules-model-proxy](https://github.com/openevent-official/openevent-modules-model-proxy) | 对接 OpenAI 兼容模型 provider，把模型请求和结果写入事件队列。 |
+| OpenEvent View | [openevent-view](https://github.com/openevent-official/openevent-view) | 查询 OpenEvent 中的事件记录。 |
+
+## 快速搭建一个 Agent Demo
+
+[openevent-agent-demo](https://github.com/openevent-official/openevent-agent-demo)
+已经把 OpenEvent、IM 模块、model-proxy、Agent 进程和 OpenEvent View 组合成一套本地运行环境，
+适合用来验证模块边界、调试事件链路，并作为业务 Agent 的起点。
+
+这个 demo 展示了 OpenEvent 推荐的模块边界：IM 事件、模型请求、模型结果、Agent WAL
+和最终回复都会写入同一条 OpenEvent 事件队列。
 
 ## 特性
 
@@ -116,7 +132,7 @@ cmake --install build --prefix /opt/openevent
 
 ## 配置
 
-服务端启动时必须传入一个有效的 YAML 配置文件路径；配置文件不存在或不是普通文件时，
+服务端启动时必须传入一个有效的 YAML 配置文件路径；配置文件缺失或类型无效时，
 服务端会拒绝启动。
 
 配置示例、字段说明和部署注意事项见 [配置说明](docs/CONFIG_cn.md)。
@@ -174,4 +190,4 @@ SDK 的构建、安装和测试说明见
 
 OpenEvent 仍处于早期阶段。公开 API 行为以
 [SDK API 契约](https://github.com/openevent-official/openevent-sdk/blob/main/docs/API_cn.md)
-为准；调用方应依赖文档化的 gRPC 契约，而不是服务端实现细节。
+为准；调用方应依赖文档化的 gRPC 契约，避免依赖服务端实现细节。

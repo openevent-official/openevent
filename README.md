@@ -2,12 +2,33 @@
 
 [中文版](README_cn.md)
 
-OpenEvent is a gRPC-based event channel service for applications that need a
-globally ordered event stream and channel-level access control.
+OpenEvent is infrastructure for AI Agent systems. Its core component is an
+ordered message queue. Modules in the system connect to this queue and share one
+globally consistent event stream.
 
-The server provides message publishing, historical fetch, live subscription,
-channel management, and token management APIs. The shared Protocol Buffers
-schema and SDK documentation live in the `openevent-sdk` submodule.
+Around this queue, OpenEvent provides a set of ready-made, pluggable modules.
+You can quickly build a running, debuggable Agent, then replace the IM
+integration, model proxy, Agent strategy, or view panel according to your
+business needs.
+
+## Pluggable Modules
+
+| Module | Project | Purpose |
+| --- | --- | --- |
+| IM module | [openevent-modules-im](https://github.com/openevent-official/openevent-modules-im) | Defines the IM payload protocol, provides an IM sync worker, and connects external conversations to OpenEvent. |
+| Model Proxy | [openevent-modules-model-proxy](https://github.com/openevent-official/openevent-modules-model-proxy) | Connects OpenAI-compatible model providers and writes model requests and results to the event queue. |
+| OpenEvent View | [openevent-view](https://github.com/openevent-official/openevent-view) | Queries event records stored in OpenEvent. |
+
+## Build An Agent Demo Quickly
+
+[openevent-agent-demo](https://github.com/openevent-official/openevent-agent-demo)
+combines OpenEvent, the IM module, model-proxy, an Agent process, and OpenEvent
+View into one local runtime. It is suitable for validating module boundaries,
+debugging event chains, and serving as the starting point for a business Agent.
+
+This demo shows OpenEvent's recommended module boundary: IM events, model
+requests, model results, Agent WAL records, and final replies are all written to
+the same OpenEvent event queue.
 
 ## Features
 
