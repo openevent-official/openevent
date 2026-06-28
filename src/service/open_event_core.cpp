@@ -184,7 +184,7 @@ Status OpenEventCore::PublishCommitted(uint64_t principal,
         return recipients_status;
     }
 
-    Message message;
+    EventMessage message;
     message.set_seq(seq);
     message.set_channel_id(channel_id);
     message.set_principal(principal);
@@ -233,6 +233,7 @@ Status OpenEventCore::Fetch(const FetchRequest& request, FetchResponse* response
     }
 
     return FetchVisible(request.principal(), request.from_seq(), request.limit(), request.only_my_recipient(),
+                        request.channels(),
                         response);
 }
 
@@ -240,6 +241,7 @@ Status OpenEventCore::FetchVisible(uint64_t principal,
                                    uint64_t from_seq,
                                    uint32_t limit,
                                    bool only_my_recipient,
+                                   const google::protobuf::RepeatedField<uint64_t>& channels,
                                    FetchResponse* response)
 {
     auto max_seq_result = metadata_->GetMaxSeq();
@@ -248,9 +250,9 @@ Status OpenEventCore::FetchVisible(uint64_t principal,
     }
     const uint64_t max_seq = max_seq_result.value();
     response->clear_messages();
+    response->set_last_seq(max_seq);
 
     if (from_seq == 0 || from_seq > max_seq) {
-        response->set_has_more(false);
         response->set_next_seq(max_seq + 1);
         return Status::Ok();
     }
@@ -286,7 +288,12 @@ Status OpenEventCore::FetchVisible(uint64_t principal,
                 return seq_for_offset.status();
             }
             if (seq_for_offset.value().has_value() && seq_for_offset.value().value() == seq) {
-                const Message& message = stored.message;
+                const EventMessage& message = stored.message;
+                if (!channels.empty() && !Contains(channels, message.channel_id())) {
+                    ++seq;
+                    next_seq = seq;
+                    continue;
+                }
                 auto channel_result = LoadChannel(message.channel_id());
                 if (!channel_result.ok()) {
                     return channel_result.status();
@@ -303,7 +310,6 @@ Status OpenEventCore::FetchVisible(uint64_t principal,
     }
 
     response->set_next_seq(next_seq);
-    response->set_has_more(next_seq <= max_seq);
     return Status::Ok();
 }
 
@@ -557,7 +563,7 @@ Status OpenEventCore::RecoverPending()
         if (!message_result.value().has_value()) {
             return Status(grpc::StatusCode::INTERNAL, "pending message missing");
         }
-        const Message& message = message_result.value().value();
+        const EventMessage& message = message_result.value().value();
         if (message.seq() != seq) {
             return Status(grpc::StatusCode::INTERNAL, "pending message seq mismatch");
         }
@@ -663,12 +669,12 @@ Status OpenEventCore::ValidateRecipients(const ChannelInfo& channel,
     return Status::Ok();
 }
 
-bool OpenEventCore::HasRecipient(const Message& message, uint64_t principal) const
+bool OpenEventCore::HasRecipient(const EventMessage& message, uint64_t principal) const
 {
     return Contains(message.recipients(), principal);
 }
 
-bool OpenEventCore::SameMessage(const Message& lhs, const Message& rhs) const
+bool OpenEventCore::SameMessage(const EventMessage& lhs, const EventMessage& rhs) const
 {
     if (lhs.seq() != rhs.seq() || lhs.channel_id() != rhs.channel_id() || lhs.principal() != rhs.principal() ||
         lhs.payload() != rhs.payload() || lhs.ts_ms() != rhs.ts_ms() || lhs.recipients_size() != rhs.recipients_size()) {

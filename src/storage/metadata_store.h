@@ -33,11 +33,11 @@ public:
     Result<uint64_t> GetMinSeq() const;
     Result<uint64_t> GetNextChannelId() const;
 
-    Status PutPendingMessage(uint64_t seq, const ::openevent::Message& message);
+    Status PutPendingMessage(uint64_t seq, const ::openevent::EventMessage& message);
     Status PutPendingOffset(uint64_t seq, uint64_t offset);
     Status CommitMessage(uint64_t seq, uint64_t offset, uint64_t channel_id, uint64_t timestamp_ms);
     Result<std::vector<uint64_t>> ListPendingSeqs() const;
-    Result<std::optional<::openevent::Message>> GetPendingMessage(uint64_t seq) const;
+    Result<std::optional<::openevent::EventMessage>> GetPendingMessage(uint64_t seq) const;
     Result<std::optional<uint64_t>> GetPendingOffset(uint64_t seq) const;
 
     Result<std::optional<uint64_t>> GetOffsetForSeq(uint64_t seq) const;

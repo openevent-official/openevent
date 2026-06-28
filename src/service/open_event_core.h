@@ -26,7 +26,11 @@ public:
     Status Publish(const PublishRequest& request, PublishResponse* response);
     Status PublishAutoSeq(const PublishAutoSeqRequest& request, PublishAutoSeqResponse* response);
     Status Fetch(const FetchRequest& request, FetchResponse* response);
-    Status FetchVisible(uint64_t principal, uint64_t from_seq, uint32_t limit, bool only_my_recipient,
+    Status FetchVisible(uint64_t principal,
+                        uint64_t from_seq,
+                        uint32_t limit,
+                        bool only_my_recipient,
+                        const google::protobuf::RepeatedField<uint64_t>& channels,
                         FetchResponse* response);
 
     Status CreateChannel(const CreateChannelRequest& request, CreateChannelResponse* response);
@@ -57,8 +61,8 @@ private:
     bool IsMember(const ChannelInfo& channel, uint64_t principal) const;
     Status ValidateRecipients(const ChannelInfo& channel,
                               const google::protobuf::RepeatedField<uint64_t>& recipients) const;
-    bool HasRecipient(const Message& message, uint64_t principal) const;
-    bool SameMessage(const Message& lhs, const Message& rhs) const;
+    bool HasRecipient(const EventMessage& message, uint64_t principal) const;
+    bool SameMessage(const EventMessage& lhs, const EventMessage& rhs) const;
     ChannelInfo SystemChannel() const;
     Status ValidateVisibility(Visibility visibility) const;
     Status ValidateFilter(ChannelFilter filter) const;

@@ -106,7 +106,8 @@ void TestPublishFetch()
     Check(response.messages(0).ts_ms() <= after_publish_ms,
           "expected server timestamp to be captured before publish returned");
     Check(response.next_seq() == 2, "expected next_seq 2");
-    Check(!response.has_more(), "expected no more data");
+    Check(response.last_seq() == 1, "expected last_seq 1");
+    Check(response.next_seq() > response.last_seq(), "expected no more data");
 
     std::filesystem::remove_all(root);
 }
@@ -154,6 +155,7 @@ void TestPrivateAcl()
     Check(status.ok(), status.message());
     Check(response.messages_size() == 0, "private message must be filtered");
     Check(response.next_seq() == 2, "next_seq should still advance globally");
+    Check(response.last_seq() == 1, "last_seq should report committed tail");
 
     openevent::AddMemberRequest add;
     add.set_principal(100);
@@ -168,6 +170,44 @@ void TestPrivateAcl()
     status = core->Fetch(fetch, &response);
     Check(status.ok(), status.message());
     Check(response.messages_size() == 1, "member should see private message");
+
+    std::filesystem::remove_all(root);
+}
+
+void TestFetchChannelFilter()
+{
+    const auto root = std::filesystem::temp_directory_path() / "openevent_core_fetch_channels";
+    std::filesystem::remove_all(root);
+    auto core = MakeCore(root);
+
+    std::string token = AddToken(*core, 100);
+    uint64_t first_channel_id = CreateChannel(*core, 100, token, openevent::VISIBILITY_PUBLIC);
+    uint64_t second_channel_id = CreateChannel(*core, 100, token, openevent::VISIBILITY_PUBLIC);
+    PublishAuto(*core, 100, token, first_channel_id, "first-channel");
+    PublishAuto(*core, 100, token, second_channel_id, "second-channel");
+
+    openevent::FetchRequest fetch;
+    fetch.set_principal(100);
+    fetch.set_token(token);
+    fetch.set_from_seq(1);
+    fetch.set_limit(10);
+    fetch.add_channels(first_channel_id);
+
+    openevent::FetchResponse response;
+    openevent::Status status = core->Fetch(fetch, &response);
+    Check(status.ok(), status.message());
+    Check(response.messages_size() == 1, "channel filter should return one message");
+    Check(response.messages(0).channel_id() == first_channel_id, "channel filter should keep first channel");
+    Check(response.messages(0).payload() == "first-channel", "channel filter should keep first payload");
+    Check(response.next_seq() == 3, "channel filter should still advance globally");
+    Check(response.last_seq() == 2, "last_seq should report committed tail");
+
+    fetch.clear_channels();
+    response.Clear();
+    status = core->Fetch(fetch, &response);
+    Check(status.ok(), status.message());
+    Check(response.messages_size() == 2, "empty channel filter should return all visible messages");
+    Check(response.last_seq() == 2, "empty channel filter last_seq");
 
     std::filesystem::remove_all(root);
 }
@@ -372,7 +412,7 @@ void TestRecoverPending()
         auto messages = openevent::RocksDBMessageStore::Open((root / "messages").string());
         Check(messages.ok(), messages.status().message());
 
-        openevent::Message message;
+        openevent::EventMessage message;
         message.set_seq(1);
         message.set_channel_id(1);
         message.set_principal(100);
@@ -405,7 +445,7 @@ void TestRecoverPendingWithBadOffset()
         auto messages = openevent::RocksDBMessageStore::Open((root / "messages").string());
         Check(messages.ok(), messages.status().message());
 
-        openevent::Message message;
+        openevent::EventMessage message;
         message.set_seq(1);
         message.set_channel_id(1);
         message.set_principal(100);
@@ -459,6 +499,7 @@ int main()
     TestPublishFetch();
     TestCasAbort();
     TestPrivateAcl();
+    TestFetchChannelFilter();
     TestRecipientFilter();
     TestRecipientMustBeChannelMember();
     TestPayloadLimit();

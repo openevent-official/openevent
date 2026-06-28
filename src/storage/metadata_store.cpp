@@ -93,7 +93,7 @@ Result<uint64_t> MetadataStore::GetNextChannelId() const
     return GetUint64(kNextChannelIdKey);
 }
 
-Status MetadataStore::PutPendingMessage(uint64_t seq, const ::openevent::Message& message)
+Status MetadataStore::PutPendingMessage(uint64_t seq, const ::openevent::EventMessage& message)
 {
     std::string payload;
     if (!message.SerializeToString(&payload)) {
@@ -143,22 +143,22 @@ Result<std::vector<uint64_t>> MetadataStore::ListPendingSeqs() const
     return seqs;
 }
 
-Result<std::optional<::openevent::Message>> MetadataStore::GetPendingMessage(uint64_t seq) const
+Result<std::optional<::openevent::EventMessage>> MetadataStore::GetPendingMessage(uint64_t seq) const
 {
     std::string value;
     rocksdb::Status status = db_->Get(rocksdb::ReadOptions(), PaddedKey(kPendingMessagePrefix, seq), &value);
     if (status.IsNotFound()) {
-        return std::optional<::openevent::Message>{};
+        return std::optional<::openevent::EventMessage>{};
     }
     if (!status.ok()) {
         return RocksToStatus(status, "read pending message");
     }
 
-    ::openevent::Message message;
+    ::openevent::EventMessage message;
     if (!message.ParseFromString(value)) {
         return Status(grpc::StatusCode::INTERNAL, "parse pending message failed");
     }
-    return std::optional<::openevent::Message>{std::move(message)};
+    return std::optional<::openevent::EventMessage>{std::move(message)};
 }
 
 Result<std::optional<uint64_t>> MetadataStore::GetPendingOffset(uint64_t seq) const

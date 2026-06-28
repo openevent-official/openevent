@@ -63,7 +63,7 @@ Result<uint64_t> RocksDBMessageStore::GetMaxOffset() const
     return DecodeUint64(value);
 }
 
-Result<uint64_t> RocksDBMessageStore::Append(const ::openevent::Message& message)
+Result<uint64_t> RocksDBMessageStore::Append(const ::openevent::EventMessage& message)
 {
     std::lock_guard<std::mutex> lock(mu_);
 

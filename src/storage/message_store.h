@@ -10,7 +10,7 @@ namespace openevent {
 
 struct StoredMessage {
     uint64_t offset = 0;
-    ::openevent::Message message;
+    ::openevent::EventMessage message;
 };
 
 struct FetchRecordsResult {
@@ -22,7 +22,7 @@ class MessageStore {
 public:
     virtual ~MessageStore() = default;
 
-    virtual Result<uint64_t> Append(const ::openevent::Message& message) = 0;
+    virtual Result<uint64_t> Append(const ::openevent::EventMessage& message) = 0;
     virtual Result<FetchRecordsResult> Fetch(uint64_t from_offset, uint32_t limit) = 0;
 };
 

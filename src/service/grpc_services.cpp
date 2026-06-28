@@ -65,9 +65,11 @@ grpc::Status EventServiceImpl::Subscribe(grpc::ServerContext* context,
         return grpc::Status::OK;
     }
 
+    google::protobuf::RepeatedField<uint64_t> channels;
     while (!context->IsCancelled()) {
         FetchResponse batch;
-        Status status = core_->FetchVisible(request->principal(), next_seq, 100, request->only_my_recipient(), &batch);
+        Status status = core_->FetchVisible(request->principal(), next_seq, 100, request->only_my_recipient(), channels,
+                                           &batch);
         if (!status.ok()) {
             return ToGrpcStatus(status);
         }
@@ -81,7 +83,7 @@ grpc::Status EventServiceImpl::Subscribe(grpc::ServerContext* context,
         }
 
         next_seq = batch.next_seq();
-        if (!batch.has_more()) {
+        if (batch.next_seq() > batch.last_seq()) {
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
         }
     }
