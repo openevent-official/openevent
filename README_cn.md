@@ -13,6 +13,7 @@ OpenEvent 是面向 AI Agent 系统的基础设施，核心组件是一条有序
 | --- | --- | --- |
 | IM 模块 | [openevent-modules-im](https://github.com/openevent-official/openevent-modules-im) | 定义 IM payload 协议，提供 IM 同步 worker，把外部会话接入 OpenEvent。 |
 | Model Proxy | [openevent-modules-model-proxy](https://github.com/openevent-official/openevent-modules-model-proxy) | 对接 OpenAI 兼容模型 provider，把模型请求和结果写入事件队列。 |
+| Cmd 模块 | [openevent-modules-cmd](https://github.com/openevent-official/openevent-modules-cmd) | 定义 `cmd.v1` 命令执行协议，提供 Linux 本地命令执行 worker，把命令请求、执行结果和输出查询写入事件队列。 |
 | OpenEvent View | [openevent-view](https://github.com/openevent-official/openevent-view) | 查询 OpenEvent 中的事件记录。 |
 
 ## 快速搭建一个 Agent Demo

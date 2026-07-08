@@ -17,6 +17,7 @@ business needs.
 | --- | --- | --- |
 | IM module | [openevent-modules-im](https://github.com/openevent-official/openevent-modules-im) | Defines the IM payload protocol, provides an IM sync worker, and connects external conversations to OpenEvent. |
 | Model Proxy | [openevent-modules-model-proxy](https://github.com/openevent-official/openevent-modules-model-proxy) | Connects OpenAI-compatible model providers and writes model requests and results to the event queue. |
+| Cmd module | [openevent-modules-cmd](https://github.com/openevent-official/openevent-modules-cmd) | Defines the `cmd.v1` command execution protocol, provides a Linux local command execution worker, and writes command requests, execution results, and output queries to the event queue. |
 | OpenEvent View | [openevent-view](https://github.com/openevent-official/openevent-view) | Queries event records stored in OpenEvent. |
 
 ## Build An Agent Demo Quickly
