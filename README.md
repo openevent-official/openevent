@@ -54,7 +54,9 @@ openevent/
 └── openevent-sdk/
     ├── docs/API.md
     ├── docs/USAGE.md
-    └── proto/openevent.proto
+    └── proto/
+        ├── admin.proto
+        └── openevent.proto
 ```
 
 ## Build
@@ -185,7 +187,8 @@ repository for SDK build, installation, and test instructions.
 - [Configuration](docs/CONFIG.md)
 - [API](docs/API.md)
 - [SDK repository](https://github.com/openevent-official/openevent-sdk)
-- [Protocol definition](https://github.com/openevent-official/openevent-sdk/blob/main/proto/openevent.proto)
+- [Business protocol definition](https://github.com/openevent-official/openevent-sdk/blob/main/proto/openevent.proto)
+- [Admin protocol definition](https://github.com/openevent-official/openevent-sdk/blob/main/proto/admin.proto)
 - [Python SDK](https://github.com/openevent-official/openevent-sdk/blob/main/README.md)
 - [Python SDK usage](https://github.com/openevent-official/openevent-sdk/blob/main/docs/USAGE.md)
 - [SDK API contract](https://github.com/openevent-official/openevent-sdk/blob/main/docs/API.md)

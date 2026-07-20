@@ -19,17 +19,13 @@ admin:
   listen_addr: "127.0.0.1:9528"
 
 storage:
-  metadata_path: "/var/lib/openevent/meta"
-
-store:
-  rocksdb:
-    path: "/var/lib/openevent/messages"
+  path: "/var/lib/openevent/data"
 
 limits:
   max_payload_bytes: 16777216
 
-log:
-  level: "info"
+shutdown:
+  grace_seconds: 10
 ```
 
 ## Fields
@@ -44,21 +40,17 @@ log:
 
 - `listen_addr`: string, default `127.0.0.1:9528`.
 - `AdminService` listen address.
-- Must not be empty.
+- Must not be empty and must differ from `grpc.listen_addr`.
 
 ### `storage`
 
-- `metadata_path`: string, no default, must be explicitly configured.
-- Server metadata storage path.
-- Must not be empty. The server creates the directory if it does not exist; the
-  runtime user must have write permission to the parent directory.
-
-### `store.rocksdb`
-
 - `path`: string, no default, must be explicitly configured.
-- Event data storage path.
-- Must not be empty. The server creates the directory if it does not exist; the
-  runtime user must have write permission to the parent directory.
+- The only RocksDB data directory. Metadata and messages use separate
+  Column Families in the same DB.
+- Must not be empty. A first deployment uses a missing or empty new directory;
+  the server initializes a missing directory, and the runtime user must have
+  write permission to its parent. Later starts accept only the complete target
+  schema.
 
 ### `limits`
 
@@ -66,12 +58,19 @@ log:
 - Maximum size of a single message `payload`.
 - `Publish` and `PublishAutoSeq` return `RESOURCE_EXHAUSTED` when the payload
   exceeds this limit.
+- Both gRPC servers derive their send/receive hard limit from
+  `max_payload_bytes + 2 MiB`, capped at the largest value accepted by gRPC.
+  Fetch and administrative message pages use a separate soft response budget of
+  `max_payload_bytes + 1 MiB`.
 - Must be greater than 0.
 
-### `log`
+### `shutdown`
 
-- `level`: string, example `info`.
-- Log level.
+- `grace_seconds`: unsigned integer, default `10`.
+- Grace period used after `SIGINT` or `SIGTERM`. Both gRPC servers stop accepting
+  new calls and drain in-flight calls until this deadline; any RPC that remains
+  active, including streaming calls, is then cancelled before storage is closed.
+- Must be greater than 0.
 
 ## Security Notes
 
@@ -84,8 +83,7 @@ log:
 
 - Place the config file under `/etc/openevent/openevent-server.yaml` or an
   equivalent deployment-managed path.
-- Use absolute data paths, for example `/var/lib/openevent/meta` and
-  `/var/lib/openevent/messages`.
+- Use an absolute data path, for example `/var/lib/openevent/data`.
 - The service user must be able to read the config file and create/write the
   configured data directories.
 
@@ -96,6 +94,7 @@ log:
 - `config path is not a regular file: <path>`
 - `grpc.listen_addr must not be empty`
 - `admin.listen_addr must not be empty`
-- `storage.metadata_path must not be empty`
-- `store.rocksdb.path must not be empty`
+- `grpc.listen_addr and admin.listen_addr must be different`
+- `storage.path must not be empty`
 - `limits.max_payload_bytes must be greater than 0`
+- `shutdown.grace_seconds must be greater than 0`

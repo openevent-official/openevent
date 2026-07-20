@@ -48,7 +48,9 @@ openevent/
 └── openevent-sdk/
     ├── docs/API.md
     ├── docs/USAGE.md
-    └── proto/openevent.proto
+    └── proto/
+        ├── admin.proto
+        └── openevent.proto
 ```
 
 ## 构建
@@ -174,7 +176,8 @@ SDK 的构建、安装和测试说明见
 - [配置说明](docs/CONFIG_cn.md)
 - [API 说明](docs/API_cn.md)
 - [SDK 仓库](https://github.com/openevent-official/openevent-sdk)
-- [协议定义](https://github.com/openevent-official/openevent-sdk/blob/main/proto/openevent.proto)
+- [业务协议定义](https://github.com/openevent-official/openevent-sdk/blob/main/proto/openevent.proto)
+- [管理协议定义](https://github.com/openevent-official/openevent-sdk/blob/main/proto/admin.proto)
 - [Python SDK](https://github.com/openevent-official/openevent-sdk/blob/main/README_cn.md)
 - [Python SDK 使用指南](https://github.com/openevent-official/openevent-sdk/blob/main/docs/USAGE_cn.md)
 - [SDK API 契约](https://github.com/openevent-official/openevent-sdk/blob/main/docs/API_cn.md)

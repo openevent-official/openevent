@@ -1,7 +1,6 @@
 #include "service/grpc_services.h"
 
 #include <chrono>
-#include <thread>
 
 namespace openevent {
 namespace {
@@ -45,31 +44,31 @@ grpc::Status EventServiceImpl::Subscribe(grpc::ServerContext* context,
                                          const SubscribeRequest* request,
                                          grpc::ServerWriter<SubscribeResponse>* writer)
 {
-    Status auth = core_->Authenticate(request->principal(), request->token());
-    if (!auth.ok()) {
-        return ToGrpcStatus(auth);
-    }
-
-    auto max_seq = core_->MaxSeq();
-    if (!max_seq.ok()) {
-        return ToGrpcStatus(max_seq.status());
+    uint64_t max_seq = 0;
+    Status start_status = core_->GetSubscriptionMaxSeq(request->principal(), request->token(), &max_seq);
+    if (!start_status.ok()) {
+        return ToGrpcStatus(start_status);
     }
 
     uint64_t next_seq = request->from_seq();
     if (next_seq == 0) {
-        next_seq = max_seq.value() + 1;
-    } else if (next_seq > max_seq.value()) {
+        next_seq = max_seq + 1;
+    } else if (next_seq > max_seq) {
         SubscribeResponse response;
-        response.set_next_seq(max_seq.value() + 1);
+        response.set_next_seq(max_seq + 1);
         writer->Write(response);
         return grpc::Status::OK;
     }
 
-    google::protobuf::RepeatedField<uint64_t> channels;
     while (!context->IsCancelled()) {
+        const uint64_t observed_generation = core_->CommitGeneration();
         FetchResponse batch;
-        Status status = core_->FetchVisible(request->principal(), next_seq, 100, request->only_my_recipient(), channels,
-                                           &batch);
+        Status status = core_->FetchSubscriptionBatch(request->principal(),
+                                                      request->token(),
+                                                      next_seq,
+                                                      100,
+                                                      request->only_my_recipient(),
+                                                      &batch);
         if (!status.ok()) {
             return ToGrpcStatus(status);
         }
@@ -84,7 +83,7 @@ grpc::Status EventServiceImpl::Subscribe(grpc::ServerContext* context,
 
         next_seq = batch.next_seq();
         if (batch.next_seq() > batch.last_seq()) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            core_->WaitForCommit(observed_generation, std::chrono::milliseconds(100));
         }
     }
 
@@ -147,6 +146,13 @@ grpc::Status AdminServiceImpl::ListTokens(grpc::ServerContext*,
                                           ListTokensResponse* response)
 {
     return ToGrpcStatus(core_->ListTokens(*request, response));
+}
+
+grpc::Status AdminServiceImpl::ListMessages(grpc::ServerContext*,
+                                            const ListMessagesRequest* request,
+                                            ListMessagesResponse* response)
+{
+    return ToGrpcStatus(core_->ListMessages(*request, response));
 }
 
 }  // namespace openevent

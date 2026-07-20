@@ -18,6 +18,8 @@ according to `openevent-sdk/README.md`.
 ## Contribution Guidelines
 
 - Keep the public API behavior aligned with `openevent-sdk/docs/API.md`.
+- Keep `openevent-sdk/proto/openevent.proto` and `openevent-sdk/proto/admin.proto`
+  aligned with their service boundaries and shared package types.
 - Do not depend on generated files that are not tracked by Git.
 - Keep build products, RocksDB data, temporary tokens, and logs out of commits.
 - Prefer small, verifiable changes with corresponding tests.

@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.20)
 
-project(OpenEvent VERSION 0.3.0 LANGUAGES CXX)
+project(OpenEvent VERSION 0.4.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -18,15 +18,21 @@ pkg_check_modules(YAMLCPP REQUIRED IMPORTED_TARGET yaml-cpp)
 find_program(GRPC_CPP_PLUGIN_EXECUTABLE grpc_cpp_plugin REQUIRED)
 
 set(OPENEVENT_PROTO "${CMAKE_CURRENT_SOURCE_DIR}/openevent-sdk/proto/openevent.proto")
+set(OPENEVENT_ADMIN_PROTO "${CMAKE_CURRENT_SOURCE_DIR}/openevent-sdk/proto/admin.proto")
+set(OPENEVENT_PROTO_FILES ${OPENEVENT_PROTO} ${OPENEVENT_ADMIN_PROTO})
 set(OPENEVENT_PROTO_GEN_DIR "${CMAKE_CURRENT_BINARY_DIR}/generated")
 file(MAKE_DIRECTORY "${OPENEVENT_PROTO_GEN_DIR}")
 
 set(OPENEVENT_PROTO_SRCS
     "${OPENEVENT_PROTO_GEN_DIR}/openevent.pb.cc"
-    "${OPENEVENT_PROTO_GEN_DIR}/openevent.grpc.pb.cc")
+    "${OPENEVENT_PROTO_GEN_DIR}/openevent.grpc.pb.cc"
+    "${OPENEVENT_PROTO_GEN_DIR}/admin.pb.cc"
+    "${OPENEVENT_PROTO_GEN_DIR}/admin.grpc.pb.cc")
 set(OPENEVENT_PROTO_HDRS
     "${OPENEVENT_PROTO_GEN_DIR}/openevent.pb.h"
-    "${OPENEVENT_PROTO_GEN_DIR}/openevent.grpc.pb.h")
+    "${OPENEVENT_PROTO_GEN_DIR}/openevent.grpc.pb.h"
+    "${OPENEVENT_PROTO_GEN_DIR}/admin.pb.h"
+    "${OPENEVENT_PROTO_GEN_DIR}/admin.grpc.pb.h")
 
 add_custom_command(
     OUTPUT ${OPENEVENT_PROTO_SRCS} ${OPENEVENT_PROTO_HDRS}
@@ -35,8 +41,8 @@ add_custom_command(
          --cpp_out ${OPENEVENT_PROTO_GEN_DIR}
          --grpc_out ${OPENEVENT_PROTO_GEN_DIR}
          --plugin=protoc-gen-grpc=${GRPC_CPP_PLUGIN_EXECUTABLE}
-         ${OPENEVENT_PROTO}
-    DEPENDS "${OPENEVENT_PROTO}"
+         ${OPENEVENT_PROTO_FILES}
+    DEPENDS ${OPENEVENT_PROTO_FILES}
     VERBATIM)
 
 add_library(openevent_proto ${OPENEVENT_PROTO_SRCS})
@@ -44,9 +50,7 @@ target_include_directories(openevent_proto PUBLIC "${OPENEVENT_PROTO_GEN_DIR}")
 target_link_libraries(openevent_proto PUBLIC protobuf::libprotobuf PkgConfig::GRPCPP)
 
 add_library(openevent_storage
-    src/storage/message_store.cpp
-    src/storage/metadata_store.cpp
-    src/storage/rocksdb_message_store.cpp)
+    src/storage/unified_storage.cpp)
 target_include_directories(openevent_storage PUBLIC src)
 target_link_libraries(openevent_storage
     PUBLIC openevent_proto

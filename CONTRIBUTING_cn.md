@@ -17,7 +17,8 @@ ctest --test-dir build --output-on-failure
 ## 贡献准则
 
 - 公开行为应记录在 `openevent-sdk/docs/API.md`。
-- 修改 gRPC 契约时，同步更新 `openevent-sdk/proto/openevent.proto`。
+- 修改 gRPC 契约时，按 service 边界同步更新 `openevent-sdk/proto/openevent.proto` 或
+  `openevent-sdk/proto/admin.proto`。
 - Python SDK 的 Protobuf 文件由 `openevent-sdk` 的 `make build` 和 `make test` 生成。
 - 行为变更应增加或更新测试。
 - 公开文档只描述使用方式、配置和 API 行为，避免记录内部设计和实现细节。

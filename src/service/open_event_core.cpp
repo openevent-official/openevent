@@ -4,13 +4,18 @@
 #include <cerrno>
 #include <chrono>
 #include <cstring>
+#include <iomanip>
+#include <limits>
 #include <sstream>
 #include <unordered_set>
+#include <utility>
 
 #include <sys/random.h>
 
 namespace openevent {
 namespace {
+
+constexpr size_t kResponseEnvelopeBytes = 1024 * 1024;
 
 uint64_t NowMs()
 {
@@ -20,33 +25,78 @@ uint64_t NowMs()
 
 Result<std::string> GenerateToken()
 {
-    uint8_t bytes[16] = {};
+    unsigned char bytes[16];
     size_t filled = 0;
     while (filled < sizeof(bytes)) {
-        const ssize_t n = getrandom(bytes + filled, sizeof(bytes) - filled, 0);
-        if (n < 0) {
+        ssize_t count = getrandom(bytes + filled, sizeof(bytes) - filled, 0);
+        if (count < 0) {
             if (errno == EINTR) {
                 continue;
             }
             return Status(grpc::StatusCode::INTERNAL, std::string("getrandom failed: ") + std::strerror(errno));
         }
-        filled += static_cast<size_t>(n);
+        filled += static_cast<size_t>(count);
     }
-
-    bytes[6] = static_cast<uint8_t>((bytes[6] & 0x0f) | 0x40);
-    bytes[8] = static_cast<uint8_t>((bytes[8] & 0x3f) | 0x80);
 
     std::ostringstream oss;
-    oss << std::hex << std::nouppercase;
-    oss.fill('0');
+    oss << std::hex << std::setfill('0');
     for (size_t i = 0; i < sizeof(bytes); ++i) {
-        if (i == 4 || i == 6 || i == 8 || i == 10) {
+        oss << std::setw(2) << static_cast<unsigned int>(bytes[i]);
+        if (i == 3 || i == 5 || i == 7 || i == 9) {
             oss << '-';
         }
-        oss.width(2);
-        oss << static_cast<unsigned>(bytes[i]);
     }
     return oss.str();
+}
+
+std::string EncodeTokenPageToken(const std::string& token)
+{
+    constexpr char kHex[] = "0123456789abcdef";
+    std::string encoded = "v1:";
+    encoded.reserve(encoded.size() + token.size() * 2);
+    for (unsigned char ch : token) {
+        encoded.push_back(kHex[ch >> 4]);
+        encoded.push_back(kHex[ch & 0x0f]);
+    }
+    return encoded;
+}
+
+int HexValue(char ch)
+{
+    if (ch >= '0' && ch <= '9') {
+        return ch - '0';
+    }
+    if (ch >= 'a' && ch <= 'f') {
+        return ch - 'a' + 10;
+    }
+    return -1;
+}
+
+Result<std::string> DecodeTokenPageToken(const std::string& page_token)
+{
+    if (page_token.empty()) {
+        return std::string{};
+    }
+
+    constexpr size_t kGeneratedTokenSize = 36;
+    constexpr char kPrefix[] = "v1:";
+    constexpr size_t kPrefixSize = sizeof(kPrefix) - 1;
+    if (page_token.size() != kPrefixSize + kGeneratedTokenSize * 2 ||
+        page_token.compare(0, kPrefixSize, kPrefix) != 0) {
+        return Status(grpc::StatusCode::INVALID_ARGUMENT, "invalid page_token");
+    }
+
+    std::string decoded;
+    decoded.reserve(kGeneratedTokenSize);
+    for (size_t i = kPrefixSize; i < page_token.size(); i += 2) {
+        const int high = HexValue(page_token[i]);
+        const int low = HexValue(page_token[i + 1]);
+        if (high < 0 || low < 0) {
+            return Status(grpc::StatusCode::INVALID_ARGUMENT, "invalid page_token");
+        }
+        decoded.push_back(static_cast<char>((high << 4) | low));
+    }
+    return decoded;
 }
 
 template <typename Repeated>
@@ -57,22 +107,36 @@ bool Contains(const Repeated& values, uint64_t value)
 
 }  // namespace
 
-OpenEventCore::OpenEventCore(std::unique_ptr<MetadataStore> metadata,
-                             std::unique_ptr<MessageStore> message_store,
-                             size_t max_payload_bytes)
-    : metadata_(std::move(metadata)),
-      message_store_(std::move(message_store)),
-      max_payload_bytes_(max_payload_bytes)
+OpenEventCore::OpenEventCore(std::unique_ptr<UnifiedStorage> storage,
+                             size_t max_payload_bytes,
+                             uint64_t max_scan_records,
+                             size_t response_soft_limit_bytes)
+    : storage_(std::move(storage)),
+      max_payload_bytes_(max_payload_bytes),
+      max_scan_records_(max_scan_records),
+      response_soft_limit_bytes_(
+          response_soft_limit_bytes == 0
+              ? (max_payload_bytes > std::numeric_limits<size_t>::max() - kResponseEnvelopeBytes
+                     ? std::numeric_limits<size_t>::max()
+                     : max_payload_bytes + kResponseEnvelopeBytes)
+              : response_soft_limit_bytes)
 {
 }
 
-Status OpenEventCore::Authenticate(uint64_t principal, const std::string& token) const
+Result<ReadSnapshot> OpenEventCore::CreateLinearizedSnapshot()
+{
+    std::lock_guard<std::mutex> lock(coordinator_mu_);
+    return storage_->CreateSnapshot();
+}
+
+Status OpenEventCore::Authenticate(const ReadSnapshot& snapshot,
+                                   uint64_t principal,
+                                   const std::string& token) const
 {
     if (token.empty()) {
         return Status(grpc::StatusCode::UNAUTHENTICATED, "token is required");
     }
-
-    auto result = metadata_->GetPrincipalForToken(token);
+    auto result = storage_->GetPrincipalForToken(snapshot, token);
     if (!result.ok()) {
         return result.status();
     }
@@ -84,12 +148,16 @@ Status OpenEventCore::Authenticate(uint64_t principal, const std::string& token)
 
 Status OpenEventCore::GetStatus(const GetStatusRequest& request, GetStatusResponse* response)
 {
-    Status auth = Authenticate(request.principal(), request.token());
+    auto snapshot_result = CreateLinearizedSnapshot();
+    if (!snapshot_result.ok()) {
+        return snapshot_result.status();
+    }
+    ReadSnapshot snapshot = std::move(snapshot_result.value());
+    Status auth = Authenticate(snapshot, request.principal(), request.token());
     if (!auth.ok()) {
         return auth;
     }
-
-    auto max_seq = metadata_->GetMaxSeq();
+    auto max_seq = storage_->GetMaxSeq(snapshot);
     if (!max_seq.ok()) {
         return max_seq.status();
     }
@@ -98,77 +166,19 @@ Status OpenEventCore::GetStatus(const GetStatusRequest& request, GetStatusRespon
     return Status::Ok();
 }
 
-Status OpenEventCore::Publish(const PublishRequest& request, PublishResponse*)
-{
-    const uint64_t ts_ms = NowMs();
-
-    Status auth = Authenticate(request.principal(), request.token());
-    if (!auth.ok()) {
-        return auth;
-    }
-    Status payload_status = ValidatePayloadSize(request.payload());
-    if (!payload_status.ok()) {
-        return payload_status;
-    }
-
-    std::lock_guard<std::mutex> lock(write_mu_);
-    auto max_seq = metadata_->GetMaxSeq();
-    if (!max_seq.ok()) {
-        return max_seq.status();
-    }
-    if (request.seq() != max_seq.value() + 1) {
-        return Status(grpc::StatusCode::ABORTED, "seq must equal max_seq + 1");
-    }
-
-    return PublishCommitted(request.principal(), request.channel_id(), request.seq(), request.recipients(),
-                            request.payload(), ts_ms);
-}
-
-Status OpenEventCore::PublishAutoSeq(const PublishAutoSeqRequest& request, PublishAutoSeqResponse* response)
-{
-    const uint64_t ts_ms = NowMs();
-
-    Status auth = Authenticate(request.principal(), request.token());
-    if (!auth.ok()) {
-        return auth;
-    }
-    Status payload_status = ValidatePayloadSize(request.payload());
-    if (!payload_status.ok()) {
-        return payload_status;
-    }
-
-    std::lock_guard<std::mutex> lock(write_mu_);
-    auto max_seq = metadata_->GetMaxSeq();
-    if (!max_seq.ok()) {
-        return max_seq.status();
-    }
-    const uint64_t seq = max_seq.value() + 1;
-
-    Status status = PublishCommitted(request.principal(), request.channel_id(), seq, request.recipients(),
-                                     request.payload(), ts_ms);
-    if (!status.ok()) {
-        return status;
-    }
-    response->set_seq(seq);
-    return Status::Ok();
-}
-
-Status OpenEventCore::PublishCommitted(uint64_t principal,
-                                       uint64_t channel_id,
-                                       uint64_t seq,
-                                       const google::protobuf::RepeatedField<uint64_t>& recipients,
-                                       const std::string& payload,
-                                       uint64_t ts_ms)
+Status OpenEventCore::BuildPublishBatch(const ReadSnapshot& snapshot,
+                                        uint64_t principal,
+                                        uint64_t channel_id,
+                                        uint64_t seq,
+                                        const google::protobuf::RepeatedField<uint64_t>& recipients,
+                                        const std::string& payload,
+                                        uint64_t ts_ms,
+                                        rocksdb::WriteBatch* batch) const
 {
     if (channel_id == 0) {
         return Status(grpc::StatusCode::PERMISSION_DENIED, "system channel is read-only");
     }
-    Status payload_status = ValidatePayloadSize(payload);
-    if (!payload_status.ok()) {
-        return payload_status;
-    }
-
-    auto channel_result = LoadChannel(channel_id);
+    auto channel_result = LoadChannel(snapshot, channel_id);
     if (!channel_result.ok()) {
         return channel_result.status();
     }
@@ -194,22 +204,106 @@ Status OpenEventCore::PublishCommitted(uint64_t principal,
     message.set_payload(payload);
     message.set_ts_ms(ts_ms);
 
-    Status status = metadata_->PutPendingMessage(seq, message);
+    Status status = storage_->PutMessage(batch, message);
     if (!status.ok()) {
         return status;
     }
+    return storage_->SetMaxSeq(batch, seq);
+}
 
-    auto append_result = message_store_->Append(message);
-    if (!append_result.ok()) {
-        return append_result.status();
+Status OpenEventCore::CommitBatch(rocksdb::WriteBatch* batch)
+{
+    Status status = storage_->Commit(batch);
+    if (status.ok()) {
+        commit_generation_.fetch_add(1, std::memory_order_release);
+        commit_cv_.notify_all();
+    }
+    return status;
+}
+
+Status OpenEventCore::Publish(const PublishRequest& request, PublishResponse*)
+{
+    const uint64_t ts_ms = NowMs();
+    Status payload_status = ValidatePayloadSize(request.payload());
+    if (!payload_status.ok()) {
+        return payload_status;
     }
 
-    status = metadata_->PutPendingOffset(seq, append_result.value());
+    std::lock_guard<std::mutex> lock(coordinator_mu_);
+    auto snapshot_result = storage_->CreateSnapshot();
+    if (!snapshot_result.ok()) {
+        return snapshot_result.status();
+    }
+    ReadSnapshot snapshot = std::move(snapshot_result.value());
+    Status auth = Authenticate(snapshot, request.principal(), request.token());
+    if (!auth.ok()) {
+        return auth;
+    }
+    auto max_seq = storage_->GetMaxSeq(snapshot);
+    if (!max_seq.ok()) {
+        return max_seq.status();
+    }
+    if (request.seq() != max_seq.value() + 1) {
+        return Status(grpc::StatusCode::ABORTED, "seq must equal max_seq + 1");
+    }
+
+    rocksdb::WriteBatch batch;
+    Status status = BuildPublishBatch(snapshot,
+                                      request.principal(),
+                                      request.channel_id(),
+                                      request.seq(),
+                                      request.recipients(),
+                                      request.payload(),
+                                      ts_ms,
+                                      &batch);
     if (!status.ok()) {
         return status;
     }
+    return CommitBatch(&batch);
+}
 
-    return metadata_->CommitMessage(seq, append_result.value(), channel_id, ts_ms);
+Status OpenEventCore::PublishAutoSeq(const PublishAutoSeqRequest& request, PublishAutoSeqResponse* response)
+{
+    const uint64_t ts_ms = NowMs();
+    Status payload_status = ValidatePayloadSize(request.payload());
+    if (!payload_status.ok()) {
+        return payload_status;
+    }
+
+    std::lock_guard<std::mutex> lock(coordinator_mu_);
+    auto snapshot_result = storage_->CreateSnapshot();
+    if (!snapshot_result.ok()) {
+        return snapshot_result.status();
+    }
+    ReadSnapshot snapshot = std::move(snapshot_result.value());
+    Status auth = Authenticate(snapshot, request.principal(), request.token());
+    if (!auth.ok()) {
+        return auth;
+    }
+    auto max_seq = storage_->GetMaxSeq(snapshot);
+    if (!max_seq.ok()) {
+        return max_seq.status();
+    }
+    const uint64_t seq = max_seq.value() + 1;
+
+    rocksdb::WriteBatch batch;
+    Status status = BuildPublishBatch(snapshot,
+                                      request.principal(),
+                                      request.channel_id(),
+                                      seq,
+                                      request.recipients(),
+                                      request.payload(),
+                                      ts_ms,
+                                      &batch);
+    if (!status.ok()) {
+        return status;
+    }
+    status = CommitBatch(&batch);
+    if (!status.ok()) {
+        return status;
+    }
+    response->set_seq(seq);
+    return Status::Ok();
 }
 
 Status OpenEventCore::ValidatePayloadSize(const std::string& payload) const
@@ -224,114 +318,110 @@ Status OpenEventCore::ValidatePayloadSize(const std::string& payload) const
 
 Status OpenEventCore::Fetch(const FetchRequest& request, FetchResponse* response)
 {
-    Status auth = Authenticate(request.principal(), request.token());
-    if (!auth.ok()) {
-        return auth;
-    }
     if (request.limit() == 0 || request.limit() > 1000) {
         return Status(grpc::StatusCode::INVALID_ARGUMENT, "limit must be in 1..1000");
     }
-
-    return FetchVisible(request.principal(), request.from_seq(), request.limit(), request.only_my_recipient(),
+    auto snapshot_result = CreateLinearizedSnapshot();
+    if (!snapshot_result.ok()) {
+        return snapshot_result.status();
+    }
+    ReadSnapshot snapshot = std::move(snapshot_result.value());
+    Status auth = Authenticate(snapshot, request.principal(), request.token());
+    if (!auth.ok()) {
+        return auth;
+    }
+    return FetchVisible(snapshot,
+                        request.principal(),
+                        request.from_seq(),
+                        request.limit(),
+                        request.only_my_recipient(),
                         request.channels(),
                         response);
 }
 
-Status OpenEventCore::FetchVisible(uint64_t principal,
+Status OpenEventCore::FetchVisible(const ReadSnapshot& snapshot,
+                                   uint64_t principal,
                                    uint64_t from_seq,
                                    uint32_t limit,
                                    bool only_my_recipient,
                                    const google::protobuf::RepeatedField<uint64_t>& channels,
-                                   FetchResponse* response)
+                                   FetchResponse* response) const
 {
-    auto max_seq_result = metadata_->GetMaxSeq();
+    auto max_seq_result = storage_->GetMaxSeq(snapshot);
     if (!max_seq_result.ok()) {
         return max_seq_result.status();
     }
     const uint64_t max_seq = max_seq_result.value();
     response->clear_messages();
     response->set_last_seq(max_seq);
-
     if (from_seq == 0 || from_seq > max_seq) {
         response->set_next_seq(max_seq + 1);
         return Status::Ok();
     }
 
-    uint64_t seq = from_seq;
-    uint64_t next_seq = from_seq;
-    while (seq <= max_seq && response->messages_size() < static_cast<int>(limit)) {
-        auto offset_result = metadata_->GetOffsetForSeq(seq);
-        if (!offset_result.ok()) {
-            return offset_result.status();
-        }
-        if (!offset_result.value().has_value()) {
-            ++seq;
-            next_seq = seq;
-            continue;
-        }
-
-        const uint64_t expected_offset = offset_result.value().value();
-        auto fetch_result = message_store_->Fetch(expected_offset, 1);
-        if (!fetch_result.ok()) {
-            return fetch_result.status();
-        }
-
-        if (!fetch_result.value().records.empty()) {
-            const StoredMessage& stored = fetch_result.value().records.front();
-            if (stored.offset != expected_offset) {
-                ++seq;
-                next_seq = seq;
-                continue;
+    size_t response_bytes = 0;
+    auto next_seq = storage_->ScanMessages(
+        snapshot,
+        from_seq,
+        max_seq,
+        max_scan_records_,
+        [&](const EventMessage& message) -> Result<MessageScanAction> {
+            if (!channels.empty() && !Contains(channels, message.channel_id())) {
+                return MessageScanAction::kContinue;
             }
-            auto seq_for_offset = metadata_->GetSeqForOffset(stored.offset);
-            if (!seq_for_offset.ok()) {
-                return seq_for_offset.status();
+            auto channel_result = LoadChannel(snapshot, message.channel_id());
+            if (!channel_result.ok()) {
+                return channel_result.status();
             }
-            if (seq_for_offset.value().has_value() && seq_for_offset.value().value() == seq) {
-                const EventMessage& message = stored.message;
-                if (!channels.empty() && !Contains(channels, message.channel_id())) {
-                    ++seq;
-                    next_seq = seq;
-                    continue;
-                }
-                auto channel_result = LoadChannel(message.channel_id());
-                if (!channel_result.ok()) {
-                    return channel_result.status();
-                }
-                if (channel_result.value().has_value() && CanRead(channel_result.value().value(), principal) &&
-                    (!only_my_recipient || HasRecipient(message, principal))) {
-                    *response->add_messages() = message;
-                }
+            if (!channel_result.value().has_value() ||
+                !CanRead(channel_result.value().value(), principal) ||
+                (only_my_recipient && !HasRecipient(message, principal))) {
+                return MessageScanAction::kContinue;
             }
-        }
 
-        ++seq;
-        next_seq = seq;
+            const size_t message_bytes = message.ByteSizeLong();
+            if (response->messages_size() > 0 &&
+                message_bytes > response_soft_limit_bytes_ - std::min(response_bytes, response_soft_limit_bytes_)) {
+                return MessageScanAction::kStopBefore;
+            }
+            *response->add_messages() = message;
+            response_bytes += message_bytes;
+            if (response->messages_size() >= static_cast<int>(limit)) {
+                return MessageScanAction::kStopAfter;
+            }
+            return MessageScanAction::kContinue;
+        });
+    if (!next_seq.ok()) {
+        return next_seq.status();
     }
-
-    response->set_next_seq(next_seq);
+    response->set_next_seq(next_seq.value());
     return Status::Ok();
 }
 
 Status OpenEventCore::CreateChannel(const CreateChannelRequest& request, CreateChannelResponse* response)
 {
-    Status auth = Authenticate(request.principal(), request.token());
-    if (!auth.ok()) {
-        return auth;
-    }
     Status visibility_status = ValidateVisibility(request.visibility());
     if (!visibility_status.ok()) {
         return visibility_status;
     }
 
-    std::lock_guard<std::mutex> lock(write_mu_);
-    auto id_result = metadata_->AllocateChannelId();
-    if (!id_result.ok()) {
-        return id_result.status();
+    std::lock_guard<std::mutex> lock(coordinator_mu_);
+    auto snapshot_result = storage_->CreateSnapshot();
+    if (!snapshot_result.ok()) {
+        return snapshot_result.status();
+    }
+    ReadSnapshot snapshot = std::move(snapshot_result.value());
+    Status auth = Authenticate(snapshot, request.principal(), request.token());
+    if (!auth.ok()) {
+        return auth;
+    }
+    auto next_channel_id = storage_->GetNextChannelId(snapshot);
+    if (!next_channel_id.ok()) {
+        return next_channel_id.status();
     }
 
     ChannelInfo channel;
-    channel.set_channel_id(id_result.value());
+    channel.set_channel_id(next_channel_id.value());
     channel.set_name(request.name());
     channel.set_visibility(request.visibility());
     channel.set_protocol(request.protocol());
@@ -347,7 +437,16 @@ Status OpenEventCore::CreateChannel(const CreateChannelRequest& request, CreateC
         }
     }
 
-    Status status = metadata_->PutChannel(channel);
+    rocksdb::WriteBatch batch;
+    Status status = storage_->PutChannel(&batch, channel);
+    if (!status.ok()) {
+        return status;
+    }
+    status = storage_->SetNextChannelId(&batch, next_channel_id.value() + 1);
+    if (!status.ok()) {
+        return status;
+    }
+    status = CommitBatch(&batch);
     if (!status.ok()) {
         return status;
     }
@@ -357,12 +456,16 @@ Status OpenEventCore::CreateChannel(const CreateChannelRequest& request, CreateC
 
 Status OpenEventCore::GetChannel(const GetChannelRequest& request, GetChannelResponse* response)
 {
-    Status auth = Authenticate(request.principal(), request.token());
+    auto snapshot_result = CreateLinearizedSnapshot();
+    if (!snapshot_result.ok()) {
+        return snapshot_result.status();
+    }
+    ReadSnapshot snapshot = std::move(snapshot_result.value());
+    Status auth = Authenticate(snapshot, request.principal(), request.token());
     if (!auth.ok()) {
         return auth;
     }
-
-    auto channel_result = LoadChannel(request.channel_id());
+    auto channel_result = LoadChannel(snapshot, request.channel_id());
     if (!channel_result.ok()) {
         return channel_result.status();
     }
@@ -372,32 +475,34 @@ Status OpenEventCore::GetChannel(const GetChannelRequest& request, GetChannelRes
     if (!CanRead(channel_result.value().value(), request.principal())) {
         return Status(grpc::StatusCode::PERMISSION_DENIED, "channel not visible");
     }
-
     *response->mutable_channel() = channel_result.value().value();
     return Status::Ok();
 }
 
 Status OpenEventCore::ListChannels(const ListChannelsRequest& request, ListChannelsResponse* response)
 {
-    Status auth = Authenticate(request.principal(), request.token());
-    if (!auth.ok()) {
-        return auth;
-    }
     Status filter_status = ValidateFilter(request.filter());
     if (!filter_status.ok()) {
         return filter_status;
+    }
+    auto snapshot_result = CreateLinearizedSnapshot();
+    if (!snapshot_result.ok()) {
+        return snapshot_result.status();
+    }
+    ReadSnapshot snapshot = std::move(snapshot_result.value());
+    Status auth = Authenticate(snapshot, request.principal(), request.token());
+    if (!auth.ok()) {
+        return auth;
     }
 
     response->clear_channels();
     if (request.filter() == CHANNEL_FILTER_ALL) {
         *response->add_channels() = SystemChannel();
     }
-
-    auto channels = metadata_->ListChannels();
+    auto channels = storage_->ListChannels(snapshot);
     if (!channels.ok()) {
         return channels.status();
     }
-
     for (const auto& channel : channels.value()) {
         if (!CanRead(channel, request.principal())) {
             continue;
@@ -416,16 +521,20 @@ Status OpenEventCore::ListChannels(const ListChannelsRequest& request, ListChann
 
 Status OpenEventCore::AddMember(const AddMemberRequest& request, AddMemberResponse*)
 {
-    Status auth = Authenticate(request.principal(), request.token());
+    std::lock_guard<std::mutex> lock(coordinator_mu_);
+    auto snapshot_result = storage_->CreateSnapshot();
+    if (!snapshot_result.ok()) {
+        return snapshot_result.status();
+    }
+    ReadSnapshot snapshot = std::move(snapshot_result.value());
+    Status auth = Authenticate(snapshot, request.principal(), request.token());
     if (!auth.ok()) {
         return auth;
     }
     if (request.channel_id() == 0) {
         return Status(grpc::StatusCode::PERMISSION_DENIED, "system channel cannot be modified");
     }
-
-    std::lock_guard<std::mutex> lock(write_mu_);
-    auto channel_result = LoadChannel(request.channel_id());
+    auto channel_result = LoadChannel(snapshot, request.channel_id());
     if (!channel_result.ok()) {
         return channel_result.status();
     }
@@ -440,23 +549,32 @@ Status OpenEventCore::AddMember(const AddMemberRequest& request, AddMemberRespon
     if (IsMember(channel, request.target_principal())) {
         return Status(grpc::StatusCode::ALREADY_EXISTS, "member already exists");
     }
-
     channel.add_members(request.target_principal());
-    return metadata_->PutChannel(channel);
+
+    rocksdb::WriteBatch batch;
+    Status status = storage_->PutChannel(&batch, channel);
+    if (!status.ok()) {
+        return status;
+    }
+    return CommitBatch(&batch);
 }
 
 Status OpenEventCore::RemoveMember(const RemoveMemberRequest& request, RemoveMemberResponse*)
 {
-    Status auth = Authenticate(request.principal(), request.token());
+    std::lock_guard<std::mutex> lock(coordinator_mu_);
+    auto snapshot_result = storage_->CreateSnapshot();
+    if (!snapshot_result.ok()) {
+        return snapshot_result.status();
+    }
+    ReadSnapshot snapshot = std::move(snapshot_result.value());
+    Status auth = Authenticate(snapshot, request.principal(), request.token());
     if (!auth.ok()) {
         return auth;
     }
     if (request.channel_id() == 0) {
         return Status(grpc::StatusCode::PERMISSION_DENIED, "system channel cannot be modified");
     }
-
-    std::lock_guard<std::mutex> lock(write_mu_);
-    auto channel_result = LoadChannel(request.channel_id());
+    auto channel_result = LoadChannel(snapshot, request.channel_id());
     if (!channel_result.ok()) {
         return channel_result.status();
     }
@@ -471,17 +589,29 @@ Status OpenEventCore::RemoveMember(const RemoveMemberRequest& request, RemoveMem
     if (request.target_principal() == channel.creator()) {
         return Status(grpc::StatusCode::PERMISSION_DENIED, "creator cannot be removed");
     }
-
     auto* members = channel.mutable_members();
     auto it = std::find(members->begin(), members->end(), request.target_principal());
     if (it != members->end()) {
         members->erase(it);
     }
-    return metadata_->PutChannel(channel);
+
+    rocksdb::WriteBatch batch;
+    Status status = storage_->PutChannel(&batch, channel);
+    if (!status.ok()) {
+        return status;
+    }
+    return CommitBatch(&batch);
 }
 
 Status OpenEventCore::AddToken(const AddTokenRequest& request, AddTokenResponse* response)
 {
+    std::lock_guard<std::mutex> lock(coordinator_mu_);
+    auto snapshot_result = storage_->CreateSnapshot();
+    if (!snapshot_result.ok()) {
+        return snapshot_result.status();
+    }
+    ReadSnapshot snapshot = std::move(snapshot_result.value());
+
     std::string token;
     for (int attempt = 0; attempt < 16; ++attempt) {
         auto token_result = GenerateToken();
@@ -489,7 +619,7 @@ Status OpenEventCore::AddToken(const AddTokenRequest& request, AddTokenResponse*
             return token_result.status();
         }
         token = token_result.value();
-        auto existing = metadata_->GetPrincipalForToken(token);
+        auto existing = storage_->GetPrincipalForToken(snapshot, token);
         if (!existing.ok()) {
             return existing.status();
         }
@@ -502,11 +632,15 @@ Status OpenEventCore::AddToken(const AddTokenRequest& request, AddTokenResponse*
         return Status(grpc::StatusCode::INTERNAL, "failed to generate unique token");
     }
 
-    Status status = metadata_->PutToken(token, request.target_principal());
+    rocksdb::WriteBatch batch;
+    Status status = storage_->PutToken(&batch, token, request.target_principal());
     if (!status.ok()) {
         return status;
     }
-
+    status = CommitBatch(&batch);
+    if (!status.ok()) {
+        return status;
+    }
     response->mutable_binding()->set_token(token);
     response->mutable_binding()->set_principal(request.target_principal());
     return Status::Ok();
@@ -514,121 +648,170 @@ Status OpenEventCore::AddToken(const AddTokenRequest& request, AddTokenResponse*
 
 Status OpenEventCore::DeleteToken(const DeleteTokenRequest& request, DeleteTokenResponse*)
 {
-    return metadata_->DeleteToken(request.target_token());
+    std::lock_guard<std::mutex> lock(coordinator_mu_);
+    rocksdb::WriteBatch batch;
+    storage_->DeleteToken(&batch, request.target_token());
+    return CommitBatch(&batch);
 }
 
-Status OpenEventCore::ListTokens(const ListTokensRequest&, ListTokensResponse* response)
+Status OpenEventCore::ListTokens(const ListTokensRequest& request, ListTokensResponse* response)
 {
-    auto bindings = metadata_->ListTokens();
-    if (!bindings.ok()) {
-        return bindings.status();
+    if (request.limit() == 0 || request.limit() > 1000) {
+        return Status(grpc::StatusCode::INVALID_ARGUMENT, "limit must be in 1..1000");
+    }
+    auto start_after = DecodeTokenPageToken(request.page_token());
+    if (!start_after.ok()) {
+        return start_after.status();
+    }
+    auto snapshot_result = CreateLinearizedSnapshot();
+    if (!snapshot_result.ok()) {
+        return snapshot_result.status();
+    }
+    ReadSnapshot snapshot = std::move(snapshot_result.value());
+    auto page = storage_->ListTokens(snapshot, start_after.value(), request.limit());
+    if (!page.ok()) {
+        return page.status();
     }
 
     response->clear_bindings();
-    for (const auto& binding : bindings.value()) {
+    response->clear_next_page_token();
+    for (const auto& binding : page.value().bindings) {
         auto* item = response->add_bindings();
         item->set_token(binding.token);
         item->set_principal(binding.principal);
     }
+    if (page.value().has_more) {
+        response->set_next_page_token(EncodeTokenPageToken(page.value().bindings.back().token));
+    }
     return Status::Ok();
+}
+
+Status OpenEventCore::ListMessages(const ListMessagesRequest& request, ListMessagesResponse* response)
+{
+    if (request.limit() == 0 || request.limit() > 1000) {
+        return Status(grpc::StatusCode::INVALID_ARGUMENT, "limit must be in 1..1000");
+    }
+    auto snapshot_result = CreateLinearizedSnapshot();
+    if (!snapshot_result.ok()) {
+        return snapshot_result.status();
+    }
+    ReadSnapshot snapshot = std::move(snapshot_result.value());
+    return ListAllMessages(snapshot, request.from_seq(), request.limit(), response);
+}
+
+Status OpenEventCore::ListAllMessages(const ReadSnapshot& snapshot,
+                                      uint64_t from_seq,
+                                      uint32_t limit,
+                                      ListMessagesResponse* response) const
+{
+    auto max_seq_result = storage_->GetMaxSeq(snapshot);
+    if (!max_seq_result.ok()) {
+        return max_seq_result.status();
+    }
+    const uint64_t max_seq = max_seq_result.value();
+    response->clear_messages();
+    response->set_last_seq(max_seq);
+    const uint64_t start_seq = from_seq == 0 ? 1 : from_seq;
+    if (start_seq > max_seq) {
+        response->set_next_seq(max_seq + 1);
+        return Status::Ok();
+    }
+
+    size_t response_bytes = 0;
+    auto next_seq = storage_->ScanMessages(
+        snapshot,
+        start_seq,
+        max_seq,
+        max_scan_records_,
+        [&](const EventMessage& message) -> Result<MessageScanAction> {
+            const size_t message_bytes = message.ByteSizeLong();
+            if (response->messages_size() > 0 &&
+                message_bytes > response_soft_limit_bytes_ - std::min(response_bytes, response_soft_limit_bytes_)) {
+                return MessageScanAction::kStopBefore;
+            }
+            *response->add_messages() = message;
+            response_bytes += message_bytes;
+            if (response->messages_size() >= static_cast<int>(limit)) {
+                return MessageScanAction::kStopAfter;
+            }
+            return MessageScanAction::kContinue;
+        });
+    if (!next_seq.ok()) {
+        return next_seq.status();
+    }
+    response->set_next_seq(next_seq.value());
+    return Status::Ok();
+}
+
+Status OpenEventCore::GetSubscriptionMaxSeq(uint64_t principal,
+                                            const std::string& token,
+                                            uint64_t* max_seq) const
+{
+    auto snapshot_result = storage_->CreateSnapshot();
+    if (!snapshot_result.ok()) {
+        return snapshot_result.status();
+    }
+    ReadSnapshot snapshot = std::move(snapshot_result.value());
+    Status auth = Authenticate(snapshot, principal, token);
+    if (!auth.ok()) {
+        return auth;
+    }
+    auto result = storage_->GetMaxSeq(snapshot);
+    if (!result.ok()) {
+        return result.status();
+    }
+    *max_seq = result.value();
+    return Status::Ok();
+}
+
+Status OpenEventCore::FetchSubscriptionBatch(uint64_t principal,
+                                             const std::string& token,
+                                             uint64_t from_seq,
+                                             uint32_t limit,
+                                             bool only_my_recipient,
+                                             FetchResponse* response) const
+{
+    auto snapshot_result = storage_->CreateSnapshot();
+    if (!snapshot_result.ok()) {
+        return snapshot_result.status();
+    }
+    ReadSnapshot snapshot = std::move(snapshot_result.value());
+    Status auth = Authenticate(snapshot, principal, token);
+    if (!auth.ok()) {
+        return auth;
+    }
+    google::protobuf::RepeatedField<uint64_t> channels;
+    return FetchVisible(snapshot, principal, from_seq, limit, only_my_recipient, channels, response);
+}
+
+uint64_t OpenEventCore::CommitGeneration() const
+{
+    return commit_generation_.load(std::memory_order_acquire);
+}
+
+void OpenEventCore::WaitForCommit(uint64_t observed_generation, std::chrono::milliseconds timeout) const
+{
+    std::unique_lock<std::mutex> lock(commit_wait_mu_);
+    commit_cv_.wait_for(lock, timeout, [&]() { return CommitGeneration() != observed_generation; });
 }
 
 Result<uint64_t> OpenEventCore::MaxSeq() const
 {
-    return metadata_->GetMaxSeq();
+    auto snapshot_result = storage_->CreateSnapshot();
+    if (!snapshot_result.ok()) {
+        return snapshot_result.status();
+    }
+    ReadSnapshot snapshot = std::move(snapshot_result.value());
+    return storage_->GetMaxSeq(snapshot);
 }
 
-Status OpenEventCore::RecoverPending()
-{
-    std::lock_guard<std::mutex> lock(write_mu_);
-
-    auto pending_result = metadata_->ListPendingSeqs();
-    if (!pending_result.ok()) {
-        return pending_result.status();
-    }
-
-    for (uint64_t seq : pending_result.value()) {
-        auto max_seq = metadata_->GetMaxSeq();
-        if (!max_seq.ok()) {
-            return max_seq.status();
-        }
-        if (seq != max_seq.value() + 1) {
-            return Status(grpc::StatusCode::INTERNAL, "pending seq is not the next commit point");
-        }
-
-        auto message_result = metadata_->GetPendingMessage(seq);
-        if (!message_result.ok()) {
-            return message_result.status();
-        }
-        if (!message_result.value().has_value()) {
-            return Status(grpc::StatusCode::INTERNAL, "pending message missing");
-        }
-        const EventMessage& message = message_result.value().value();
-        if (message.seq() != seq) {
-            return Status(grpc::StatusCode::INTERNAL, "pending message seq mismatch");
-        }
-
-        uint64_t offset = 0;
-        auto pending_offset = metadata_->GetPendingOffset(seq);
-        if (!pending_offset.ok()) {
-            return pending_offset.status();
-        }
-        bool needs_append = true;
-        if (pending_offset.value().has_value()) {
-            offset = pending_offset.value().value();
-            auto mapped_seq = metadata_->GetSeqForOffset(offset);
-            if (!mapped_seq.ok()) {
-                return mapped_seq.status();
-            }
-            if (mapped_seq.value().has_value() && mapped_seq.value().value() != seq) {
-                return Status(grpc::StatusCode::INTERNAL, "pending offset is mapped to another seq");
-            }
-
-            auto fetch_result = message_store_->Fetch(offset, 1);
-            if (!fetch_result.ok()) {
-                return fetch_result.status();
-            }
-            const bool exact_match = !fetch_result.value().records.empty() &&
-                                     fetch_result.value().records.front().offset == offset &&
-                                     SameMessage(fetch_result.value().records.front().message, message);
-            if (mapped_seq.value().has_value() && !exact_match) {
-                return Status(grpc::StatusCode::INTERNAL, "mapped pending offset message mismatch");
-            }
-            if (!exact_match) {
-                needs_append = true;
-            } else {
-                needs_append = false;
-            }
-        }
-
-        if (needs_append) {
-            auto append_result = message_store_->Append(message);
-            if (!append_result.ok()) {
-                return append_result.status();
-            }
-            offset = append_result.value();
-
-            Status status = metadata_->PutPendingOffset(seq, offset);
-            if (!status.ok()) {
-                return status;
-            }
-        }
-
-        Status status = metadata_->CommitMessage(seq, offset, message.channel_id(), message.ts_ms());
-        if (!status.ok()) {
-            return status;
-        }
-    }
-
-    return Status::Ok();
-}
-
-Result<std::optional<ChannelInfo>> OpenEventCore::LoadChannel(uint64_t channel_id) const
+Result<std::optional<ChannelInfo>> OpenEventCore::LoadChannel(const ReadSnapshot& snapshot,
+                                                             uint64_t channel_id) const
 {
     if (channel_id == 0) {
         return std::optional<ChannelInfo>{SystemChannel()};
     }
-    return metadata_->GetChannel(channel_id);
+    return storage_->GetChannel(snapshot, channel_id);
 }
 
 bool OpenEventCore::CanRead(const ChannelInfo& channel, uint64_t principal) const
@@ -674,20 +857,6 @@ bool OpenEventCore::HasRecipient(const EventMessage& message, uint64_t principal
     return Contains(message.recipients(), principal);
 }
 
-bool OpenEventCore::SameMessage(const EventMessage& lhs, const EventMessage& rhs) const
-{
-    if (lhs.seq() != rhs.seq() || lhs.channel_id() != rhs.channel_id() || lhs.principal() != rhs.principal() ||
-        lhs.payload() != rhs.payload() || lhs.ts_ms() != rhs.ts_ms() || lhs.recipients_size() != rhs.recipients_size()) {
-        return false;
-    }
-    for (int i = 0; i < lhs.recipients_size(); ++i) {
-        if (lhs.recipients(i) != rhs.recipients(i)) {
-            return false;
-        }
-    }
-    return true;
-}
-
 ChannelInfo OpenEventCore::SystemChannel() const
 {
     ChannelInfo channel;
@@ -698,7 +867,8 @@ ChannelInfo OpenEventCore::SystemChannel() const
 
 Status OpenEventCore::ValidateVisibility(Visibility visibility) const
 {
-    if (visibility == VISIBILITY_PUBLIC || visibility == VISIBILITY_PROTECTED || visibility == VISIBILITY_PRIVATE) {
+    if (visibility == VISIBILITY_PUBLIC || visibility == VISIBILITY_PROTECTED ||
+        visibility == VISIBILITY_PRIVATE) {
         return Status::Ok();
     }
     return Status(grpc::StatusCode::INVALID_ARGUMENT, "invalid visibility");

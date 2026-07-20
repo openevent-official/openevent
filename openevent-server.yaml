@@ -5,14 +5,10 @@ admin:
   listen_addr: "127.0.0.1:9528"
 
 storage:
-  metadata_path: "/var/lib/openevent/meta"
-
-store:
-  rocksdb:
-    path: "/var/lib/openevent/messages"
+  path: "/var/lib/openevent/data"
 
 limits:
   max_payload_bytes: 16777216
 
-log:
-  level: "info"
+shutdown:
+  grace_seconds: 10

@@ -4,8 +4,10 @@
 
 OpenEvent exposes gRPC services through the shared protobuf schema:
 
-- Protocol definition:
+- Business protocol definition:
   [`openevent-sdk/proto/openevent.proto`](https://github.com/openevent-official/openevent-sdk/blob/main/proto/openevent.proto)
+- Admin protocol definition:
+  [`openevent-sdk/proto/admin.proto`](https://github.com/openevent-official/openevent-sdk/blob/main/proto/admin.proto)
 - API behavior and error semantics:
   [`openevent-sdk/docs/API.md`](https://github.com/openevent-official/openevent-sdk/blob/main/docs/API.md)
 
@@ -13,7 +15,7 @@ The API contract covers:
 
 - `EventService`: status query, message publishing, batch fetch, and subscription.
 - `ChannelService`: channel creation, query, listing, and member management.
-- `AdminService`: token management.
+- `AdminService`: token management and administrative message queries.
 
 Client applications should depend on the protobuf schema and documented gRPC
 status codes, not server implementation details.

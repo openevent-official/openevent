@@ -4,6 +4,7 @@
 
 #include <grpcpp/grpcpp.h>
 
+#include "admin.grpc.pb.h"
 #include "openevent.grpc.pb.h"
 #include "service/open_event_core.h"
 
@@ -70,6 +71,9 @@ public:
     grpc::Status ListTokens(grpc::ServerContext* context,
                             const ListTokensRequest* request,
                             ListTokensResponse* response) override;
+    grpc::Status ListMessages(grpc::ServerContext* context,
+                              const ListMessagesRequest* request,
+                              ListMessagesResponse* response) override;
 
 private:
     std::shared_ptr<OpenEventCore> core_;
