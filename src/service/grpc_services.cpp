@@ -90,6 +90,33 @@ grpc::Status EventServiceImpl::Subscribe(grpc::ServerContext* context,
     return grpc::Status::OK;
 }
 
+ObjectStorageServiceImpl::ObjectStorageServiceImpl(std::shared_ptr<OpenEventCore> core)
+    : core_(std::move(core))
+{
+}
+
+grpc::Status ObjectStorageServiceImpl::WriteObject(grpc::ServerContext*,
+                                                   const WriteObjectRequest* request,
+                                                   WriteObjectResponse* response)
+{
+    return ToGrpcStatus(core_->WriteObject(*request, response));
+}
+
+grpc::Status ObjectStorageServiceImpl::GetObjectMetadata(
+    grpc::ServerContext*,
+    const GetObjectMetadataRequest* request,
+    GetObjectMetadataResponse* response)
+{
+    return ToGrpcStatus(core_->GetObjectMetadata(*request, response));
+}
+
+grpc::Status ObjectStorageServiceImpl::ReadObject(grpc::ServerContext*,
+                                                  const ReadObjectRequest* request,
+                                                  ReadObjectResponse* response)
+{
+    return ToGrpcStatus(core_->ReadObject(*request, response));
+}
+
 ChannelServiceImpl::ChannelServiceImpl(std::shared_ptr<OpenEventCore> core) : core_(std::move(core)) {}
 
 grpc::Status ChannelServiceImpl::CreateChannel(grpc::ServerContext*,

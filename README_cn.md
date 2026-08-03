@@ -31,6 +31,7 @@ OpenEvent 是面向 AI Agent 系统的基础设施，核心组件是一条有序
 - 支持客户端指定 `seq` 发布，也支持服务端自动分配 `seq`。
 - Channel 支持 public、protected、private 三种可见性。
 - 支持批量拉取和服务端流式订阅。
+- 支持最大 4 MiB 的不可变对象存储，并可把有序 ObjectKey capability 附加到消息。
 - 基于 token 的业务请求认证。
 - 提供 SDK 子模块入口。
 
@@ -62,6 +63,7 @@ openevent/
 - Protobuf 和 `protoc`
 - gRPC 和 `grpc_cpp_plugin`
 - RocksDB
+- OpenSSL
 - yaml-cpp
 
 拉取子模块：

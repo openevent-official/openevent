@@ -34,6 +34,24 @@ private:
     std::shared_ptr<OpenEventCore> core_;
 };
 
+class ObjectStorageServiceImpl final : public ::openevent::ObjectStorageService::Service {
+public:
+    explicit ObjectStorageServiceImpl(std::shared_ptr<OpenEventCore> core);
+
+    grpc::Status WriteObject(grpc::ServerContext* context,
+                             const WriteObjectRequest* request,
+                             WriteObjectResponse* response) override;
+    grpc::Status GetObjectMetadata(grpc::ServerContext* context,
+                                   const GetObjectMetadataRequest* request,
+                                   GetObjectMetadataResponse* response) override;
+    grpc::Status ReadObject(grpc::ServerContext* context,
+                            const ReadObjectRequest* request,
+                            ReadObjectResponse* response) override;
+
+private:
+    std::shared_ptr<OpenEventCore> core_;
+};
+
 class ChannelServiceImpl final : public ::openevent::ChannelService::Service {
 public:
     explicit ChannelServiceImpl(std::shared_ptr<OpenEventCore> core);

@@ -6,6 +6,7 @@
 #include <fstream>
 #include <iostream>
 #include <iterator>
+#include <limits>
 #include <memory>
 #include <set>
 #include <string>
@@ -13,9 +14,11 @@
 
 #include <rocksdb/options.h>
 
+#include "object_record.pb.h"
 #include "server/server_config.h"
 #include "service/open_event_core.h"
 #include "storage/encoding.h"
+#include "storage/object_file_store.h"
 #include "storage/unified_storage.h"
 
 namespace {
@@ -31,12 +34,17 @@ void Check(bool condition, const std::string& message)
 std::unique_ptr<openevent::OpenEventCore> MakeCore(const std::filesystem::path& root,
                                                    size_t max_payload_bytes = 1024,
                                                    uint64_t max_scan_records = 10000,
-                                                   size_t response_soft_limit_bytes = 0)
+                                                   size_t response_soft_limit_bytes = 0,
+                                                   openevent::OpenEventCore::FatalErrorHandler fatal_handler = {})
 {
     auto storage = openevent::UnifiedStorage::Open((root / "data").string());
     Check(storage.ok(), storage.status().message());
     return std::make_unique<openevent::OpenEventCore>(
-        std::move(storage.value()), max_payload_bytes, max_scan_records, response_soft_limit_bytes);
+        std::move(storage.value()),
+        max_payload_bytes,
+        max_scan_records,
+        response_soft_limit_bytes,
+        std::move(fatal_handler));
 }
 
 rocksdb::WriteOptions SyncWriteOptions()
@@ -46,16 +54,21 @@ rocksdb::WriteOptions SyncWriteOptions()
     return options;
 }
 
-void CreatePartialStorage(const std::filesystem::path& path, bool write_marker, bool create_messages_cf)
+void CreatePartialStorage(const std::filesystem::path& path,
+                          bool write_marker,
+                          bool create_messages_cf,
+                          bool create_objects_cf = false)
 {
     std::error_code ec;
-    std::filesystem::create_directories(path.parent_path(), ec);
-    Check(!ec, "create partial storage parent: " + ec.message());
+    std::filesystem::create_directories(path / "db", ec);
+    Check(!ec, "create partial storage database directory: " + ec.message());
+    std::filesystem::create_directory(path / "objects", ec);
+    Check(!ec, "create partial storage object directory: " + ec.message());
 
     rocksdb::Options options;
     options.create_if_missing = true;
     rocksdb::DB* raw_db = nullptr;
-    rocksdb::Status status = rocksdb::DB::Open(options, path.string(), &raw_db);
+    rocksdb::Status status = rocksdb::DB::Open(options, (path / "db").string(), &raw_db);
     Check(status.ok(), status.ToString());
     std::unique_ptr<rocksdb::DB> db(raw_db);
 
@@ -68,6 +81,13 @@ void CreatePartialStorage(const std::filesystem::path& path, bool write_marker, 
         status = db->CreateColumnFamily(rocksdb::ColumnFamilyOptions(), "messages", &messages);
         Check(status.ok(), status.ToString());
         status = db->DestroyColumnFamilyHandle(messages);
+        Check(status.ok(), status.ToString());
+    }
+    if (create_objects_cf) {
+        rocksdb::ColumnFamilyHandle* objects = nullptr;
+        status = db->CreateColumnFamily(rocksdb::ColumnFamilyOptions(), "objects", &objects);
+        Check(status.ok(), status.ToString());
+        status = db->DestroyColumnFamilyHandle(objects);
         Check(status.ok(), status.ToString());
     }
 }
@@ -147,6 +167,32 @@ void PublishAuto(openevent::OpenEventCore& core, uint64_t principal, const std::
     openevent::PublishAutoSeqResponse response;
     openevent::Status status = core.PublishAutoSeq(request, &response);
     Check(status.ok(), status.message());
+}
+
+openevent::WriteObjectRequest MakeWriteObjectRequest(uint64_t principal,
+                                                     const std::string& token,
+                                                     const std::string& data)
+{
+    openevent::WriteObjectRequest request;
+    request.set_principal(principal);
+    request.set_token(token);
+    request.set_name("object.bin");
+    request.set_type("application/octet-stream");
+    request.set_description("test object");
+    request.set_data(data);
+    return request;
+}
+
+openevent::WriteObjectResponse WriteObject(openevent::OpenEventCore& core,
+                                           uint64_t principal,
+                                           const std::string& token,
+                                           const std::string& data)
+{
+    openevent::WriteObjectRequest request = MakeWriteObjectRequest(principal, token, data);
+    openevent::WriteObjectResponse response;
+    openevent::Status status = core.WriteObject(request, &response);
+    Check(status.ok(), status.message());
+    return response;
 }
 
 void TestPublishFetch()
@@ -687,6 +733,370 @@ void TestDeleteTokenOrdersBeforePublish()
     std::filesystem::remove_all(root);
 }
 
+void TestObjectWriteMetadataReadAndReopen()
+{
+    constexpr size_t kMaxObjectBytes = 4 * 1024 * 1024;
+    const auto root = std::filesystem::temp_directory_path() / "openevent_core_object_round_trip";
+    std::filesystem::remove_all(root);
+    auto core = MakeCore(root);
+    const std::string token = AddToken(*core, 100);
+
+    auto expect_write_status = [&](const openevent::WriteObjectRequest& request,
+                                   grpc::StatusCode expected_code) {
+        openevent::WriteObjectResponse response;
+        openevent::Status status = core->WriteObject(request, &response);
+        Check(!status.ok() && status.code() == expected_code,
+              "unexpected WriteObject validation status: " + status.message());
+    };
+
+    openevent::WriteObjectRequest invalid = MakeWriteObjectRequest(100, token, "data");
+    invalid.clear_name();
+    expect_write_status(invalid, grpc::StatusCode::INVALID_ARGUMENT);
+    invalid = MakeWriteObjectRequest(100, token, "data");
+    invalid.set_name(std::string(256, 'n'));
+    expect_write_status(invalid, grpc::StatusCode::INVALID_ARGUMENT);
+    invalid = MakeWriteObjectRequest(100, token, "data");
+    invalid.clear_type();
+    expect_write_status(invalid, grpc::StatusCode::INVALID_ARGUMENT);
+    invalid = MakeWriteObjectRequest(100, token, "data");
+    invalid.set_type(std::string(256, 't'));
+    expect_write_status(invalid, grpc::StatusCode::INVALID_ARGUMENT);
+    invalid = MakeWriteObjectRequest(100, token, "data");
+    invalid.set_description(std::string(4097, 'd'));
+    expect_write_status(invalid, grpc::StatusCode::INVALID_ARGUMENT);
+    invalid = MakeWriteObjectRequest(100, token, "");
+    expect_write_status(invalid, grpc::StatusCode::INVALID_ARGUMENT);
+    invalid = MakeWriteObjectRequest(100, token, std::string(kMaxObjectBytes + 1, 'x'));
+    expect_write_status(invalid, grpc::StatusCode::INVALID_ARGUMENT);
+    invalid = MakeWriteObjectRequest(100, "wrong-token", "data");
+    expect_write_status(invalid, grpc::StatusCode::UNAUTHENTICATED);
+
+    const std::string data("ab\0cdef", 7);
+    openevent::WriteObjectRequest write = MakeWriteObjectRequest(100, token, data);
+    write.set_name("binary");
+    write.set_type("application/test");
+    write.set_description("");
+    openevent::WriteObjectResponse first;
+    openevent::Status status = core->WriteObject(write, &first);
+    Check(status.ok(), status.message());
+    Check(first.object_id() == 1, "invalid writes must not consume an object ID");
+    Check(first.object_token().size() == 43, "object token must be 43 Base64URL characters");
+    Check(std::filesystem::is_regular_file(root / "data" / "objects" / "1"),
+          "committed object file must use its decimal ID as the file name");
+
+    openevent::GetObjectMetadataRequest metadata_request;
+    metadata_request.set_object_id(first.object_id());
+    metadata_request.set_object_token(first.object_token());
+    openevent::GetObjectMetadataResponse metadata;
+    status = core->GetObjectMetadata(metadata_request, &metadata);
+    Check(status.ok(), status.message());
+    Check(metadata.name() == "binary" && metadata.type() == "application/test" &&
+              metadata.description().empty() && metadata.nbytes() == data.size(),
+          "GetObjectMetadata must return committed metadata exactly");
+
+    openevent::GetObjectMetadataRequest invalid_key = metadata_request;
+    invalid_key.set_object_token("wrong-token");
+    status = core->GetObjectMetadata(invalid_key, &metadata);
+    Check(!status.ok() && status.code() == grpc::StatusCode::NOT_FOUND,
+          "wrong object token must be indistinguishable from a missing object");
+    invalid_key = metadata_request;
+    invalid_key.set_object_id(9999);
+    status = core->GetObjectMetadata(invalid_key, &metadata);
+    Check(!status.ok() && status.code() == grpc::StatusCode::NOT_FOUND,
+          "missing object must return NOT_FOUND");
+    invalid_key = metadata_request;
+    invalid_key.set_object_id(0);
+    status = core->GetObjectMetadata(invalid_key, &metadata);
+    Check(!status.ok() && status.code() == grpc::StatusCode::INVALID_ARGUMENT,
+          "object ID zero must be rejected");
+    invalid_key = metadata_request;
+    invalid_key.clear_object_token();
+    status = core->GetObjectMetadata(invalid_key, &metadata);
+    Check(!status.ok() && status.code() == grpc::StatusCode::INVALID_ARGUMENT,
+          "empty object token must be rejected");
+
+    openevent::ReadObjectRequest read;
+    read.set_object_id(first.object_id());
+    read.set_object_token(first.object_token());
+    read.set_nbytes(std::numeric_limits<uint64_t>::max());
+    openevent::ReadObjectResponse read_response;
+    status = core->ReadObject(read, &read_response);
+    Check(status.ok() && read_response.data() == data,
+          "large nbytes must return the complete object without overflow");
+    read.set_offset(2);
+    read.set_nbytes(3);
+    status = core->ReadObject(read, &read_response);
+    Check(status.ok() && read_response.data() == data.substr(2, 3),
+          "partial object read must return the requested range");
+    read.set_offset(data.size() - 1);
+    read.set_nbytes(100);
+    status = core->ReadObject(read, &read_response);
+    Check(status.ok() && read_response.data() == data.substr(data.size() - 1),
+          "object read must truncate a range at EOF");
+    read.set_offset(data.size());
+    status = core->ReadObject(read, &read_response);
+    Check(status.ok() && read_response.data().empty(), "offset at EOF must return empty data");
+    read.set_offset(data.size() + 1);
+    status = core->ReadObject(read, &read_response);
+    Check(!status.ok() && status.code() == grpc::StatusCode::OUT_OF_RANGE,
+          "offset beyond EOF must return OUT_OF_RANGE");
+    read.set_offset(0);
+    read.set_nbytes(0);
+    status = core->ReadObject(read, &read_response);
+    Check(!status.ok() && status.code() == grpc::StatusCode::INVALID_ARGUMENT,
+          "zero-length object read must be rejected");
+
+    openevent::WriteObjectRequest largest = MakeWriteObjectRequest(
+        100, token, std::string(kMaxObjectBytes, 'm'));
+    largest.set_name(std::string(255, 'n'));
+    largest.set_type(std::string(255, 't'));
+    largest.set_description(std::string(4096, 'd'));
+    openevent::WriteObjectResponse second;
+    status = core->WriteObject(largest, &second);
+    Check(status.ok(), status.message());
+    Check(second.object_id() == 2, "committed object IDs must increase globally");
+
+    openevent::DeleteTokenRequest delete_token;
+    delete_token.set_target_token(token);
+    openevent::DeleteTokenResponse delete_response;
+    status = core->DeleteToken(delete_token, &delete_response);
+    Check(status.ok(), status.message());
+    read.set_object_id(first.object_id());
+    read.set_object_token(first.object_token());
+    read.set_offset(0);
+    read.set_nbytes(data.size());
+    status = core->ReadObject(read, &read_response);
+    Check(status.ok() && read_response.data() == data,
+          "ObjectKey authorization must survive deletion of the creator token");
+
+    core.reset();
+    core = MakeCore(root);
+    read.set_object_id(first.object_id());
+    read.set_object_token(first.object_token());
+    read.set_offset(0);
+    read.set_nbytes(data.size());
+    status = core->ReadObject(read, &read_response);
+    Check(status.ok() && read_response.data() == data, "committed object must remain readable after reopen");
+
+    std::filesystem::remove_all(root);
+}
+
+void TestMessageObjectReferences()
+{
+    const auto root = std::filesystem::temp_directory_path() / "openevent_core_object_references";
+    std::filesystem::remove_all(root);
+    auto core = MakeCore(root);
+    const std::string token = AddToken(*core, 100);
+    const uint64_t channel_id = CreateChannel(*core, 100, token, openevent::VISIBILITY_PUBLIC);
+    const auto first = WriteObject(*core, 100, token, "first");
+    const auto second = WriteObject(*core, 100, token, "second");
+
+    openevent::PublishAutoSeqRequest publish;
+    publish.set_principal(100);
+    publish.set_token(token);
+    publish.set_channel_id(channel_id);
+    publish.set_payload("references");
+    for (const auto* key : {&first, &second, &first}) {
+        auto* object_key = publish.add_object_keys();
+        object_key->set_object_id(key->object_id());
+        object_key->set_object_token(key->object_token());
+    }
+    openevent::PublishAutoSeqResponse publish_response;
+    openevent::Status status = core->PublishAutoSeq(publish, &publish_response);
+    Check(status.ok(), status.message());
+
+    openevent::FetchRequest fetch;
+    fetch.set_principal(100);
+    fetch.set_token(token);
+    fetch.set_from_seq(publish_response.seq());
+    fetch.set_limit(1);
+    openevent::FetchResponse fetched;
+    status = core->Fetch(fetch, &fetched);
+    Check(status.ok() && fetched.messages_size() == 1, "referenced message must be fetchable");
+    const auto& keys = fetched.messages(0).object_keys();
+    Check(keys.size() == 3 && keys.Get(0).object_id() == first.object_id() &&
+              keys.Get(1).object_id() == second.object_id() &&
+              keys.Get(2).object_id() == first.object_id(),
+          "message ObjectKeys must retain duplicates and request order");
+
+    openevent::FetchResponse subscription_batch;
+    status = core->FetchSubscriptionBatch(
+        100, token, publish_response.seq(), 1, false, &subscription_batch);
+    Check(status.ok() && subscription_batch.messages_size() == 1 &&
+              subscription_batch.messages(0).object_keys_size() == 3,
+          "subscription batches must retain object references");
+    openevent::ListMessagesRequest list;
+    list.set_from_seq(publish_response.seq());
+    list.set_limit(1);
+    openevent::ListMessagesResponse listed;
+    status = core->ListMessages(list, &listed);
+    Check(status.ok() && listed.messages_size() == 1 && listed.messages(0).object_keys_size() == 3,
+          "administrative message reads must retain object references");
+
+    publish.clear_object_keys();
+    for (size_t i = 0; i < 1024; ++i) {
+        auto* object_key = publish.add_object_keys();
+        object_key->set_object_id(first.object_id());
+        object_key->set_object_token(first.object_token());
+    }
+    status = core->PublishAutoSeq(publish, &publish_response);
+    Check(status.ok(), "a message with exactly 1024 ObjectKeys must commit");
+    const uint64_t watermark = publish_response.seq();
+
+    auto* too_many = publish.add_object_keys();
+    too_many->set_object_id(first.object_id());
+    too_many->set_object_token(first.object_token());
+    status = core->PublishAutoSeq(publish, &publish_response);
+    Check(!status.ok() && status.code() == grpc::StatusCode::INVALID_ARGUMENT,
+          "a message with 1025 ObjectKeys must be rejected");
+    auto max_seq = core->MaxSeq();
+    Check(max_seq.ok() && max_seq.value() == watermark,
+          "too many ObjectKeys must not advance the message watermark");
+
+    publish.clear_object_keys();
+    auto* valid_key = publish.add_object_keys();
+    valid_key->set_object_id(first.object_id());
+    valid_key->set_object_token(first.object_token());
+    auto* invalid_key = publish.add_object_keys();
+    invalid_key->set_object_id(second.object_id());
+    invalid_key->set_object_token("wrong-token");
+    status = core->PublishAutoSeq(publish, &publish_response);
+    Check(!status.ok() && status.code() == grpc::StatusCode::NOT_FOUND,
+          "one invalid ObjectKey must reject the complete message");
+    max_seq = core->MaxSeq();
+    Check(max_seq.ok() && max_seq.value() == watermark,
+          "an invalid ObjectKey must not partially commit or advance max_seq");
+
+    publish.clear_object_keys();
+    invalid_key = publish.add_object_keys();
+    invalid_key->set_object_id(0);
+    invalid_key->set_object_token(first.object_token());
+    status = core->PublishAutoSeq(publish, &publish_response);
+    Check(!status.ok() && status.code() == grpc::StatusCode::INVALID_ARGUMENT,
+          "a malformed ObjectKey must be rejected before commit");
+
+    std::filesystem::remove_all(root);
+}
+
+void TestPreparingRecoveryAndNoDirectoryScan()
+{
+    const auto root = std::filesystem::temp_directory_path() / "openevent_core_object_recovery";
+    const auto storage_path = root / "data";
+    const auto objects_path = storage_path / "objects";
+    std::filesystem::remove_all(root);
+    {
+        auto storage = openevent::UnifiedStorage::Open(storage_path.string());
+        Check(storage.ok(), storage.status().message());
+        openevent::StoredObject object;
+        object.object_id = 1;
+        object.object_token = std::string(43, 'A');
+        object.creator_principal = 100;
+        object.name = "preparing";
+        object.type = "application/octet-stream";
+        object.nbytes = 4;
+        auto digest = openevent::ObjectFileStore::Sha256("data");
+        Check(digest.ok(), digest.status().message());
+        object.sha256 = digest.value();
+
+        rocksdb::WriteBatch batch;
+        openevent::Status status = storage.value()->PutPreparingObject(&batch, object);
+        Check(status.ok(), status.message());
+        status = storage.value()->SetNextObjectId(&batch, 2);
+        Check(status.ok(), status.message());
+        status = storage.value()->Commit(&batch);
+        Check(status.ok(), status.message());
+        status = storage.value()->WriteObjectFile(1, "data");
+        Check(status.ok(), status.message());
+        std::ofstream temporary(objects_path / ".tmp.1", std::ios::binary);
+        temporary << "partial";
+        Check(temporary.good(), "create recovery temporary file");
+    }
+    {
+        std::ofstream orphan(objects_path / "999", std::ios::binary);
+        orphan << "orphan";
+        Check(orphan.good(), "create orphan object file");
+    }
+
+    auto reopened = openevent::UnifiedStorage::Open(storage_path.string());
+    Check(reopened.ok(), reopened.status().message());
+    Check(!std::filesystem::exists(objects_path / "1") &&
+              !std::filesystem::exists(objects_path / ".tmp.1"),
+          "startup recovery must remove both known PREPARING paths");
+    Check(std::filesystem::exists(objects_path / "999"),
+          "startup recovery must not scan or remove unrelated object files");
+    auto snapshot = reopened.value()->CreateSnapshot();
+    Check(snapshot.ok(), snapshot.status().message());
+    auto preparing = reopened.value()->GetPreparingObject(snapshot.value(), 1);
+    Check(preparing.ok() && !preparing.value().has_value(),
+          "startup recovery must delete PREPARING metadata");
+    auto next_object_id = reopened.value()->GetNextObjectId(snapshot.value());
+    Check(next_object_id.ok() && next_object_id.value() == 2,
+          "startup recovery must not reuse a PREPARING object ID");
+
+    snapshot.value() = openevent::ReadSnapshot();
+    reopened.value().reset();
+    std::filesystem::remove_all(root);
+}
+
+void TestCommittedObjectCorruptionIsFatal()
+{
+    const auto root = std::filesystem::temp_directory_path() / "openevent_core_object_corruption";
+    std::filesystem::remove_all(root);
+    int fatal_calls = 0;
+    auto core = MakeCore(root,
+                         1024,
+                         10000,
+                         0,
+                         [&](const openevent::Status& status) {
+                             Check(status.code() == grpc::StatusCode::DATA_LOSS,
+                                   "fatal object corruption must report DATA_LOSS");
+                             ++fatal_calls;
+                         });
+    const std::string token = AddToken(*core, 100);
+    const uint64_t channel_id = CreateChannel(*core, 100, token, openevent::VISIBILITY_PUBLIC);
+    const auto object = WriteObject(*core, 100, token, "original");
+    {
+        std::ofstream corrupt(root / "data" / "objects" / std::to_string(object.object_id()),
+                              std::ios::binary | std::ios::trunc);
+        corrupt << "modified";
+        Check(corrupt.good(), "replace committed object content");
+    }
+
+    openevent::GetObjectMetadataRequest metadata_request;
+    metadata_request.set_object_id(object.object_id());
+    metadata_request.set_object_token(object.object_token());
+    openevent::GetObjectMetadataResponse metadata;
+    openevent::Status status = core->GetObjectMetadata(metadata_request, &metadata);
+    Check(status.ok() && fatal_calls == 0,
+          "metadata lookup must not inspect a committed object file");
+
+    openevent::PublishAutoSeqRequest publish;
+    publish.set_principal(100);
+    publish.set_token(token);
+    publish.set_channel_id(channel_id);
+    auto* object_key = publish.add_object_keys();
+    object_key->set_object_id(object.object_id());
+    object_key->set_object_token(object.object_token());
+    openevent::PublishAutoSeqResponse publish_response;
+    status = core->PublishAutoSeq(publish, &publish_response);
+    Check(status.ok() && fatal_calls == 0,
+          "publishing an ObjectKey must validate metadata without reading object data");
+
+    openevent::ReadObjectRequest read;
+    read.set_object_id(object.object_id());
+    read.set_object_token(object.object_token());
+    read.set_nbytes(1);
+    openevent::ReadObjectResponse response;
+    status = core->ReadObject(read, &response);
+    Check(!status.ok() && status.code() == grpc::StatusCode::DATA_LOSS && fatal_calls == 1,
+          "committed object corruption must return DATA_LOSS and trigger fatal shutdown once");
+    status = core->ReadObject(read, &response);
+    Check(!status.ok() && status.code() == grpc::StatusCode::DATA_LOSS && fatal_calls == 1,
+          "fatal storage callback must be idempotent");
+
+    std::filesystem::remove_all(root);
+}
+
 void TestUnifiedStorageReopen()
 {
     const auto root = std::filesystem::temp_directory_path() / "openevent_core_unified_reopen";
@@ -728,6 +1138,7 @@ void TestUnifiedStorageLayout()
 {
     const auto root = std::filesystem::temp_directory_path() / "openevent_core_unified_layout";
     const auto storage_path = root / "data";
+    const auto database_path = storage_path / "db";
     std::filesystem::remove_all(root);
     {
         auto core = MakeCore(root);
@@ -738,20 +1149,23 @@ void TestUnifiedStorageLayout()
 
     rocksdb::Options list_options;
     std::vector<std::string> names;
-    rocksdb::Status rocks_status = rocksdb::DB::ListColumnFamilies(list_options, storage_path.string(), &names);
+    Check(std::filesystem::is_directory(storage_path / "objects"),
+          "unified storage should create the objects directory");
+    rocksdb::Status rocks_status = rocksdb::DB::ListColumnFamilies(list_options, database_path.string(), &names);
     Check(rocks_status.ok(), rocks_status.ToString());
     Check(std::set<std::string>(names.begin(), names.end()) ==
-              std::set<std::string>({rocksdb::kDefaultColumnFamilyName, "messages"}),
-          "unified storage should contain only default and messages column families");
+              std::set<std::string>({rocksdb::kDefaultColumnFamilyName, "messages", "objects"}),
+          "unified storage should contain default, messages, and objects column families");
 
     std::vector<rocksdb::ColumnFamilyDescriptor> descriptors{
         {rocksdb::kDefaultColumnFamilyName, rocksdb::ColumnFamilyOptions()},
         {"messages", rocksdb::ColumnFamilyOptions()},
+        {"objects", rocksdb::ColumnFamilyOptions()},
     };
     std::vector<rocksdb::ColumnFamilyHandle*> handles;
     rocksdb::DB* raw_db = nullptr;
     rocks_status = rocksdb::DB::Open(
-        rocksdb::DBOptions(), storage_path.string(), descriptors, &handles, &raw_db);
+        rocksdb::DBOptions(), database_path.string(), descriptors, &handles, &raw_db);
     Check(rocks_status.ok(), rocks_status.ToString());
     std::unique_ptr<rocksdb::DB> db(raw_db);
 
@@ -797,11 +1211,14 @@ void TestUint64KeyEncodingOrder()
 
 void TestUnifiedStorageInitializationRecovery()
 {
-    for (bool create_messages_cf : {false, true}) {
+    for (int created_column_families = 0; created_column_families <= 2; ++created_column_families) {
         const auto root = std::filesystem::temp_directory_path() /
-                          (create_messages_cf ? "openevent_init_after_cf" : "openevent_init_after_marker");
+                          ("openevent_init_stage_" + std::to_string(created_column_families));
         std::filesystem::remove_all(root);
-        CreatePartialStorage(root, true, create_messages_cf);
+        CreatePartialStorage(root,
+                             true,
+                             created_column_families >= 1,
+                             created_column_families >= 2);
 
         {
             auto storage = openevent::UnifiedStorage::Open(root.string());
@@ -818,11 +1235,11 @@ void TestUnifiedStorageInitializationRecovery()
 
         rocksdb::Options options;
         std::vector<std::string> names;
-        rocksdb::Status status = rocksdb::DB::ListColumnFamilies(options, root.string(), &names);
+        rocksdb::Status status = rocksdb::DB::ListColumnFamilies(options, (root / "db").string(), &names);
         Check(status.ok(), status.ToString());
         Check(std::set<std::string>(names.begin(), names.end()) ==
-                  std::set<std::string>({rocksdb::kDefaultColumnFamilyName, "messages"}),
-              "recovered initialization should contain both required column families");
+                  std::set<std::string>({rocksdb::kDefaultColumnFamilyName, "messages", "objects"}),
+              "recovered initialization should contain all required column families");
         std::filesystem::remove_all(root);
     }
 }
@@ -842,8 +1259,8 @@ void TestUnifiedStorageRejectsInvalidState()
         auto initialized = openevent::UnifiedStorage::Open(bad_schema.string());
         Check(initialized.ok(), initialized.status().message());
     }
-    PutRawRecord(bad_schema, rocksdb::kDefaultColumnFamilyName, "meta:schema_version",
-                 openevent::EncodeUint64(2));
+    PutRawRecord(bad_schema / "db", rocksdb::kDefaultColumnFamilyName, "meta:schema_version",
+                 openevent::EncodeUint64(999));
     storage = openevent::UnifiedStorage::Open(bad_schema.string());
     Check(!storage.ok(), "unsupported storage schema must be rejected");
 
@@ -852,7 +1269,7 @@ void TestUnifiedStorageRejectsInvalidState()
         auto initialized = openevent::UnifiedStorage::Open(bad_watermark.string());
         Check(initialized.ok(), initialized.status().message());
     }
-    PutRawRecord(bad_watermark, rocksdb::kDefaultColumnFamilyName, "meta:max_seq",
+    PutRawRecord(bad_watermark / "db", rocksdb::kDefaultColumnFamilyName, "meta:max_seq",
                  openevent::EncodeUint64(1));
     storage = openevent::UnifiedStorage::Open(bad_watermark.string());
     Check(!storage.ok(), "message watermark without a matching message must be rejected");
@@ -864,7 +1281,7 @@ void TestUnifiedStorageRejectsInvalidState()
         uint64_t channel_id = CreateChannel(*core, 100, token, openevent::VISIBILITY_PUBLIC);
         PublishAuto(*core, 100, token, channel_id, "valid-before-corruption");
     }
-    const auto bad_message = bad_message_root / "data";
+    const auto bad_message = bad_message_root / "data" / "db";
     openevent::EventMessage mismatched_message;
     mismatched_message.set_seq(2);
     mismatched_message.set_payload("mismatched-seq");
@@ -874,6 +1291,35 @@ void TestUnifiedStorageRejectsInvalidState()
                  mismatched_message.SerializeAsString());
     storage = openevent::UnifiedStorage::Open(bad_message.string());
     Check(!storage.ok(), "message key/value seq mismatch must be rejected");
+
+    const auto conflicting_object_root = base / "conflicting-object-root";
+    openevent::WriteObjectResponse written;
+    {
+        auto core = MakeCore(conflicting_object_root);
+        const std::string token = AddToken(*core, 100);
+        written = WriteObject(*core, 100, token, "conflict");
+    }
+    openevent::storage::internal::ObjectRecord preparing;
+    preparing.set_object_id(written.object_id());
+    preparing.set_object_token(written.object_token());
+    preparing.set_creator_principal(100);
+    preparing.set_name("object.bin");
+    preparing.set_type("application/octet-stream");
+    preparing.set_description("test object");
+    preparing.set_nbytes(8);
+    auto digest = openevent::ObjectFileStore::Sha256("conflict");
+    Check(digest.ok(), digest.status().message());
+    preparing.set_sha256(digest.value());
+    PutRawRecord(conflicting_object_root / "data" / "db",
+                 "objects",
+                 std::string("preparing/") + openevent::EncodeUint64(written.object_id()),
+                 preparing.SerializeAsString());
+    storage = openevent::UnifiedStorage::Open((conflicting_object_root / "data").string());
+    Check(!storage.ok() && storage.status().code() == grpc::StatusCode::DATA_LOSS,
+          "conflicting PREPARING and COMMITTED object metadata must reject startup");
+    Check(std::filesystem::is_regular_file(
+              conflicting_object_root / "data" / "objects" / std::to_string(written.object_id())),
+          "conflicting metadata recovery must not delete a committed object file");
 
     std::filesystem::remove_all(base);
 }
@@ -982,6 +1428,10 @@ int main()
     TestFetchScanBudgetAdvancesCursor();
     TestResponseSoftBudgetPagination();
     TestDeleteTokenOrdersBeforePublish();
+    TestObjectWriteMetadataReadAndReopen();
+    TestMessageObjectReferences();
+    TestPreparingRecoveryAndNoDirectoryScan();
+    TestCommittedObjectCorruptionIsFatal();
     TestUnifiedStorageReopen();
     TestUnifiedStorageLayout();
     TestUint64KeyEncodingOrder();

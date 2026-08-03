@@ -16,6 +16,11 @@ namespace openevent {
 namespace {
 
 constexpr size_t kResponseEnvelopeBytes = 1024 * 1024;
+constexpr size_t kMaxObjectNameBytes = 255;
+constexpr size_t kMaxObjectTypeBytes = 255;
+constexpr size_t kMaxObjectDescriptionBytes = 4096;
+constexpr size_t kMaxObjectBytes = 4 * 1024 * 1024;
+constexpr int kMaxObjectKeys = 1024;
 
 uint64_t NowMs()
 {
@@ -47,6 +52,60 @@ Result<std::string> GenerateToken()
         }
     }
     return oss.str();
+}
+
+Result<std::string> GenerateObjectToken()
+{
+    unsigned char bytes[32];
+    size_t filled = 0;
+    while (filled < sizeof(bytes)) {
+        const ssize_t count = getrandom(bytes + filled, sizeof(bytes) - filled, 0);
+        if (count < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            return Status(grpc::StatusCode::INTERNAL,
+                          std::string("getrandom failed: ") + std::strerror(errno));
+        }
+        filled += static_cast<size_t>(count);
+    }
+
+    constexpr char kBase64Url[] =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    std::string token;
+    token.reserve(43);
+    size_t index = 0;
+    while (index + 3 <= sizeof(bytes)) {
+        const uint32_t value = (static_cast<uint32_t>(bytes[index]) << 16) |
+                               (static_cast<uint32_t>(bytes[index + 1]) << 8) |
+                               static_cast<uint32_t>(bytes[index + 2]);
+        token.push_back(kBase64Url[(value >> 18) & 0x3f]);
+        token.push_back(kBase64Url[(value >> 12) & 0x3f]);
+        token.push_back(kBase64Url[(value >> 6) & 0x3f]);
+        token.push_back(kBase64Url[value & 0x3f]);
+        index += 3;
+    }
+    const size_t remaining = sizeof(bytes) - index;
+    if (remaining == 1) {
+        const uint32_t value = static_cast<uint32_t>(bytes[index]) << 16;
+        token.push_back(kBase64Url[(value >> 18) & 0x3f]);
+        token.push_back(kBase64Url[(value >> 12) & 0x3f]);
+    } else if (remaining == 2) {
+        const uint32_t value = (static_cast<uint32_t>(bytes[index]) << 16) |
+                               (static_cast<uint32_t>(bytes[index + 1]) << 8);
+        token.push_back(kBase64Url[(value >> 18) & 0x3f]);
+        token.push_back(kBase64Url[(value >> 12) & 0x3f]);
+        token.push_back(kBase64Url[(value >> 6) & 0x3f]);
+    }
+    return token;
+}
+
+bool SameObject(const StoredObject& left, const StoredObject& right)
+{
+    return left.object_id == right.object_id && left.object_token == right.object_token &&
+           left.creator_principal == right.creator_principal && left.name == right.name &&
+           left.type == right.type && left.description == right.description &&
+           left.nbytes == right.nbytes && left.sha256 == right.sha256;
 }
 
 std::string EncodeTokenPageToken(const std::string& token)
@@ -110,7 +169,8 @@ bool Contains(const Repeated& values, uint64_t value)
 OpenEventCore::OpenEventCore(std::unique_ptr<UnifiedStorage> storage,
                              size_t max_payload_bytes,
                              uint64_t max_scan_records,
-                             size_t response_soft_limit_bytes)
+                             size_t response_soft_limit_bytes,
+                             FatalErrorHandler fatal_error_handler)
     : storage_(std::move(storage)),
       max_payload_bytes_(max_payload_bytes),
       max_scan_records_(max_scan_records),
@@ -119,7 +179,8 @@ OpenEventCore::OpenEventCore(std::unique_ptr<UnifiedStorage> storage,
               ? (max_payload_bytes > std::numeric_limits<size_t>::max() - kResponseEnvelopeBytes
                      ? std::numeric_limits<size_t>::max()
                      : max_payload_bytes + kResponseEnvelopeBytes)
-              : response_soft_limit_bytes)
+              : response_soft_limit_bytes),
+      fatal_error_handler_(std::move(fatal_error_handler))
 {
 }
 
@@ -172,6 +233,7 @@ Status OpenEventCore::BuildPublishBatch(const ReadSnapshot& snapshot,
                                         uint64_t seq,
                                         const google::protobuf::RepeatedField<uint64_t>& recipients,
                                         const std::string& payload,
+                                        const google::protobuf::RepeatedPtrField<ObjectKey>& object_keys,
                                         uint64_t ts_ms,
                                         rocksdb::WriteBatch* batch) const
 {
@@ -193,6 +255,12 @@ Status OpenEventCore::BuildPublishBatch(const ReadSnapshot& snapshot,
     if (!recipients_status.ok()) {
         return recipients_status;
     }
+    for (const auto& object_key : object_keys) {
+        auto object = LoadAuthorizedObject(snapshot, object_key.object_id(), object_key.object_token());
+        if (!object.ok()) {
+            return object.status();
+        }
+    }
 
     EventMessage message;
     message.set_seq(seq);
@@ -203,6 +271,9 @@ Status OpenEventCore::BuildPublishBatch(const ReadSnapshot& snapshot,
     }
     message.set_payload(payload);
     message.set_ts_ms(ts_ms);
+    for (const auto& object_key : object_keys) {
+        *message.add_object_keys() = object_key;
+    }
 
     Status status = storage_->PutMessage(batch, message);
     if (!status.ok()) {
@@ -227,6 +298,10 @@ Status OpenEventCore::Publish(const PublishRequest& request, PublishResponse*)
     Status payload_status = ValidatePayloadSize(request.payload());
     if (!payload_status.ok()) {
         return payload_status;
+    }
+    Status object_keys_status = ValidateObjectKeysShape(request.object_keys());
+    if (!object_keys_status.ok()) {
+        return object_keys_status;
     }
 
     std::lock_guard<std::mutex> lock(coordinator_mu_);
@@ -254,6 +329,7 @@ Status OpenEventCore::Publish(const PublishRequest& request, PublishResponse*)
                                       request.seq(),
                                       request.recipients(),
                                       request.payload(),
+                                      request.object_keys(),
                                       ts_ms,
                                       &batch);
     if (!status.ok()) {
@@ -268,6 +344,10 @@ Status OpenEventCore::PublishAutoSeq(const PublishAutoSeqRequest& request, Publi
     Status payload_status = ValidatePayloadSize(request.payload());
     if (!payload_status.ok()) {
         return payload_status;
+    }
+    Status object_keys_status = ValidateObjectKeysShape(request.object_keys());
+    if (!object_keys_status.ok()) {
+        return object_keys_status;
     }
 
     std::lock_guard<std::mutex> lock(coordinator_mu_);
@@ -293,6 +373,7 @@ Status OpenEventCore::PublishAutoSeq(const PublishAutoSeqRequest& request, Publi
                                       seq,
                                       request.recipients(),
                                       request.payload(),
+                                      request.object_keys(),
                                       ts_ms,
                                       &batch);
     if (!status.ok()) {
@@ -314,6 +395,233 @@ Status OpenEventCore::ValidatePayloadSize(const std::string& payload) const
     return Status(grpc::StatusCode::RESOURCE_EXHAUSTED,
                   "payload exceeds limits.max_payload_bytes (" + std::to_string(payload.size()) + " > " +
                       std::to_string(max_payload_bytes_) + ")");
+}
+
+Status OpenEventCore::ValidateObjectKeysShape(
+    const google::protobuf::RepeatedPtrField<ObjectKey>& object_keys) const
+{
+    if (object_keys.size() > kMaxObjectKeys) {
+        return Status(grpc::StatusCode::INVALID_ARGUMENT, "object_keys must contain at most 1024 items");
+    }
+    for (const auto& object_key : object_keys) {
+        if (object_key.object_id() == 0 || object_key.object_token().empty()) {
+            return Status(grpc::StatusCode::INVALID_ARGUMENT,
+                          "each ObjectKey requires nonzero object_id and nonempty object_token");
+        }
+    }
+    return Status::Ok();
+}
+
+Result<StoredObject> OpenEventCore::LoadAuthorizedObject(const ReadSnapshot& snapshot,
+                                                        uint64_t object_id,
+                                                        const std::string& object_token) const
+{
+    if (object_id == 0 || object_token.empty()) {
+        return Status(grpc::StatusCode::INVALID_ARGUMENT,
+                      "object_id must be nonzero and object_token must be nonempty");
+    }
+    auto object = storage_->GetCommittedObject(snapshot, object_id);
+    if (!object.ok()) {
+        return object.status().code() == grpc::StatusCode::DATA_LOSS
+                   ? FatalStorageError(object.status())
+                   : object.status();
+    }
+    if (!object.value().has_value() ||
+        !ObjectFileStore::ConstantTimeEquals(object.value()->object_token, object_token)) {
+        return Status(grpc::StatusCode::NOT_FOUND, "object capability not found");
+    }
+    return object.value().value();
+}
+
+Status OpenEventCore::FatalStorageError(const Status& status) const
+{
+    bool expected = false;
+    if (fatal_error_triggered_.compare_exchange_strong(expected, true, std::memory_order_acq_rel) &&
+        fatal_error_handler_) {
+        fatal_error_handler_(status);
+    }
+    return status;
+}
+
+Status OpenEventCore::CleanupPreparingObject(uint64_t object_id, const Status& result)
+{
+    Status file_status = storage_->CleanupObjectFiles(object_id);
+    if (!file_status.ok()) {
+        return file_status.code() == grpc::StatusCode::DATA_LOSS ? FatalStorageError(file_status) : file_status;
+    }
+
+    std::lock_guard<std::mutex> lock(coordinator_mu_);
+    rocksdb::WriteBatch batch;
+    storage_->DeletePreparingObject(&batch, object_id);
+    Status cleanup_status = CommitBatch(&batch);
+    return cleanup_status.ok() ? result : cleanup_status;
+}
+
+Status OpenEventCore::WriteObject(const WriteObjectRequest& request, WriteObjectResponse* response)
+{
+    if (request.name().empty() || request.name().size() > kMaxObjectNameBytes ||
+        request.type().empty() || request.type().size() > kMaxObjectTypeBytes ||
+        request.description().size() > kMaxObjectDescriptionBytes || request.data().empty() ||
+        request.data().size() > kMaxObjectBytes) {
+        return Status(grpc::StatusCode::INVALID_ARGUMENT, "invalid object metadata or data size");
+    }
+
+    auto object_token = GenerateObjectToken();
+    if (!object_token.ok()) {
+        return object_token.status();
+    }
+    auto sha256 = ObjectFileStore::Sha256(request.data());
+    if (!sha256.ok()) {
+        return sha256.status();
+    }
+
+    StoredObject object;
+    object.object_token = std::move(object_token.value());
+    object.creator_principal = request.principal();
+    object.name = request.name();
+    object.type = request.type();
+    object.description = request.description();
+    object.nbytes = request.data().size();
+    object.sha256 = std::move(sha256.value());
+
+    {
+        std::lock_guard<std::mutex> lock(coordinator_mu_);
+        auto snapshot_result = storage_->CreateSnapshot();
+        if (!snapshot_result.ok()) {
+            return snapshot_result.status();
+        }
+        ReadSnapshot snapshot = std::move(snapshot_result.value());
+        Status auth = Authenticate(snapshot, request.principal(), request.token());
+        if (!auth.ok()) {
+            return auth;
+        }
+        auto next_object_id = storage_->GetNextObjectId(snapshot);
+        if (!next_object_id.ok()) {
+            return next_object_id.status();
+        }
+        if (next_object_id.value() == std::numeric_limits<uint64_t>::max()) {
+            return Status(grpc::StatusCode::RESOURCE_EXHAUSTED, "object ID space exhausted");
+        }
+        object.object_id = next_object_id.value();
+
+        rocksdb::WriteBatch batch;
+        Status status = storage_->PutPreparingObject(&batch, object);
+        if (!status.ok()) {
+            return status;
+        }
+        status = storage_->SetNextObjectId(&batch, object.object_id + 1);
+        if (!status.ok()) {
+            return status;
+        }
+        status = CommitBatch(&batch);
+        if (!status.ok()) {
+            return status;
+        }
+    }
+
+    Status file_status = storage_->WriteObjectFile(object.object_id, request.data());
+    if (!file_status.ok()) {
+        if (file_status.code() == grpc::StatusCode::DATA_LOSS) {
+            return FatalStorageError(file_status);
+        }
+        return CleanupPreparingObject(object.object_id, file_status);
+    }
+
+    Status final_status = Status::Ok();
+    bool commit_attempted = false;
+    {
+        std::lock_guard<std::mutex> lock(coordinator_mu_);
+        auto snapshot_result = storage_->CreateSnapshot();
+        if (!snapshot_result.ok()) {
+            final_status = snapshot_result.status();
+        } else {
+            ReadSnapshot snapshot = std::move(snapshot_result.value());
+            final_status = Authenticate(snapshot, request.principal(), request.token());
+            if (final_status.ok()) {
+                auto preparing = storage_->GetPreparingObject(snapshot, object.object_id);
+                if (!preparing.ok()) {
+                    if (preparing.status().code() == grpc::StatusCode::DATA_LOSS) {
+                        return FatalStorageError(preparing.status());
+                    }
+                    final_status = preparing.status();
+                } else if (!preparing.value().has_value() ||
+                           !SameObject(preparing.value().value(), object)) {
+                    return FatalStorageError(Status(
+                        grpc::StatusCode::DATA_LOSS,
+                        "preparing object metadata changed unexpectedly"));
+                } else {
+                    rocksdb::WriteBatch batch;
+                    final_status = storage_->PutCommittedObject(&batch, object);
+                    if (final_status.ok()) {
+                        commit_attempted = true;
+                        final_status = CommitBatch(&batch);
+                    }
+                    if (final_status.ok()) {
+                        response->set_object_id(object.object_id);
+                        response->set_object_token(object.object_token);
+                        return Status::Ok();
+                    }
+                }
+            }
+        }
+    }
+    if (commit_attempted) {
+        return final_status;
+    }
+    return CleanupPreparingObject(object.object_id, final_status);
+}
+
+Status OpenEventCore::GetObjectMetadata(const GetObjectMetadataRequest& request,
+                                        GetObjectMetadataResponse* response)
+{
+    auto snapshot_result = CreateLinearizedSnapshot();
+    if (!snapshot_result.ok()) {
+        return snapshot_result.status();
+    }
+    ReadSnapshot snapshot = std::move(snapshot_result.value());
+    auto object = LoadAuthorizedObject(snapshot, request.object_id(), request.object_token());
+    if (!object.ok()) {
+        return object.status();
+    }
+    response->set_name(object.value().name);
+    response->set_type(object.value().type);
+    response->set_description(object.value().description);
+    response->set_nbytes(object.value().nbytes);
+    return Status::Ok();
+}
+
+Status OpenEventCore::ReadObject(const ReadObjectRequest& request, ReadObjectResponse* response)
+{
+    if (request.nbytes() == 0) {
+        return Status(grpc::StatusCode::INVALID_ARGUMENT, "nbytes must be greater than 0");
+    }
+
+    StoredObject object;
+    {
+        auto snapshot_result = CreateLinearizedSnapshot();
+        if (!snapshot_result.ok()) {
+            return snapshot_result.status();
+        }
+        ReadSnapshot snapshot = std::move(snapshot_result.value());
+        auto loaded = LoadAuthorizedObject(snapshot, request.object_id(), request.object_token());
+        if (!loaded.ok()) {
+            return loaded.status();
+        }
+        object = std::move(loaded.value());
+    }
+
+    if (request.offset() > object.nbytes) {
+        return Status(grpc::StatusCode::OUT_OF_RANGE, "offset exceeds object size");
+    }
+    auto data = storage_->ReadObjectFile(object);
+    if (!data.ok()) {
+        return data.status().code() == grpc::StatusCode::DATA_LOSS ? FatalStorageError(data.status())
+                                                                   : data.status();
+    }
+    const uint64_t remaining = object.nbytes - request.offset();
+    const size_t count = static_cast<size_t>(std::min(request.nbytes(), remaining));
+    response->set_data(data.value().substr(static_cast<size_t>(request.offset()), count));
+    return Status::Ok();
 }
 
 Status OpenEventCore::Fetch(const FetchRequest& request, FetchResponse* response)

@@ -25,4 +25,16 @@ Please include:
 
 - Do not expose `AdminService` directly to the public internet.
 - Bind the admin port to localhost or a trusted management network.
-- Protect token material in logs, shell history, CI output, and issue reports.
+- Protect principal tokens, object tokens, and admin page tokens in logs, shell
+  history, CI output, traces, and issue reports.
+- An ObjectKey is a permanent transferable bearer credential. Anyone holding its
+  object ID and token can read the object without principal authentication. There
+  is currently no revocation, rotation, or deletion operation.
+- Attaching an ObjectKey to a message reveals it to every caller allowed to read
+  that message and to AdminService ListMessages. Apply Channel ACLs accordingly.
+- RocksDB stores principal and object tokens in plaintext. Restrict filesystem
+  access to `storage.path`, encrypt storage and backups when required, and handle
+  backups as credential-bearing sensitive data.
+- The reference server uses insecure gRPC credentials. Put business and admin
+  endpoints behind trusted network boundaries or a TLS/mTLS proxy appropriate to
+  the deployment.

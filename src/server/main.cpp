@@ -8,6 +8,7 @@
 #include <pthread.h>
 #include <string>
 #include <thread>
+#include <unistd.h>
 
 #include <grpcpp/grpcpp.h>
 
@@ -54,18 +55,31 @@ int main(int argc, char** argv)
         return 1;
     }
 
+    std::atomic<bool> fatal_storage_error{false};
     auto core = std::make_shared<openevent::OpenEventCore>(std::move(storage_result.value()),
-                                                           config.max_payload_bytes);
+                                                           config.max_payload_bytes,
+                                                           10000,
+                                                           0,
+                                                           [&fatal_storage_error](const openevent::Status& status) {
+                                                               fatal_storage_error.store(
+                                                                   true, std::memory_order_release);
+                                                               std::cerr << "fatal storage error: "
+                                                                         << status.message() << "\n";
+                                                               ::kill(::getpid(), SIGTERM);
+                                                           });
 
     openevent::EventServiceImpl event_service(core);
+    openevent::ObjectStorageServiceImpl object_storage_service(core);
     openevent::ChannelServiceImpl channel_service(core);
     openevent::AdminServiceImpl admin_service(core);
 
+    constexpr size_t kMaxObjectBytes = 4 * 1024 * 1024;
     constexpr size_t kGrpcEnvelopeBytes = 2 * 1024 * 1024;
     const size_t max_grpc_size = static_cast<size_t>(std::numeric_limits<int>::max());
-    const size_t configured_grpc_size = config.max_payload_bytes > max_grpc_size - kGrpcEnvelopeBytes
+    const size_t largest_body = std::max(config.max_payload_bytes, kMaxObjectBytes);
+    const size_t configured_grpc_size = largest_body > max_grpc_size - kGrpcEnvelopeBytes
                                             ? max_grpc_size
-                                            : config.max_payload_bytes + kGrpcEnvelopeBytes;
+                                            : largest_body + kGrpcEnvelopeBytes;
     const int grpc_message_limit = static_cast<int>(configured_grpc_size);
 
     grpc::ServerBuilder admin_builder;
@@ -84,6 +98,7 @@ int main(int argc, char** argv)
     public_builder.SetMaxSendMessageSize(grpc_message_limit);
     public_builder.AddListeningPort(config.grpc_listen_addr, grpc::InsecureServerCredentials());
     public_builder.RegisterService(&event_service);
+    public_builder.RegisterService(&object_storage_service);
     public_builder.RegisterService(&channel_service);
     std::unique_ptr<grpc::Server> public_server(public_builder.BuildAndStart());
     if (!public_server) {
@@ -121,5 +136,5 @@ int main(int argc, char** argv)
     }
     admin_thread.join();
     shutdown_thread.join();
-    return 0;
+    return fatal_storage_error.load(std::memory_order_acquire) ? 1 : 0;
 }

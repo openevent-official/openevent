@@ -37,6 +37,8 @@ the same OpenEvent event queue.
 - Supports both client-assigned `seq` publishing and server-assigned `seq`.
 - Channels support `public`, `protected`, and `private` visibility.
 - Supports batch fetch and server-streaming subscription.
+- Stores immutable objects up to 4 MiB and attaches ordered ObjectKey capabilities
+  to messages.
 - Token-based authentication for business requests.
 - Includes a Python SDK submodule.
 
@@ -68,6 +70,7 @@ Install the build dependencies for your Linux distribution first:
 - Protobuf and `protoc`
 - gRPC and `grpc_cpp_plugin`
 - RocksDB
+- OpenSSL
 - yaml-cpp
 
 Initialize submodules:

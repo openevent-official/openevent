@@ -45,12 +45,17 @@ shutdown:
 ### `storage`
 
 - `path`: string, no default, must be explicitly configured.
-- The only RocksDB data directory. Metadata and messages use separate
-  Column Families in the same DB.
+- The OpenEvent data root. It has a fixed layout: `path/db` contains one RocksDB
+  instance with `default` (metadata), `messages`, and `objects` Column Families;
+  `path/objects` contains one immutable file per committed object, named by its
+  decimal object ID.
 - Must not be empty. A first deployment uses a missing or empty new directory;
   the server initializes a missing directory, and the runtime user must have
   write permission to its parent. Later starts accept only the complete target
   schema.
+- Object data is limited to 4 MiB per object and is not stored in RocksDB. Objects
+  are never updated, deleted, or garbage-collected by the current server, so each
+  object permanently consumes data space and one inode.
 
 ### `limits`
 
@@ -59,7 +64,7 @@ shutdown:
 - `Publish` and `PublishAutoSeq` return `RESOURCE_EXHAUSTED` when the payload
   exceeds this limit.
 - Both gRPC servers derive their send/receive hard limit from
-  `max_payload_bytes + 2 MiB`, capped at the largest value accepted by gRPC.
+  `max(max_payload_bytes, 4 MiB) + 2 MiB`, capped at the largest value accepted by gRPC.
   Fetch and administrative message pages use a separate soft response budget of
   `max_payload_bytes + 1 MiB`.
 - Must be greater than 0.
@@ -86,6 +91,17 @@ shutdown:
 - Use an absolute data path, for example `/var/lib/openevent/data`.
 - The service user must be able to read the config file and create/write the
   configured data directories.
+- Use a local Linux filesystem that supports durable file `fsync`, directory
+  `fsync`, and non-overwriting atomic `renameat2(RENAME_NOREPLACE)`. NFS and
+  filesystems without those semantics are unsupported.
+- Monitor both free bytes and free inodes under `storage.path`. The server has no
+  object deletion or background garbage collection.
+- Back up `db/` and `objects/` as one consistent unit using a stopped service or a
+  filesystem/storage snapshot with equivalent consistency. Copying either child
+  independently can produce committed metadata without matching object data.
+- Startup only recovers known incomplete object writes; it does not scan every
+  committed object file. Missing or corrupted committed data is detected when
+  ReadObject accesses it, returns `DATA_LOSS`, and causes a nonzero server exit.
 
 ## Validation Errors
 

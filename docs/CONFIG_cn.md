@@ -45,17 +45,21 @@ shutdown:
 ### `storage`
 
 - `path`：字符串，无默认值，必须通过配置显式提供。
-- 唯一 RocksDB 数据目录；metadata 和消息分别位于同一 DB 的不同 Column Family。
+- OpenEvent 数据根目录，固定布局为：`path/db` 保存一个 RocksDB 实例，其中包含 `default`
+  （metadata）、`messages` 和 `objects` 三个 Column Family；`path/objects` 为每个 committed 对象
+  保存一个不可变文件，文件名是十进制 object ID。
 - 不能为空。首次部署使用不存在或为空的新目录；目录不存在时由服务端初始化，运行用户必须拥有
   对应父目录的写入权限。后续启动只接受完整的目标 schema。
+- 对象 data 不进入 RocksDB，每个对象最大 4 MiB。当前服务端不更新、删除或回收对象，因此每个
+  对象永久占用 data 空间和一个 inode。
 
 ### `limits`
 
 - `max_payload_bytes`：无符号整数，默认 `16777216`（16 MiB）
 - 单条消息 `payload` 的最大字节数。
 - `Publish` 和 `PublishAutoSeq` 收到超过该限制的消息时返回 `RESOURCE_EXHAUSTED`。
-- 两个 gRPC Server 的收发硬上限由 `max_payload_bytes + 2 MiB` 推导，并封顶为 gRPC 接受的
-  最大值；Fetch 和管理消息分页使用独立的 `max_payload_bytes + 1 MiB` 应用层响应软预算。
+- 两个 gRPC Server 的收发硬上限由 `max(max_payload_bytes, 4 MiB) + 2 MiB` 推导，并封顶为
+  gRPC 接受的最大值；Fetch 和管理消息分页使用独立的 `max_payload_bytes + 1 MiB` 应用层响应软预算。
 - 必须大于 0。
 
 ### `shutdown`
@@ -76,6 +80,13 @@ shutdown:
 - 配置文件建议放在 `/etc/openevent/openevent-server.yaml` 或部署系统管理的等价路径。
 - 数据目录建议使用绝对路径，例如 `/var/lib/openevent/data`。
 - 运行服务的系统用户必须能读取配置文件，并能创建和写入配置中的数据目录。
+- 必须使用支持持久文件 `fsync`、目录 `fsync` 和不覆盖原子
+  `renameat2(RENAME_NOREPLACE)` 的本地 Linux 文件系统。不支持 NFS 或缺少这些语义的文件系统。
+- 同时监控 `storage.path` 下的可用字节数和 inode；服务端没有对象删除或后台垃圾回收。
+- 必须在服务停止时，或使用具有同等一致性的文件系统/存储快照，把 `db/` 和 `objects/` 作为一个
+  一致单元备份。单独复制任一子目录可能得到缺少对应对象 data 的 committed metadata。
+- 启动只恢复已知的未完成对象写入，不扫描所有 committed 对象文件。ReadObject 访问时才会发现
+  committed data 缺失或损坏，返回 `DATA_LOSS`，并使服务端以非零状态退出。
 
 ## 校验错误
 

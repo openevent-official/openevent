@@ -1,0 +1,14 @@
+syntax = "proto3";
+
+package openevent.storage.internal;
+
+message ObjectRecord {
+    uint64 object_id = 1;
+    string object_token = 2;
+    uint64 creator_principal = 3;
+    string name = 4;
+    string type = 5;
+    string description = 6;
+    uint64 nbytes = 7;
+    bytes sha256 = 8;
+}

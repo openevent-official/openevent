@@ -1,12 +1,13 @@
 cmake_minimum_required(VERSION 3.20)
 
-project(OpenEvent VERSION 0.4.1 LANGUAGES CXX)
+project(OpenEvent VERSION 0.4.2 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
 find_package(Protobuf REQUIRED)
+find_package(OpenSSL REQUIRED)
 find_package(Threads REQUIRED)
 find_package(PkgConfig REQUIRED)
 include(GNUInstallDirs)
@@ -49,12 +50,28 @@ add_library(openevent_proto ${OPENEVENT_PROTO_SRCS})
 target_include_directories(openevent_proto PUBLIC "${OPENEVENT_PROTO_GEN_DIR}")
 target_link_libraries(openevent_proto PUBLIC protobuf::libprotobuf PkgConfig::GRPCPP)
 
+set(OPENEVENT_STORAGE_PROTO "${CMAKE_CURRENT_SOURCE_DIR}/src/storage/object_record.proto")
+set(OPENEVENT_STORAGE_PROTO_SRC "${OPENEVENT_PROTO_GEN_DIR}/object_record.pb.cc")
+set(OPENEVENT_STORAGE_PROTO_HDR "${OPENEVENT_PROTO_GEN_DIR}/object_record.pb.h")
+add_custom_command(
+    OUTPUT ${OPENEVENT_STORAGE_PROTO_SRC} ${OPENEVENT_STORAGE_PROTO_HDR}
+    COMMAND ${Protobuf_PROTOC_EXECUTABLE}
+    ARGS --proto_path ${CMAKE_CURRENT_SOURCE_DIR}/src/storage
+         --cpp_out ${OPENEVENT_PROTO_GEN_DIR}
+         ${OPENEVENT_STORAGE_PROTO}
+    DEPENDS ${OPENEVENT_STORAGE_PROTO}
+    VERBATIM)
+add_library(openevent_storage_proto ${OPENEVENT_STORAGE_PROTO_SRC})
+target_include_directories(openevent_storage_proto PUBLIC "${OPENEVENT_PROTO_GEN_DIR}")
+target_link_libraries(openevent_storage_proto PUBLIC protobuf::libprotobuf)
+
 add_library(openevent_storage
+    src/storage/object_file_store.cpp
     src/storage/unified_storage.cpp)
 target_include_directories(openevent_storage PUBLIC src)
 target_link_libraries(openevent_storage
-    PUBLIC openevent_proto
-    PRIVATE PkgConfig::ROCKSDB)
+    PUBLIC openevent_proto openevent_storage_proto
+    PRIVATE PkgConfig::ROCKSDB OpenSSL::Crypto)
 
 add_library(openevent_service
     src/service/open_event_core.cpp

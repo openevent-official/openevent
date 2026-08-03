@@ -13,6 +13,7 @@
 #include "admin.pb.h"
 #include "common/status.h"
 #include "openevent.pb.h"
+#include "storage/object_file_store.h"
 
 namespace openevent {
 
@@ -47,6 +48,17 @@ struct TokenBindingPage {
     bool has_more = false;
 };
 
+struct StoredObject {
+    uint64_t object_id = 0;
+    std::string object_token;
+    uint64_t creator_principal = 0;
+    std::string name;
+    std::string type;
+    std::string description;
+    uint64_t nbytes = 0;
+    std::string sha256;
+};
+
 enum class MessageScanAction {
     kContinue,
     kStopBefore,
@@ -69,6 +81,7 @@ public:
 
     Result<uint64_t> GetMaxSeq(const ReadSnapshot& snapshot) const;
     Result<uint64_t> GetNextChannelId(const ReadSnapshot& snapshot) const;
+    Result<uint64_t> GetNextObjectId(const ReadSnapshot& snapshot) const;
     Result<std::optional<uint64_t>> GetPrincipalForToken(const ReadSnapshot& snapshot,
                                                          const std::string& token) const;
     Result<std::optional<ChannelInfo>> GetChannel(const ReadSnapshot& snapshot, uint64_t channel_id) const;
@@ -81,33 +94,54 @@ public:
                                   uint64_t last_seq,
                                   uint64_t max_records,
                                   const MessageVisitor& visitor) const;
+    Result<std::optional<StoredObject>> GetPreparingObject(const ReadSnapshot& snapshot,
+                                                           uint64_t object_id) const;
+    Result<std::optional<StoredObject>> GetCommittedObject(const ReadSnapshot& snapshot,
+                                                           uint64_t object_id) const;
 
     Status SetMaxSeq(rocksdb::WriteBatch* batch, uint64_t seq) const;
     Status SetNextChannelId(rocksdb::WriteBatch* batch, uint64_t channel_id) const;
+    Status SetNextObjectId(rocksdb::WriteBatch* batch, uint64_t object_id) const;
     Status PutMessage(rocksdb::WriteBatch* batch, const EventMessage& message) const;
     Status PutChannel(rocksdb::WriteBatch* batch, const ChannelInfo& channel) const;
     Status PutToken(rocksdb::WriteBatch* batch, const std::string& token, uint64_t principal) const;
     void DeleteToken(rocksdb::WriteBatch* batch, const std::string& token) const;
+    Status PutPreparingObject(rocksdb::WriteBatch* batch, const StoredObject& object) const;
+    Status PutCommittedObject(rocksdb::WriteBatch* batch, const StoredObject& object) const;
+    void DeletePreparingObject(rocksdb::WriteBatch* batch, uint64_t object_id) const;
+
+    Status WriteObjectFile(uint64_t object_id, const std::string& data) const;
+    Status CleanupObjectFiles(uint64_t object_id) const;
+    Result<std::string> ReadObjectFile(const StoredObject& object) const;
 
 private:
     friend class ReadSnapshot;
 
     UnifiedStorage(std::unique_ptr<rocksdb::DB> db,
                    rocksdb::ColumnFamilyHandle* meta,
-                   rocksdb::ColumnFamilyHandle* messages);
+                   rocksdb::ColumnFamilyHandle* messages,
+                   rocksdb::ColumnFamilyHandle* objects,
+                   std::unique_ptr<ObjectFileStore> object_files);
 
-    static Status InitializeNew(const std::string& path);
-    static Status CompleteInitialization(const std::string& path,
+    static Status InitializeNew(const std::string& root_path);
+    static Status CompleteInitialization(const std::string& root_path,
                                          const std::vector<std::string>& column_families);
-    static Result<std::unique_ptr<UnifiedStorage>> OpenExisting(const std::string& path);
+    static Result<std::unique_ptr<UnifiedStorage>> OpenExisting(const std::string& root_path);
 
     Result<uint64_t> GetRequiredUint64(const ReadSnapshot& snapshot, const std::string& key) const;
+    Result<std::optional<StoredObject>> GetObject(const ReadSnapshot& snapshot,
+                                                  const char* prefix,
+                                                  uint64_t object_id) const;
+    Result<std::vector<StoredObject>> ListPreparingObjects() const;
+    Status RecoverPreparingObjects();
     Status Validate() const;
     void ReleaseSnapshot(const rocksdb::Snapshot* snapshot) const;
 
     std::unique_ptr<rocksdb::DB> db_;
     rocksdb::ColumnFamilyHandle* meta_ = nullptr;
     rocksdb::ColumnFamilyHandle* messages_ = nullptr;
+    rocksdb::ColumnFamilyHandle* objects_ = nullptr;
+    std::unique_ptr<ObjectFileStore> object_files_;
 };
 
 }  // namespace openevent
