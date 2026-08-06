@@ -10,6 +10,7 @@
 #include <mutex>
 #include <optional>
 #include <string>
+#include <thread>
 
 #include "admin.pb.h"
 #include "common/status.h"
@@ -27,6 +28,7 @@ public:
                   uint64_t max_scan_records = 10000,
                   size_t response_soft_limit_bytes = 0,
                   FatalErrorHandler fatal_error_handler = {});
+    ~OpenEventCore();
 
     Status GetStatus(const GetStatusRequest& request, GetStatusResponse* response);
     Status Publish(const PublishRequest& request, PublishResponse* response);
@@ -48,20 +50,32 @@ public:
     Status ListTokens(const ListTokensRequest& request, ListTokensResponse* response);
     Status ListMessages(const ListMessagesRequest& request, ListMessagesResponse* response);
 
+    Status HandleRpcStatus(const Status& status) const;
+
     Status GetSubscriptionMaxSeq(uint64_t principal, const std::string& token, uint64_t* max_seq) const;
     Status FetchSubscriptionBatch(uint64_t principal,
                                   const std::string& token,
                                   uint64_t from_seq,
                                   uint32_t limit,
                                   bool only_my_recipient,
-                                  FetchResponse* response) const;
-    uint64_t CommitGeneration() const;
-    void WaitForCommit(uint64_t observed_generation, std::chrono::milliseconds timeout) const;
+                                  const google::protobuf::RepeatedField<uint64_t>& channels,
+                                  FetchResponse* response,
+                                  uint64_t* snapshot_version = nullptr) const;
+    uint64_t SubscriptionSnapshotVersion() const;
+    bool WaitForSubscriptionSnapshot(uint64_t observed_version,
+                                     std::chrono::milliseconds timeout) const;
 
     Result<uint64_t> MaxSeq() const;
 
 private:
+    struct SubscriptionSnapshot {
+        std::shared_ptr<const ReadSnapshot> snapshot;
+        uint64_t version = 0;
+    };
+
     Result<ReadSnapshot> CreateLinearizedSnapshot();
+    Result<SubscriptionSnapshot> AcquireSubscriptionSnapshot() const;
+    void RefreshSubscriptionSnapshots();
     Status Authenticate(const ReadSnapshot& snapshot, uint64_t principal, const std::string& token) const;
     Status BuildPublishBatch(const ReadSnapshot& snapshot,
                              uint64_t principal,
@@ -109,8 +123,15 @@ private:
     size_t response_soft_limit_bytes_ = 0;
     mutable std::mutex coordinator_mu_;
     std::atomic<uint64_t> commit_generation_{0};
-    mutable std::mutex commit_wait_mu_;
-    mutable std::condition_variable commit_cv_;
+    mutable std::mutex subscription_snapshot_mu_;
+    mutable std::condition_variable subscription_snapshot_cv_;
+    std::shared_ptr<const ReadSnapshot> subscription_snapshot_;
+    uint64_t subscription_snapshot_version_ = 0;
+    uint64_t subscription_snapshot_generation_ = 0;
+    uint64_t subscription_snapshot_attempt_generation_ = 0;
+    Status subscription_snapshot_status_;
+    bool stop_subscription_snapshot_thread_ = false;
+    std::thread subscription_snapshot_thread_;
     FatalErrorHandler fatal_error_handler_;
     mutable std::atomic<bool> fatal_error_triggered_{false};
 };

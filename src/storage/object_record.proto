@@ -10,5 +10,5 @@ message ObjectRecord {
     string type = 5;
     string description = 6;
     uint64 nbytes = 7;
-    bytes sha256 = 8;
+    reserved 8;
 }

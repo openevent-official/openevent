@@ -52,7 +52,8 @@ shutdown:
 - Must not be empty. A first deployment uses a missing or empty new directory;
   the server initializes a missing directory, and the runtime user must have
   write permission to its parent. Later starts accept only the complete target
-  schema.
+  schema. If initialization was interrupted or the nonempty directory has any
+  incomplete layout, the server rejects startup instead of repairing it.
 - Object data is limited to 4 MiB per object and is not stored in RocksDB. Objects
   are never updated, deleted, or garbage-collected by the current server, so each
   object permanently consumes data space and one inode.
@@ -99,9 +100,21 @@ shutdown:
 - Back up `db/` and `objects/` as one consistent unit using a stopped service or a
   filesystem/storage snapshot with equivalent consistency. Copying either child
   independently can produce committed metadata without matching object data.
-- Startup only recovers known incomplete object writes; it does not scan every
-  committed object file. Missing or corrupted committed data is detected when
-  ReadObject accesses it, returns `DATA_LOSS`, and causes a nonzero server exit.
+- Startup does not scan historical messages or compare the message watermark
+  with stored message records. It only scans known incomplete object writes,
+  not committed object metadata, files, or the complete object directory.
+  Missing committed object data, a non-regular file, or a metadata/file size
+  mismatch is detected when ReadObject accesses it, returns `DATA_LOSS`, and
+  causes a nonzero server exit. Same-size content changes are not detected.
+- Any RocksDB operation failure encountered while serving requests causes a
+  nonzero server exit. RocksDB corruption returns `DATA_LOSS`; other RocksDB
+  errors return `UNAVAILABLE`. A normal lookup of a missing token, Channel, or
+  object is not a RocksDB failure. Any RocksDB failure during startup prevents
+  startup.
+- Stored bytes that violate the internal record format or required record
+  relationships are treated as corruption. A request that encounters such data
+  returns `DATA_LOSS` and causes a nonzero server exit. Startup still performs no
+  full historical message or committed object scan.
 
 ## Validation Errors
 

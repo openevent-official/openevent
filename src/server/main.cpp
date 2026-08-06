@@ -13,6 +13,7 @@
 #include <grpcpp/grpcpp.h>
 
 #include "server/server_config.h"
+#include "common/object_limits.h"
 #include "service/grpc_services.h"
 #include "service/open_event_core.h"
 #include "storage/unified_storage.h"
@@ -73,10 +74,9 @@ int main(int argc, char** argv)
     openevent::ChannelServiceImpl channel_service(core);
     openevent::AdminServiceImpl admin_service(core);
 
-    constexpr size_t kMaxObjectBytes = 4 * 1024 * 1024;
     constexpr size_t kGrpcEnvelopeBytes = 2 * 1024 * 1024;
     const size_t max_grpc_size = static_cast<size_t>(std::numeric_limits<int>::max());
-    const size_t largest_body = std::max(config.max_payload_bytes, kMaxObjectBytes);
+    const size_t largest_body = std::max(config.max_payload_bytes, openevent::kMaxObjectBytes);
     const size_t configured_grpc_size = largest_body > max_grpc_size - kGrpcEnvelopeBytes
                                             ? max_grpc_size
                                             : largest_body + kGrpcEnvelopeBytes;

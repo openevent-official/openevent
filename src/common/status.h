@@ -13,11 +13,19 @@ public:
     Status(grpc::StatusCode code, std::string message)
         : code_(code), message_(std::move(message)) {}
 
+    static Status Fatal(grpc::StatusCode code, std::string message)
+    {
+        Status status(code, std::move(message));
+        status.requires_server_exit_ = true;
+        return status;
+    }
+
     static Status Ok() { return {}; }
 
     bool ok() const { return code_ == grpc::StatusCode::OK; }
     grpc::StatusCode code() const { return code_; }
     const std::string& message() const { return message_; }
+    bool requires_server_exit() const { return requires_server_exit_; }
 
     grpc::Status ToGrpc() const
     {
@@ -30,6 +38,7 @@ public:
 private:
     grpc::StatusCode code_ = grpc::StatusCode::OK;
     std::string message_;
+    bool requires_server_exit_ = false;
 };
 
 template <typename T>

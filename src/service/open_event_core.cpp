@@ -7,20 +7,18 @@
 #include <iomanip>
 #include <limits>
 #include <sstream>
+#include <unordered_map>
 #include <unordered_set>
 #include <utility>
 
 #include <sys/random.h>
 
+#include "common/object_limits.h"
+
 namespace openevent {
 namespace {
 
 constexpr size_t kResponseEnvelopeBytes = 1024 * 1024;
-constexpr size_t kMaxObjectNameBytes = 255;
-constexpr size_t kMaxObjectTypeBytes = 255;
-constexpr size_t kMaxObjectDescriptionBytes = 4096;
-constexpr size_t kMaxObjectBytes = 4 * 1024 * 1024;
-constexpr int kMaxObjectKeys = 1024;
 
 uint64_t NowMs()
 {
@@ -56,7 +54,7 @@ Result<std::string> GenerateToken()
 
 Result<std::string> GenerateObjectToken()
 {
-    unsigned char bytes[32];
+    unsigned char bytes[kObjectTokenRandomBytes];
     size_t filled = 0;
     while (filled < sizeof(bytes)) {
         const ssize_t count = getrandom(bytes + filled, sizeof(bytes) - filled, 0);
@@ -73,7 +71,7 @@ Result<std::string> GenerateObjectToken()
     constexpr char kBase64Url[] =
         "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
     std::string token;
-    token.reserve(43);
+    token.reserve(kObjectTokenEncodedBytes);
     size_t index = 0;
     while (index + 3 <= sizeof(bytes)) {
         const uint32_t value = (static_cast<uint32_t>(bytes[index]) << 16) |
@@ -105,7 +103,7 @@ bool SameObject(const StoredObject& left, const StoredObject& right)
     return left.object_id == right.object_id && left.object_token == right.object_token &&
            left.creator_principal == right.creator_principal && left.name == right.name &&
            left.type == right.type && left.description == right.description &&
-           left.nbytes == right.nbytes && left.sha256 == right.sha256;
+           left.nbytes == right.nbytes;
 }
 
 std::string EncodeTokenPageToken(const std::string& token)
@@ -182,12 +180,102 @@ OpenEventCore::OpenEventCore(std::unique_ptr<UnifiedStorage> storage,
               : response_soft_limit_bytes),
       fatal_error_handler_(std::move(fatal_error_handler))
 {
+    auto snapshot = storage_->CreateSnapshot();
+    if (snapshot.ok()) {
+        subscription_snapshot_ =
+            std::make_shared<ReadSnapshot>(std::move(snapshot.value()));
+        subscription_snapshot_version_ = 1;
+        subscription_snapshot_status_ = Status::Ok();
+    } else {
+        subscription_snapshot_status_ = snapshot.status();
+        if (snapshot.status().requires_server_exit()) {
+            FatalStorageError(snapshot.status());
+        }
+    }
+    subscription_snapshot_thread_ =
+        std::thread([this]() { RefreshSubscriptionSnapshots(); });
+}
+
+OpenEventCore::~OpenEventCore()
+{
+    {
+        std::lock_guard<std::mutex> lock(subscription_snapshot_mu_);
+        stop_subscription_snapshot_thread_ = true;
+    }
+    subscription_snapshot_cv_.notify_all();
+    if (subscription_snapshot_thread_.joinable()) {
+        subscription_snapshot_thread_.join();
+    }
+    subscription_snapshot_.reset();
 }
 
 Result<ReadSnapshot> OpenEventCore::CreateLinearizedSnapshot()
 {
     std::lock_guard<std::mutex> lock(coordinator_mu_);
     return storage_->CreateSnapshot();
+}
+
+Result<OpenEventCore::SubscriptionSnapshot> OpenEventCore::AcquireSubscriptionSnapshot() const
+{
+    const uint64_t required_generation = commit_generation_.load(std::memory_order_acquire);
+    std::unique_lock<std::mutex> lock(subscription_snapshot_mu_);
+    subscription_snapshot_cv_.wait(lock, [&]() {
+        return stop_subscription_snapshot_thread_ ||
+               subscription_snapshot_generation_ >= required_generation ||
+               (!subscription_snapshot_status_.ok() &&
+                subscription_snapshot_attempt_generation_ >= required_generation);
+    });
+    if (!subscription_snapshot_status_.ok() &&
+        subscription_snapshot_attempt_generation_ >= required_generation) {
+        return subscription_snapshot_status_;
+    }
+    if (!subscription_snapshot_) {
+        return Status(grpc::StatusCode::UNAVAILABLE, "subscription snapshot is unavailable");
+    }
+    return SubscriptionSnapshot{subscription_snapshot_, subscription_snapshot_version_};
+}
+
+void OpenEventCore::RefreshSubscriptionSnapshots()
+{
+    constexpr auto kRefreshInterval = std::chrono::milliseconds(100);
+    auto next_refresh = std::chrono::steady_clock::now() + kRefreshInterval;
+    std::unique_lock<std::mutex> lock(subscription_snapshot_mu_);
+    while (!stop_subscription_snapshot_thread_) {
+        if (subscription_snapshot_cv_.wait_until(lock, next_refresh, [&]() {
+                return stop_subscription_snapshot_thread_;
+            })) {
+            break;
+        }
+        next_refresh += kRefreshInterval;
+
+        const uint64_t generation = commit_generation_.load(std::memory_order_acquire);
+        if (subscription_snapshot_ && generation == subscription_snapshot_generation_) {
+            continue;
+        }
+
+        lock.unlock();
+        auto snapshot = storage_->CreateSnapshot();
+        lock.lock();
+        subscription_snapshot_attempt_generation_ = generation;
+        if (snapshot.ok()) {
+            subscription_snapshot_ =
+                std::make_shared<ReadSnapshot>(std::move(snapshot.value()));
+            subscription_snapshot_generation_ = generation;
+            ++subscription_snapshot_version_;
+            subscription_snapshot_status_ = Status::Ok();
+        } else {
+            subscription_snapshot_status_ = snapshot.status();
+            if (snapshot.status().requires_server_exit()) {
+                FatalStorageError(snapshot.status());
+            }
+        }
+        subscription_snapshot_cv_.notify_all();
+
+        const auto now = std::chrono::steady_clock::now();
+        if (next_refresh <= now) {
+            next_refresh = now + kRefreshInterval;
+        }
+    }
 }
 
 Status OpenEventCore::Authenticate(const ReadSnapshot& snapshot,
@@ -255,10 +343,29 @@ Status OpenEventCore::BuildPublishBatch(const ReadSnapshot& snapshot,
     if (!recipients_status.ok()) {
         return recipients_status;
     }
+    std::vector<uint64_t> object_ids;
+    object_ids.reserve(object_keys.size());
+    std::unordered_map<uint64_t, size_t> object_indexes;
+    object_indexes.reserve(object_keys.size());
     for (const auto& object_key : object_keys) {
-        auto object = LoadAuthorizedObject(snapshot, object_key.object_id(), object_key.object_token());
-        if (!object.ok()) {
-            return object.status();
+        const bool inserted =
+            object_indexes.emplace(object_key.object_id(), object_ids.size()).second;
+        if (inserted) {
+            object_ids.push_back(object_key.object_id());
+        }
+    }
+    auto objects = storage_->GetCommittedObjects(snapshot, object_ids);
+    if (!objects.ok()) {
+        return objects.status().requires_server_exit() ||
+                       objects.status().code() == grpc::StatusCode::DATA_LOSS
+                   ? FatalStorageError(objects.status())
+                   : objects.status();
+    }
+    for (const auto& object_key : object_keys) {
+        const auto& object = objects.value()[object_indexes.at(object_key.object_id())];
+        if (!object.has_value() ||
+            !ObjectFileStore::ConstantTimeEquals(object->object_token, object_key.object_token())) {
+            return Status(grpc::StatusCode::NOT_FOUND, "object capability not found");
         }
     }
 
@@ -285,9 +392,11 @@ Status OpenEventCore::BuildPublishBatch(const ReadSnapshot& snapshot,
 Status OpenEventCore::CommitBatch(rocksdb::WriteBatch* batch)
 {
     Status status = storage_->Commit(batch);
+    if (!status.ok() && status.requires_server_exit()) {
+        return FatalStorageError(status);
+    }
     if (status.ok()) {
         commit_generation_.fetch_add(1, std::memory_order_release);
-        commit_cv_.notify_all();
     }
     return status;
 }
@@ -422,7 +531,8 @@ Result<StoredObject> OpenEventCore::LoadAuthorizedObject(const ReadSnapshot& sna
     }
     auto object = storage_->GetCommittedObject(snapshot, object_id);
     if (!object.ok()) {
-        return object.status().code() == grpc::StatusCode::DATA_LOSS
+        return object.status().requires_server_exit() ||
+                       object.status().code() == grpc::StatusCode::DATA_LOSS
                    ? FatalStorageError(object.status())
                    : object.status();
     }
@@ -443,11 +553,21 @@ Status OpenEventCore::FatalStorageError(const Status& status) const
     return status;
 }
 
+Status OpenEventCore::HandleRpcStatus(const Status& status) const
+{
+    return status.requires_server_exit() || status.code() == grpc::StatusCode::DATA_LOSS
+               ? FatalStorageError(status)
+               : status;
+}
+
 Status OpenEventCore::CleanupPreparingObject(uint64_t object_id, const Status& result)
 {
     Status file_status = storage_->CleanupObjectFiles(object_id);
     if (!file_status.ok()) {
-        return file_status.code() == grpc::StatusCode::DATA_LOSS ? FatalStorageError(file_status) : file_status;
+        return file_status.requires_server_exit() ||
+                       file_status.code() == grpc::StatusCode::DATA_LOSS
+                   ? FatalStorageError(file_status)
+                   : file_status;
     }
 
     std::lock_guard<std::mutex> lock(coordinator_mu_);
@@ -470,11 +590,6 @@ Status OpenEventCore::WriteObject(const WriteObjectRequest& request, WriteObject
     if (!object_token.ok()) {
         return object_token.status();
     }
-    auto sha256 = ObjectFileStore::Sha256(request.data());
-    if (!sha256.ok()) {
-        return sha256.status();
-    }
-
     StoredObject object;
     object.object_token = std::move(object_token.value());
     object.creator_principal = request.principal();
@@ -482,7 +597,6 @@ Status OpenEventCore::WriteObject(const WriteObjectRequest& request, WriteObject
     object.type = request.type();
     object.description = request.description();
     object.nbytes = request.data().size();
-    object.sha256 = std::move(sha256.value());
 
     {
         std::lock_guard<std::mutex> lock(coordinator_mu_);
@@ -498,9 +612,6 @@ Status OpenEventCore::WriteObject(const WriteObjectRequest& request, WriteObject
         auto next_object_id = storage_->GetNextObjectId(snapshot);
         if (!next_object_id.ok()) {
             return next_object_id.status();
-        }
-        if (next_object_id.value() == std::numeric_limits<uint64_t>::max()) {
-            return Status(grpc::StatusCode::RESOURCE_EXHAUSTED, "object ID space exhausted");
         }
         object.object_id = next_object_id.value();
 
@@ -521,7 +632,8 @@ Status OpenEventCore::WriteObject(const WriteObjectRequest& request, WriteObject
 
     Status file_status = storage_->WriteObjectFile(object.object_id, request.data());
     if (!file_status.ok()) {
-        if (file_status.code() == grpc::StatusCode::DATA_LOSS) {
+        if (file_status.requires_server_exit() ||
+            file_status.code() == grpc::StatusCode::DATA_LOSS) {
             return FatalStorageError(file_status);
         }
         return CleanupPreparingObject(object.object_id, file_status);
@@ -540,7 +652,8 @@ Status OpenEventCore::WriteObject(const WriteObjectRequest& request, WriteObject
             if (final_status.ok()) {
                 auto preparing = storage_->GetPreparingObject(snapshot, object.object_id);
                 if (!preparing.ok()) {
-                    if (preparing.status().code() == grpc::StatusCode::DATA_LOSS) {
+                    if (preparing.status().requires_server_exit() ||
+                        preparing.status().code() == grpc::StatusCode::DATA_LOSS) {
                         return FatalStorageError(preparing.status());
                     }
                     final_status = preparing.status();
@@ -566,7 +679,11 @@ Status OpenEventCore::WriteObject(const WriteObjectRequest& request, WriteObject
         }
     }
     if (commit_attempted) {
-        return final_status;
+        return FatalStorageError(final_status);
+    }
+    if (final_status.requires_server_exit() ||
+        final_status.code() == grpc::StatusCode::DATA_LOSS) {
+        return FatalStorageError(final_status);
     }
     return CleanupPreparingObject(object.object_id, final_status);
 }
@@ -613,14 +730,14 @@ Status OpenEventCore::ReadObject(const ReadObjectRequest& request, ReadObjectRes
     if (request.offset() > object.nbytes) {
         return Status(grpc::StatusCode::OUT_OF_RANGE, "offset exceeds object size");
     }
-    auto data = storage_->ReadObjectFile(object);
+    auto data = storage_->ReadObjectFile(object, request.offset(), request.nbytes());
     if (!data.ok()) {
-        return data.status().code() == grpc::StatusCode::DATA_LOSS ? FatalStorageError(data.status())
-                                                                   : data.status();
+        return data.status().requires_server_exit() ||
+                       data.status().code() == grpc::StatusCode::DATA_LOSS
+                   ? FatalStorageError(data.status())
+                   : data.status();
     }
-    const uint64_t remaining = object.nbytes - request.offset();
-    const size_t count = static_cast<size_t>(std::min(request.nbytes(), remaining));
-    response->set_data(data.value().substr(static_cast<size_t>(request.offset()), count));
+    response->set_data(std::move(data.value()));
     return Status::Ok();
 }
 
@@ -667,6 +784,8 @@ Status OpenEventCore::FetchVisible(const ReadSnapshot& snapshot,
         return Status::Ok();
     }
 
+    const std::unordered_set<uint64_t> requested_channels(channels.begin(), channels.end());
+    std::unordered_map<uint64_t, bool> readable_channels;
     size_t response_bytes = 0;
     auto next_seq = storage_->ScanMessages(
         snapshot,
@@ -674,16 +793,23 @@ Status OpenEventCore::FetchVisible(const ReadSnapshot& snapshot,
         max_seq,
         max_scan_records_,
         [&](const EventMessage& message) -> Result<MessageScanAction> {
-            if (!channels.empty() && !Contains(channels, message.channel_id())) {
+            auto readable = readable_channels.find(message.channel_id());
+            if (readable == readable_channels.end()) {
+                auto channel_result = LoadChannel(snapshot, message.channel_id());
+                if (!channel_result.ok()) {
+                    return channel_result.status();
+                }
+                if (!channel_result.value().has_value()) {
+                    return Status(grpc::StatusCode::DATA_LOSS,
+                                  "stored message references a missing channel");
+                }
+                const bool can_read = CanRead(channel_result.value().value(), principal);
+                readable = readable_channels.emplace(message.channel_id(), can_read).first;
+            }
+            if (!requested_channels.empty() && !requested_channels.contains(message.channel_id())) {
                 return MessageScanAction::kContinue;
             }
-            auto channel_result = LoadChannel(snapshot, message.channel_id());
-            if (!channel_result.ok()) {
-                return channel_result.status();
-            }
-            if (!channel_result.value().has_value() ||
-                !CanRead(channel_result.value().value(), principal) ||
-                (only_my_recipient && !HasRecipient(message, principal))) {
+            if (!readable->second || (only_my_recipient && !HasRecipient(message, principal))) {
                 return MessageScanAction::kContinue;
             }
 
@@ -1055,11 +1181,11 @@ Status OpenEventCore::GetSubscriptionMaxSeq(uint64_t principal,
                                             const std::string& token,
                                             uint64_t* max_seq) const
 {
-    auto snapshot_result = storage_->CreateSnapshot();
+    auto snapshot_result = AcquireSubscriptionSnapshot();
     if (!snapshot_result.ok()) {
         return snapshot_result.status();
     }
-    ReadSnapshot snapshot = std::move(snapshot_result.value());
+    const ReadSnapshot& snapshot = *snapshot_result.value().snapshot;
     Status auth = Authenticate(snapshot, principal, token);
     if (!auth.ok()) {
         return auth;
@@ -1077,30 +1203,47 @@ Status OpenEventCore::FetchSubscriptionBatch(uint64_t principal,
                                              uint64_t from_seq,
                                              uint32_t limit,
                                              bool only_my_recipient,
-                                             FetchResponse* response) const
+                                             const google::protobuf::RepeatedField<uint64_t>& channels,
+                                             FetchResponse* response,
+                                             uint64_t* snapshot_version) const
 {
-    auto snapshot_result = storage_->CreateSnapshot();
+    auto snapshot_result = AcquireSubscriptionSnapshot();
     if (!snapshot_result.ok()) {
         return snapshot_result.status();
     }
-    ReadSnapshot snapshot = std::move(snapshot_result.value());
+    const ReadSnapshot& snapshot = *snapshot_result.value().snapshot;
     Status auth = Authenticate(snapshot, principal, token);
     if (!auth.ok()) {
         return auth;
     }
-    google::protobuf::RepeatedField<uint64_t> channels;
-    return FetchVisible(snapshot, principal, from_seq, limit, only_my_recipient, channels, response);
+    Status status = FetchVisible(snapshot, principal, from_seq, limit, only_my_recipient, channels, response);
+    if (status.ok() && snapshot_version != nullptr) {
+        *snapshot_version = snapshot_result.value().version;
+    }
+    return status;
 }
 
-uint64_t OpenEventCore::CommitGeneration() const
+uint64_t OpenEventCore::SubscriptionSnapshotVersion() const
 {
-    return commit_generation_.load(std::memory_order_acquire);
+    std::lock_guard<std::mutex> lock(subscription_snapshot_mu_);
+    return subscription_snapshot_version_;
 }
 
-void OpenEventCore::WaitForCommit(uint64_t observed_generation, std::chrono::milliseconds timeout) const
+bool OpenEventCore::WaitForSubscriptionSnapshot(uint64_t observed_version,
+                                                std::chrono::milliseconds timeout) const
 {
-    std::unique_lock<std::mutex> lock(commit_wait_mu_);
-    commit_cv_.wait_for(lock, timeout, [&]() { return CommitGeneration() != observed_generation; });
+    std::unique_lock<std::mutex> lock(subscription_snapshot_mu_);
+    subscription_snapshot_cv_.wait_for(lock, timeout, [&]() {
+        return stop_subscription_snapshot_thread_ ||
+               subscription_snapshot_version_ != observed_version ||
+               (!subscription_snapshot_status_.ok() &&
+                subscription_snapshot_attempt_generation_ >
+                    subscription_snapshot_generation_);
+    });
+    return subscription_snapshot_version_ != observed_version ||
+           (!subscription_snapshot_status_.ok() &&
+            subscription_snapshot_attempt_generation_ >
+                subscription_snapshot_generation_);
 }
 
 Result<uint64_t> OpenEventCore::MaxSeq() const
@@ -1152,8 +1295,12 @@ bool OpenEventCore::IsMember(const ChannelInfo& channel, uint64_t principal) con
 Status OpenEventCore::ValidateRecipients(const ChannelInfo& channel,
                                          const google::protobuf::RepeatedField<uint64_t>& recipients) const
 {
+    if (recipients.empty()) {
+        return Status::Ok();
+    }
+    const std::unordered_set<uint64_t> members(channel.members().begin(), channel.members().end());
     for (uint64_t recipient : recipients) {
-        if (!IsMember(channel, recipient)) {
+        if (!members.contains(recipient)) {
             return Status(grpc::StatusCode::INVALID_ARGUMENT, "recipient must be channel member");
         }
     }

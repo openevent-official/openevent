@@ -1,37 +1,22 @@
 #include "storage/object_file_store.h"
 
 #include <algorithm>
-#include <cerrno>
 #include <climits>
-#include <cstring>
 #include <string>
+#include <utility>
 
 #include <fcntl.h>
 #include <linux/fs.h>
 #include <openssl/crypto.h>
-#include <openssl/evp.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
 #include <unistd.h>
 
+#include "common/object_limits.h"
+#include "storage/io_error.h"
+
 namespace openevent {
 namespace {
-
-constexpr uint64_t kMaxObjectBytes = 4ULL * 1024 * 1024;
-constexpr size_t kSha256Bytes = 32;
-
-std::string ErrnoMessage(const std::string& operation, int error)
-{
-    return operation + ": " + std::strerror(error);
-}
-
-Status IoStatus(const std::string& operation, int error)
-{
-    if (error == ENOSPC || error == EDQUOT) {
-        return Status(grpc::StatusCode::RESOURCE_EXHAUSTED, ErrnoMessage(operation, error));
-    }
-    return Status(grpc::StatusCode::UNAVAILABLE, ErrnoMessage(operation, error));
-}
 
 Status CorruptionStatus(const std::string& message)
 {
@@ -53,7 +38,7 @@ Status CloseFile(int fd, const std::string& description)
     if (::close(fd) == 0) {
         return Status::Ok();
     }
-    return IoStatus("close " + description, errno);
+    return ObjectIoStatus("close " + description, errno);
 }
 
 Status UnlinkKnownPath(int directory_fd, const std::string& name)
@@ -65,12 +50,15 @@ Status UnlinkKnownPath(int directory_fd, const std::string& name)
     if (error == EISDIR || error == EPERM) {
         return CorruptionStatus("object path is not a removable file: " + name);
     }
-    return IoStatus("remove object path " + name, error);
+    return ObjectIoStatus("remove object path " + name, error);
 }
 
 }  // namespace
 
-ObjectFileStore::ObjectFileStore(int directory_fd) : directory_fd_(directory_fd) {}
+ObjectFileStore::ObjectFileStore(int directory_fd, StorageFaultInjector fault_injector)
+    : directory_fd_(directory_fd), fault_injector_(std::move(fault_injector))
+{
+}
 
 ObjectFileStore::~ObjectFileStore()
 {
@@ -79,30 +67,15 @@ ObjectFileStore::~ObjectFileStore()
     }
 }
 
-Result<std::unique_ptr<ObjectFileStore>> ObjectFileStore::Open(const std::string& path)
+Result<std::unique_ptr<ObjectFileStore>> ObjectFileStore::Open(
+    const std::string& path,
+    StorageFaultInjector fault_injector)
 {
     const int fd = ::open(path.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
     if (fd < 0) {
-        return IoStatus("open object directory", errno);
+        return ObjectIoStatus("open object directory", errno);
     }
-    return std::unique_ptr<ObjectFileStore>(new ObjectFileStore(fd));
-}
-
-Result<std::string> ObjectFileStore::Sha256(const std::string& data)
-{
-    EVP_MD_CTX* raw_context = EVP_MD_CTX_new();
-    if (raw_context == nullptr) {
-        return Status(grpc::StatusCode::INTERNAL, "allocate SHA-256 context failed");
-    }
-    std::unique_ptr<EVP_MD_CTX, decltype(&EVP_MD_CTX_free)> context(raw_context, EVP_MD_CTX_free);
-    unsigned char digest[EVP_MAX_MD_SIZE];
-    unsigned int digest_size = 0;
-    if (EVP_DigestInit_ex(context.get(), EVP_sha256(), nullptr) != 1 ||
-        EVP_DigestUpdate(context.get(), data.data(), data.size()) != 1 ||
-        EVP_DigestFinal_ex(context.get(), digest, &digest_size) != 1 || digest_size != kSha256Bytes) {
-        return Status(grpc::StatusCode::INTERNAL, "compute SHA-256 failed");
-    }
-    return std::string(reinterpret_cast<const char*>(digest), digest_size);
+    return std::unique_ptr<ObjectFileStore>(new ObjectFileStore(fd, std::move(fault_injector)));
 }
 
 bool ObjectFileStore::ConstantTimeEquals(const std::string& left, const std::string& right)
@@ -126,7 +99,18 @@ Status ObjectFileStore::Write(uint64_t object_id, const std::string& data) const
         if (error == EEXIST) {
             return CorruptionStatus("unexpected existing temporary object file: " + temporary);
         }
-        return IoStatus("create temporary object file", error);
+        return ObjectIoStatus("create temporary object file", error);
+    }
+
+    Status injected = InjectStorageFault(fault_injector_, StorageFaultPoint::kAfterTemporaryFileCreate);
+    if (!injected.ok()) {
+        ::close(fd);
+        return injected;
+    }
+    injected = InjectStorageFault(fault_injector_, StorageFaultPoint::kBeforeTemporaryFileWrite);
+    if (!injected.ok()) {
+        ::close(fd);
+        return injected;
     }
 
     size_t written = 0;
@@ -140,7 +124,7 @@ Status ObjectFileStore::Write(uint64_t object_id, const std::string& data) const
                 continue;
             }
             ::close(fd);
-            return IoStatus("write temporary object file", error);
+            return ObjectIoStatus("write temporary object file", error);
         }
         if (result == 0) {
             ::close(fd);
@@ -149,16 +133,36 @@ Status ObjectFileStore::Write(uint64_t object_id, const std::string& data) const
         written += static_cast<size_t>(result);
     }
 
+    injected = InjectStorageFault(fault_injector_, StorageFaultPoint::kAfterTemporaryFileWrite);
+    if (!injected.ok()) {
+        ::close(fd);
+        return injected;
+    }
+
+    injected = InjectStorageFault(fault_injector_, StorageFaultPoint::kBeforeFileFsync);
+    if (!injected.ok()) {
+        ::close(fd);
+        return injected;
+    }
     if (::fsync(fd) != 0) {
         const int error = errno;
         ::close(fd);
-        return IoStatus("fsync temporary object file", error);
+        return ObjectIoStatus("fsync temporary object file", error);
+    }
+    injected = InjectStorageFault(fault_injector_, StorageFaultPoint::kAfterFileFsync);
+    if (!injected.ok()) {
+        ::close(fd);
+        return injected;
     }
     Status close_status = CloseFile(fd, "temporary object file");
     if (!close_status.ok()) {
         return close_status;
     }
 
+    injected = InjectStorageFault(fault_injector_, StorageFaultPoint::kBeforeRename);
+    if (!injected.ok()) {
+        return injected;
+    }
     if (::syscall(SYS_renameat2,
                   directory_fd_,
                   temporary.c_str(),
@@ -169,36 +173,61 @@ Status ObjectFileStore::Write(uint64_t object_id, const std::string& data) const
         if (error == EEXIST) {
             return CorruptionStatus("unexpected existing final object file: " + final);
         }
-        return IoStatus("rename temporary object file", error);
+        return ObjectIoStatus("rename temporary object file", error);
+    }
+    injected = InjectStorageFault(fault_injector_, StorageFaultPoint::kAfterRename);
+    if (!injected.ok()) {
+        return injected;
+    }
+    injected = InjectStorageFault(fault_injector_, StorageFaultPoint::kBeforeDirectoryFsync);
+    if (!injected.ok()) {
+        return injected;
     }
     if (::fsync(directory_fd_) != 0) {
-        return IoStatus("fsync object directory", errno);
+        return ObjectIoStatus("fsync object directory", errno);
     }
-    return Status::Ok();
+    return InjectStorageFault(fault_injector_, StorageFaultPoint::kAfterDirectoryFsync);
 }
 
 Status ObjectFileStore::Cleanup(uint64_t object_id) const
 {
-    Status temporary_status = UnlinkKnownPath(directory_fd_, TemporaryName(object_id));
-    if (!temporary_status.ok()) {
-        return temporary_status;
+    return Cleanup(std::vector<uint64_t>{object_id});
+}
+
+Status ObjectFileStore::Cleanup(const std::vector<uint64_t>& object_ids) const
+{
+    for (uint64_t object_id : object_ids) {
+        Status temporary_status = UnlinkKnownPath(directory_fd_, TemporaryName(object_id));
+        if (!temporary_status.ok()) {
+            return temporary_status;
+        }
+        Status final_status = UnlinkKnownPath(directory_fd_, FinalName(object_id));
+        if (!final_status.ok()) {
+            return final_status;
+        }
     }
-    Status final_status = UnlinkKnownPath(directory_fd_, FinalName(object_id));
-    if (!final_status.ok()) {
-        return final_status;
+    if (object_ids.empty()) {
+        return Status::Ok();
     }
     if (::fsync(directory_fd_) != 0) {
-        return IoStatus("fsync object directory after cleanup", errno);
+        return ObjectIoStatus("fsync object directory after cleanup", errno);
     }
     return Status::Ok();
 }
 
-Result<std::string> ObjectFileStore::ReadAndValidate(uint64_t object_id,
-                                                     uint64_t expected_size,
-                                                     const std::string& expected_sha256) const
+Result<std::string> ObjectFileStore::ReadRange(uint64_t object_id,
+                                               uint64_t expected_size,
+                                               uint64_t offset,
+                                               uint64_t nbytes) const
 {
-    if (expected_size == 0 || expected_size > kMaxObjectBytes || expected_sha256.size() != kSha256Bytes) {
+    if (object_id == 0 || expected_size == 0 || expected_size > kMaxObjectBytes) {
         return CorruptionStatus("invalid committed object metadata");
+    }
+    if (nbytes == 0) {
+        return Status(grpc::StatusCode::INVALID_ARGUMENT, "nbytes must be greater than 0");
+    }
+    if (offset > expected_size) {
+        return Status(grpc::StatusCode::OUT_OF_RANGE, "offset exceeds object size");
     }
 
     const std::string final = FinalName(object_id);
@@ -211,14 +240,14 @@ Result<std::string> ObjectFileStore::ReadAndValidate(uint64_t object_id,
         if (error == ENOENT || error == ELOOP) {
             return CorruptionStatus(ErrnoMessage("open committed object file " + final, error));
         }
-        return IoStatus("open committed object file " + final, error);
+        return ObjectIoStatus("open committed object file " + final, error);
     }
 
     struct stat file_stat {};
     if (::fstat(fd, &file_stat) != 0) {
         const int error = errno;
         ::close(fd);
-        return IoStatus("stat committed object file " + final, error);
+        return ObjectIoStatus("stat committed object file " + final, error);
     }
     if (!S_ISREG(file_stat.st_mode) || file_stat.st_size < 0 ||
         static_cast<uint64_t>(file_stat.st_size) != expected_size) {
@@ -226,17 +255,22 @@ Result<std::string> ObjectFileStore::ReadAndValidate(uint64_t object_id,
         return CorruptionStatus("committed object file type or size mismatch: " + final);
     }
 
-    std::string data(static_cast<size_t>(expected_size), '\0');
+    const uint64_t remaining = expected_size - offset;
+    const size_t count = static_cast<size_t>(std::min(nbytes, remaining));
+    std::string data(count, '\0');
     size_t read_bytes = 0;
     while (read_bytes < data.size()) {
-        const ssize_t result = ::read(fd, data.data() + read_bytes, data.size() - read_bytes);
+        const ssize_t result = ::pread(fd,
+                                       data.data() + read_bytes,
+                                       data.size() - read_bytes,
+                                       static_cast<off_t>(offset + read_bytes));
         if (result < 0) {
             const int error = errno;
             if (error == EINTR) {
                 continue;
             }
             ::close(fd);
-            return IoStatus("read committed object file " + final, error);
+            return ObjectIoStatus("read committed object file range " + final, error);
         }
         if (result == 0) {
             ::close(fd);
@@ -249,13 +283,6 @@ Result<std::string> ObjectFileStore::ReadAndValidate(uint64_t object_id,
         return close_status;
     }
 
-    auto digest = Sha256(data);
-    if (!digest.ok()) {
-        return digest.status();
-    }
-    if (CRYPTO_memcmp(digest.value().data(), expected_sha256.data(), kSha256Bytes) != 0) {
-        return CorruptionStatus("committed object file SHA-256 mismatch: " + final);
-    }
     return data;
 }
 

@@ -49,7 +49,8 @@ shutdown:
   （metadata）、`messages` 和 `objects` 三个 Column Family；`path/objects` 为每个 committed 对象
   保存一个不可变文件，文件名是十进制 object ID。
 - 不能为空。首次部署使用不存在或为空的新目录；目录不存在时由服务端初始化，运行用户必须拥有
-  对应父目录的写入权限。后续启动只接受完整的目标 schema。
+  对应父目录的写入权限。后续启动只接受完整的目标 schema。初始化中断或非空目录布局不完整时，
+  服务端拒绝启动，不在线修复。
 - 对象 data 不进入 RocksDB，每个对象最大 4 MiB。当前服务端不更新、删除或回收对象，因此每个
   对象永久占用 data 空间和一个 inode。
 
@@ -85,8 +86,15 @@ shutdown:
 - 同时监控 `storage.path` 下的可用字节数和 inode；服务端没有对象删除或后台垃圾回收。
 - 必须在服务停止时，或使用具有同等一致性的文件系统/存储快照，把 `db/` 和 `objects/` 作为一个
   一致单元备份。单独复制任一子目录可能得到缺少对应对象 data 的 committed metadata。
-- 启动只恢复已知的未完成对象写入，不扫描所有 committed 对象文件。ReadObject 访问时才会发现
-  committed data 缺失或损坏，返回 `DATA_LOSS`，并使服务端以非零状态退出。
+- 启动不扫描历史消息，也不比较消息水位和已存消息记录。对象恢复只扫描已知的未完成写入，
+  不扫描 committed 对象 metadata、文件或完整对象目录。ReadObject 访问时才会发现 committed
+  对象 data 缺失、不是普通文件或与 metadata 大小不一致，返回 `DATA_LOSS`，并使服务端以非零状态
+  退出；同大小的内容变更不会被发现。
+- 服务期间任何 RocksDB 操作失败都会使服务端以非零状态退出。RocksDB 损坏返回 `DATA_LOSS`，其他
+  RocksDB 错误返回 `UNAVAILABLE`。正常查询不存在的 token、Channel 或 object 不属于 RocksDB 故障。
+  启动期间任何 RocksDB 操作失败都会拒绝启动。
+- 已读出的持久化 bytes 不符合内部记录格式或必要记录关系时按存储损坏处理；遇到该数据的请求返回
+  `DATA_LOSS`，并使服务端以非零状态退出。启动仍不全量扫描历史消息或 committed 对象。
 
 ## 校验错误
 

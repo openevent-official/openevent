@@ -3,8 +3,10 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <vector>
 
 #include "common/status.h"
+#include "storage/fault_injector.h"
 
 namespace openevent {
 
@@ -15,20 +17,24 @@ public:
     ObjectFileStore(const ObjectFileStore&) = delete;
     ObjectFileStore& operator=(const ObjectFileStore&) = delete;
 
-    static Result<std::unique_ptr<ObjectFileStore>> Open(const std::string& path);
-    static Result<std::string> Sha256(const std::string& data);
+    static Result<std::unique_ptr<ObjectFileStore>> Open(
+        const std::string& path,
+        StorageFaultInjector fault_injector = {});
     static bool ConstantTimeEquals(const std::string& left, const std::string& right);
 
     Status Write(uint64_t object_id, const std::string& data) const;
     Status Cleanup(uint64_t object_id) const;
-    Result<std::string> ReadAndValidate(uint64_t object_id,
-                                       uint64_t expected_size,
-                                       const std::string& expected_sha256) const;
+    Status Cleanup(const std::vector<uint64_t>& object_ids) const;
+    Result<std::string> ReadRange(uint64_t object_id,
+                                  uint64_t expected_size,
+                                  uint64_t offset,
+                                  uint64_t nbytes) const;
 
 private:
-    explicit ObjectFileStore(int directory_fd);
+    ObjectFileStore(int directory_fd, StorageFaultInjector fault_injector);
 
     int directory_fd_ = -1;
+    StorageFaultInjector fault_injector_;
 };
 
 }  // namespace openevent

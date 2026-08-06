@@ -1,5 +1,8 @@
 #include <algorithm>
+#include <atomic>
+#include <cerrno>
 #include <chrono>
+#include <condition_variable>
 #include <cstring>
 #include <cstdlib>
 #include <filesystem>
@@ -8,16 +11,23 @@
 #include <iterator>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <set>
 #include <string>
+#include <thread>
 #include <vector>
 
+#include <grpcpp/grpcpp.h>
 #include <rocksdb/options.h>
+#include <sys/wait.h>
+#include <unistd.h>
 
 #include "object_record.pb.h"
 #include "server/server_config.h"
+#include "service/grpc_services.h"
 #include "service/open_event_core.h"
 #include "storage/encoding.h"
+#include "storage/io_error.h"
 #include "storage/object_file_store.h"
 #include "storage/unified_storage.h"
 
@@ -35,9 +45,11 @@ std::unique_ptr<openevent::OpenEventCore> MakeCore(const std::filesystem::path& 
                                                    size_t max_payload_bytes = 1024,
                                                    uint64_t max_scan_records = 10000,
                                                    size_t response_soft_limit_bytes = 0,
-                                                   openevent::OpenEventCore::FatalErrorHandler fatal_handler = {})
+                                                   openevent::OpenEventCore::FatalErrorHandler fatal_handler = {},
+                                                   openevent::StorageFaultInjector fault_injector = {})
 {
-    auto storage = openevent::UnifiedStorage::Open((root / "data").string());
+    auto storage = openevent::UnifiedStorage::Open(
+        (root / "data").string(), std::move(fault_injector));
     Check(storage.ok(), storage.status().message());
     return std::make_unique<openevent::OpenEventCore>(
         std::move(storage.value()),
@@ -195,6 +207,37 @@ openevent::WriteObjectResponse WriteObject(openevent::OpenEventCore& core,
     return response;
 }
 
+void CheckRecoveredObjectState(const std::filesystem::path& root,
+                               bool expected_committed,
+                               uint64_t expected_next_id,
+                               const std::string& expected_data = "fault-data")
+{
+    auto storage = openevent::UnifiedStorage::Open((root / "data").string());
+    Check(storage.ok(), storage.status().message());
+    auto snapshot = storage.value()->CreateSnapshot();
+    Check(snapshot.ok(), snapshot.status().message());
+    auto preparing = storage.value()->GetPreparingObject(snapshot.value(), 1);
+    auto committed = storage.value()->GetCommittedObject(snapshot.value(), 1);
+    auto next_id = storage.value()->GetNextObjectId(snapshot.value());
+    Check(preparing.ok() && !preparing.value().has_value(),
+          "recovery must remove PREPARING metadata");
+    Check(committed.ok() && committed.value().has_value() == expected_committed,
+          "recovered committed state does not match the injected persistence point");
+    Check(next_id.ok() && next_id.value() == expected_next_id,
+          "object ID watermark does not match the injected persistence point");
+    const auto final_path = root / "data" / "objects" / "1";
+    const auto temporary_path = root / "data" / "objects" / ".tmp.1";
+    Check(!std::filesystem::exists(temporary_path), "recovery must remove the temporary object file");
+    Check(std::filesystem::exists(final_path) == expected_committed,
+          "recovered object file visibility must match COMMITTED metadata");
+    if (expected_committed) {
+        auto data = storage.value()->ReadObjectFile(
+            committed.value().value(), 0, committed.value().value().nbytes);
+        Check(data.ok() && data.value() == expected_data,
+              "committed object must remain intact after an injected failure or crash");
+    }
+}
+
 void TestPublishFetch()
 {
     const auto root = std::filesystem::temp_directory_path() / "openevent_core_publish_fetch";
@@ -320,12 +363,64 @@ void TestFetchChannelFilter()
     Check(response.next_seq() == 3, "channel filter should still advance globally");
     Check(response.last_seq() == 2, "last_seq should report committed tail");
 
+    google::protobuf::RepeatedField<uint64_t> subscription_channels;
+    subscription_channels.Add(second_channel_id);
+    response.Clear();
+    status = core->FetchSubscriptionBatch(
+        100, token, 1, 10, false, subscription_channels, &response);
+    Check(status.ok(), status.message());
+    Check(response.messages_size() == 1,
+          "subscription channel filter should return one message");
+    Check(response.messages(0).channel_id() == second_channel_id,
+          "subscription channel filter should keep the selected channel");
+    Check(response.messages(0).payload() == "second-channel",
+          "subscription channel filter should keep the selected payload");
+    Check(response.next_seq() == 3,
+          "subscription channel filter should advance past filtered messages");
+    Check(response.last_seq() == 2,
+          "subscription channel filter should report the committed tail");
+
     fetch.clear_channels();
     response.Clear();
     status = core->Fetch(fetch, &response);
     Check(status.ok(), status.message());
     Check(response.messages_size() == 2, "empty channel filter should return all visible messages");
     Check(response.last_seq() == 2, "empty channel filter last_seq");
+
+    std::filesystem::remove_all(root);
+}
+
+void TestSharedSubscriptionSnapshotRefresh()
+{
+    const auto root =
+        std::filesystem::temp_directory_path() / "openevent_shared_subscription_snapshot";
+    std::filesystem::remove_all(root);
+    auto core = MakeCore(root);
+    const std::string token = AddToken(*core, 100);
+    const uint64_t channel_id =
+        CreateChannel(*core, 100, token, openevent::VISIBILITY_PUBLIC);
+
+    uint64_t max_seq = 0;
+    openevent::Status status = core->GetSubscriptionMaxSeq(100, token, &max_seq);
+    Check(status.ok() && max_seq == 0,
+          "subscription startup must wait for the shared snapshot to cover prior commits");
+    const uint64_t settled_version = core->SubscriptionSnapshotVersion();
+    Check(!core->WaitForSubscriptionSnapshot(settled_version, std::chrono::milliseconds(150)),
+          "the server must not publish a new subscription snapshot without a commit");
+
+    PublishAuto(*core, 100, token, channel_id, "shared-snapshot");
+    Check(core->WaitForSubscriptionSnapshot(settled_version, std::chrono::seconds(1)),
+          "a successful commit must be published by the periodic snapshot refresh");
+
+    google::protobuf::RepeatedField<uint64_t> channels;
+    openevent::FetchResponse response;
+    uint64_t used_version = 0;
+    status = core->FetchSubscriptionBatch(
+        100, token, 1, 10, false, channels, &response, &used_version);
+    Check(status.ok() && response.messages_size() == 1 &&
+              response.messages(0).payload() == "shared-snapshot" &&
+              used_version != settled_version,
+          "all subscription reads must use the refreshed shared snapshot");
 
     std::filesystem::remove_all(root);
 }
@@ -920,8 +1015,14 @@ void TestMessageObjectReferences()
           "message ObjectKeys must retain duplicates and request order");
 
     openevent::FetchResponse subscription_batch;
-    status = core->FetchSubscriptionBatch(
-        100, token, publish_response.seq(), 1, false, &subscription_batch);
+    google::protobuf::RepeatedField<uint64_t> subscription_channels;
+    status = core->FetchSubscriptionBatch(100,
+                                          token,
+                                          publish_response.seq(),
+                                          1,
+                                          false,
+                                          subscription_channels,
+                                          &subscription_batch);
     Check(status.ok() && subscription_batch.messages_size() == 1 &&
               subscription_batch.messages(0).object_keys_size() == 3,
           "subscription batches must retain object references");
@@ -968,6 +1069,20 @@ void TestMessageObjectReferences()
           "an invalid ObjectKey must not partially commit or advance max_seq");
 
     publish.clear_object_keys();
+    valid_key = publish.add_object_keys();
+    valid_key->set_object_id(first.object_id());
+    valid_key->set_object_token(first.object_token());
+    invalid_key = publish.add_object_keys();
+    invalid_key->set_object_id(first.object_id());
+    invalid_key->set_object_token("wrong-token");
+    status = core->PublishAutoSeq(publish, &publish_response);
+    Check(!status.ok() && status.code() == grpc::StatusCode::NOT_FOUND,
+          "duplicate object IDs must validate every supplied token");
+    max_seq = core->MaxSeq();
+    Check(max_seq.ok() && max_seq.value() == watermark,
+          "a bad token on a duplicate object ID must not advance max_seq");
+
+    publish.clear_object_keys();
     invalid_key = publish.add_object_keys();
     invalid_key->set_object_id(0);
     invalid_key->set_object_token(first.object_token());
@@ -975,6 +1090,387 @@ void TestMessageObjectReferences()
     Check(!status.ok() && status.code() == grpc::StatusCode::INVALID_ARGUMENT,
           "a malformed ObjectKey must be rejected before commit");
 
+    std::filesystem::remove_all(root);
+}
+
+void TestObjectWriteInjectedFailures()
+{
+    struct FailureCase {
+        const char* name;
+        openevent::StorageFaultPoint point;
+        int skip_matches;
+        grpc::StatusCode code;
+        bool committed;
+        uint64_t next_id;
+        bool fatal;
+    };
+    const std::vector<FailureCase> cases{
+        {"preparing-commit", openevent::StorageFaultPoint::kBeforeCommit, 0,
+         grpc::StatusCode::UNAVAILABLE, false, 1, false},
+        {"preparing-after-commit", openevent::StorageFaultPoint::kAfterCommit, 0,
+         grpc::StatusCode::UNAVAILABLE, false, 2, false},
+        {"file-write", openevent::StorageFaultPoint::kBeforeTemporaryFileWrite, 0,
+         grpc::StatusCode::RESOURCE_EXHAUSTED, false, 2, false},
+        {"file-fsync", openevent::StorageFaultPoint::kBeforeFileFsync, 0,
+         grpc::StatusCode::RESOURCE_EXHAUSTED, false, 2, false},
+        {"rename", openevent::StorageFaultPoint::kBeforeRename, 0,
+         grpc::StatusCode::UNAVAILABLE, false, 2, false},
+        {"directory-fsync", openevent::StorageFaultPoint::kBeforeDirectoryFsync, 0,
+         grpc::StatusCode::RESOURCE_EXHAUSTED, false, 2, false},
+        {"committed-before-write", openevent::StorageFaultPoint::kBeforeCommit, 1,
+         grpc::StatusCode::UNAVAILABLE, false, 2, true},
+        {"committed-after-write", openevent::StorageFaultPoint::kAfterCommit, 1,
+         grpc::StatusCode::UNAVAILABLE, true, 2, true},
+    };
+
+    for (const auto& test_case : cases) {
+        const auto root = std::filesystem::temp_directory_path() /
+                          (std::string("openevent_object_failure_") + test_case.name);
+        std::filesystem::remove_all(root);
+        struct State {
+            bool active = false;
+            int skip_matches = 0;
+        };
+        auto state = std::make_shared<State>();
+        auto injector = [state, test_case](openevent::StorageFaultPoint point) {
+            if (!state->active || point != test_case.point) {
+                return openevent::Status::Ok();
+            }
+            if (state->skip_matches > 0) {
+                --state->skip_matches;
+                return openevent::Status::Ok();
+            }
+            state->active = false;
+            return openevent::Status(test_case.code, "injected storage failure");
+        };
+        int fatal_calls = 0;
+        auto core = MakeCore(root,
+                             1024,
+                             10000,
+                             0,
+                             [&](const openevent::Status&) { ++fatal_calls; },
+                             injector);
+        const std::string token = AddToken(*core, 100);
+        state->skip_matches = test_case.skip_matches;
+        state->active = true;
+
+        openevent::WriteObjectRequest request = MakeWriteObjectRequest(100, token, "fault-data");
+        openevent::WriteObjectResponse response;
+        openevent::Status status = core->WriteObject(request, &response);
+        Check(!status.ok() && status.code() == test_case.code,
+              std::string("unexpected injected failure result for ") + test_case.name);
+        Check(fatal_calls == (test_case.fatal ? 1 : 0),
+              std::string("unexpected fatal shutdown result for ") + test_case.name);
+        core.reset();
+        CheckRecoveredObjectState(root, test_case.committed, test_case.next_id);
+        std::filesystem::remove_all(root);
+    }
+}
+
+void TestRpcStorageFailureTriggersFatalShutdown()
+{
+    const auto run_case = [](const std::string& name, const openevent::Status& injected_status) {
+        const auto root = std::filesystem::temp_directory_path() / ("openevent_rpc_" + name);
+        std::filesystem::remove_all(root);
+        auto inject_failure = std::make_shared<bool>(false);
+        auto injector = [inject_failure, injected_status](openevent::StorageFaultPoint point) {
+            if (*inject_failure && point == openevent::StorageFaultPoint::kBeforeCommit) {
+                return injected_status;
+            }
+            return openevent::Status::Ok();
+        };
+        int fatal_calls = 0;
+        auto unique_core = MakeCore(root,
+                                    1024,
+                                    10000,
+                                    0,
+                                    [&](const openevent::Status& status) {
+                                        Check(status.code() == injected_status.code(),
+                                              "fatal RPC storage error must preserve its gRPC code");
+                                        ++fatal_calls;
+                                    },
+                                    injector);
+        const std::string token = AddToken(*unique_core, 100);
+        auto core = std::shared_ptr<openevent::OpenEventCore>(std::move(unique_core));
+        openevent::ChannelServiceImpl service(core);
+
+        openevent::CreateChannelRequest request;
+        request.set_principal(100);
+        request.set_token(token);
+        request.set_name(name);
+        request.set_visibility(openevent::VISIBILITY_PUBLIC);
+        openevent::CreateChannelResponse response;
+        *inject_failure = true;
+        grpc::Status status = service.CreateChannel(nullptr, &request, &response);
+        Check(!status.ok() && status.error_code() == injected_status.code() && fatal_calls == 1,
+              "fatal storage failure from a non-object RPC must trigger shutdown");
+
+        response.Clear();
+        status = service.CreateChannel(nullptr, &request, &response);
+        Check(!status.ok() && status.error_code() == injected_status.code() && fatal_calls == 1,
+              "fatal RPC storage callback must be idempotent");
+
+        core.reset();
+        std::filesystem::remove_all(root);
+    };
+
+    run_case("data_loss",
+             openevent::Status(grpc::StatusCode::DATA_LOSS, "injected stored-data corruption"));
+    run_case("rocksdb_unavailable",
+             openevent::Status::Fatal(grpc::StatusCode::UNAVAILABLE,
+                                      "injected RocksDB availability failure"));
+}
+
+void TestObjectWriteCrashRecoveryBoundaries()
+{
+    struct CrashCase {
+        const char* name;
+        openevent::StorageFaultPoint point;
+        int skip_matches;
+        bool committed;
+    };
+    const std::vector<CrashCase> cases{
+        {"after-preparing", openevent::StorageFaultPoint::kAfterCommit, 0, false},
+        {"after-temp-create", openevent::StorageFaultPoint::kAfterTemporaryFileCreate, 0, false},
+        {"after-temp-write", openevent::StorageFaultPoint::kAfterTemporaryFileWrite, 0, false},
+        {"after-file-fsync", openevent::StorageFaultPoint::kAfterFileFsync, 0, false},
+        {"after-rename", openevent::StorageFaultPoint::kAfterRename, 0, false},
+        {"after-directory-fsync", openevent::StorageFaultPoint::kAfterDirectoryFsync, 0, false},
+        {"before-committed", openevent::StorageFaultPoint::kBeforeCommit, 1, false},
+        {"after-committed", openevent::StorageFaultPoint::kAfterCommit, 1, true},
+    };
+    constexpr int kInjectedCrashExitCode = 73;
+
+    for (const auto& test_case : cases) {
+        const auto root = std::filesystem::temp_directory_path() /
+                          (std::string("openevent_object_crash_") + test_case.name);
+        std::filesystem::remove_all(root);
+        std::string token;
+        {
+            auto core = MakeCore(root);
+            token = AddToken(*core, 100);
+        }
+
+        const pid_t child = ::fork();
+        Check(child >= 0, "fork object crash test process");
+        if (child == 0) {
+            int skip_matches = test_case.skip_matches;
+            auto injector = [test_case, &skip_matches](openevent::StorageFaultPoint point) {
+                if (point != test_case.point) {
+                    return openevent::Status::Ok();
+                }
+                if (skip_matches > 0) {
+                    --skip_matches;
+                    return openevent::Status::Ok();
+                }
+                ::_exit(kInjectedCrashExitCode);
+            };
+            auto core = MakeCore(root, 1024, 10000, 0, {}, injector);
+            openevent::WriteObjectRequest request = MakeWriteObjectRequest(100, token, "fault-data");
+            openevent::WriteObjectResponse response;
+            core->WriteObject(request, &response);
+            ::_exit(74);
+        }
+
+        int child_status = 0;
+        Check(::waitpid(child, &child_status, 0) == child, "wait for injected object crash");
+        Check(WIFEXITED(child_status) && WEXITSTATUS(child_status) == kInjectedCrashExitCode,
+              std::string("child did not exit at injected point: ") + test_case.name);
+        CheckRecoveredObjectState(root, test_case.committed, 2);
+        std::filesystem::remove_all(root);
+    }
+}
+
+void TestConcurrentObjectWritesCanCommitOutOfIdOrder()
+{
+    const auto root = std::filesystem::temp_directory_path() / "openevent_object_concurrent_commit";
+    std::filesystem::remove_all(root);
+    struct State {
+        std::mutex mutex;
+        std::condition_variable cv;
+        bool active = false;
+        bool first_blocked = false;
+        bool release_first = false;
+        int file_creates = 0;
+    };
+    auto state = std::make_shared<State>();
+    auto injector = [state](openevent::StorageFaultPoint point) {
+        if (point != openevent::StorageFaultPoint::kAfterTemporaryFileCreate) {
+            return openevent::Status::Ok();
+        }
+        std::unique_lock<std::mutex> lock(state->mutex);
+        if (!state->active || state->file_creates++ != 0) {
+            return openevent::Status::Ok();
+        }
+        state->first_blocked = true;
+        state->cv.notify_all();
+        state->cv.wait(lock, [&]() { return state->release_first; });
+        return openevent::Status::Ok();
+    };
+    auto core = MakeCore(root, 1024, 10000, 0, {}, injector);
+    const std::string token = AddToken(*core, 100);
+    state->active = true;
+
+    openevent::WriteObjectResponse first_response;
+    openevent::WriteObjectResponse second_response;
+    openevent::Status first_status;
+    openevent::Status second_status;
+    std::thread first([&]() {
+        auto request = MakeWriteObjectRequest(100, token, "first");
+        first_status = core->WriteObject(request, &first_response);
+    });
+    {
+        std::unique_lock<std::mutex> lock(state->mutex);
+        state->cv.wait(lock, [&]() { return state->first_blocked; });
+    }
+    std::thread second([&]() {
+        auto request = MakeWriteObjectRequest(100, token, "second");
+        second_status = core->WriteObject(request, &second_response);
+    });
+    second.join();
+    Check(second_status.ok() && second_response.object_id() == 2,
+          "second object must commit while the lower ID is still in file I/O");
+    {
+        std::lock_guard<std::mutex> lock(state->mutex);
+        state->release_first = true;
+    }
+    state->cv.notify_all();
+    first.join();
+    Check(first_status.ok() && first_response.object_id() == 1,
+          "concurrent object IDs must follow PREPARING allocation order");
+    core.reset();
+    std::filesystem::remove_all(root);
+}
+
+void TestObjectWriteReauthenticatesBeforeCommit()
+{
+    const auto root = std::filesystem::temp_directory_path() / "openevent_object_final_auth";
+    std::filesystem::remove_all(root);
+    struct State {
+        std::mutex mutex;
+        std::condition_variable cv;
+        bool active = false;
+        bool blocked = false;
+        bool release = false;
+    };
+    auto state = std::make_shared<State>();
+    auto injector = [state](openevent::StorageFaultPoint point) {
+        if (point != openevent::StorageFaultPoint::kAfterTemporaryFileCreate || !state->active) {
+            return openevent::Status::Ok();
+        }
+        std::unique_lock<std::mutex> lock(state->mutex);
+        state->active = false;
+        state->blocked = true;
+        state->cv.notify_all();
+        state->cv.wait(lock, [&]() { return state->release; });
+        return openevent::Status::Ok();
+    };
+    auto core = MakeCore(root, 1024, 10000, 0, {}, injector);
+    const std::string token = AddToken(*core, 100);
+    state->active = true;
+
+    openevent::Status write_status;
+    std::thread writer([&]() {
+        auto request = MakeWriteObjectRequest(100, token, "fault-data");
+        openevent::WriteObjectResponse response;
+        write_status = core->WriteObject(request, &response);
+    });
+    {
+        std::unique_lock<std::mutex> lock(state->mutex);
+        state->cv.wait(lock, [&]() { return state->blocked; });
+    }
+    openevent::DeleteTokenRequest delete_request;
+    delete_request.set_target_token(token);
+    openevent::DeleteTokenResponse delete_response;
+    Check(core->DeleteToken(delete_request, &delete_response).ok(), "delete token during object file I/O");
+    {
+        std::lock_guard<std::mutex> lock(state->mutex);
+        state->release = true;
+    }
+    state->cv.notify_all();
+    writer.join();
+    Check(!write_status.ok() && write_status.code() == grpc::StatusCode::UNAUTHENTICATED,
+          "object write must fail final authentication after token deletion");
+    core.reset();
+    CheckRecoveredObjectState(root, false, 2);
+    std::filesystem::remove_all(root);
+}
+
+void TestCancelledObjectWriteContinuesAfterPreparing()
+{
+    const auto root = std::filesystem::temp_directory_path() / "openevent_object_cancel_after_preparing";
+    std::filesystem::remove_all(root);
+    struct State {
+        std::mutex mutex;
+        std::condition_variable cv;
+        bool active = false;
+        int commits = 0;
+        bool preparing_committed = false;
+        bool release = false;
+        bool object_committed = false;
+    };
+    auto state = std::make_shared<State>();
+    auto injector = [state](openevent::StorageFaultPoint point) {
+        if (point != openevent::StorageFaultPoint::kAfterCommit || !state->active) {
+            return openevent::Status::Ok();
+        }
+        std::unique_lock<std::mutex> lock(state->mutex);
+        ++state->commits;
+        if (state->commits == 1) {
+            state->preparing_committed = true;
+            state->cv.notify_all();
+            state->cv.wait(lock, [&]() { return state->release; });
+        } else if (state->commits == 2) {
+            state->object_committed = true;
+            state->cv.notify_all();
+        }
+        return openevent::Status::Ok();
+    };
+    auto unique_core = MakeCore(root, 1024, 10000, 0, {}, injector);
+    const std::string token = AddToken(*unique_core, 100);
+    auto core = std::shared_ptr<openevent::OpenEventCore>(std::move(unique_core));
+    state->active = true;
+
+    {
+        openevent::ObjectStorageServiceImpl service(core);
+        grpc::ServerBuilder builder;
+        int port = 0;
+        builder.AddListeningPort("127.0.0.1:0", grpc::InsecureServerCredentials(), &port);
+        builder.RegisterService(&service);
+        std::unique_ptr<grpc::Server> server = builder.BuildAndStart();
+        Check(server != nullptr && port > 0, "start cancellation test gRPC server");
+        auto channel = grpc::CreateChannel("127.0.0.1:" + std::to_string(port),
+                                           grpc::InsecureChannelCredentials());
+        auto stub = openevent::ObjectStorageService::NewStub(channel);
+        grpc::ClientContext context;
+        grpc::Status rpc_status;
+        std::thread client([&]() {
+            auto request = MakeWriteObjectRequest(100, token, "fault-data");
+            openevent::WriteObjectResponse response;
+            rpc_status = stub->WriteObject(&context, request, &response);
+        });
+        {
+            std::unique_lock<std::mutex> lock(state->mutex);
+            state->cv.wait(lock, [&]() { return state->preparing_committed; });
+        }
+        context.TryCancel();
+        {
+            std::lock_guard<std::mutex> lock(state->mutex);
+            state->release = true;
+        }
+        state->cv.notify_all();
+        {
+            std::unique_lock<std::mutex> lock(state->mutex);
+            state->cv.wait(lock, [&]() { return state->object_committed; });
+        }
+        client.join();
+        Check(rpc_status.error_code() == grpc::StatusCode::CANCELLED,
+              "cancelled object RPC must report CANCELLED to the client");
+        server->Shutdown();
+        server->Wait();
+    }
+    core.reset();
+    CheckRecoveredObjectState(root, true, 2);
     std::filesystem::remove_all(root);
 }
 
@@ -994,9 +1490,6 @@ void TestPreparingRecoveryAndNoDirectoryScan()
         object.name = "preparing";
         object.type = "application/octet-stream";
         object.nbytes = 4;
-        auto digest = openevent::ObjectFileStore::Sha256("data");
-        Check(digest.ok(), digest.status().message());
-        object.sha256 = digest.value();
 
         rocksdb::WriteBatch batch;
         openevent::Status status = storage.value()->PutPreparingObject(&batch, object);
@@ -1085,14 +1578,76 @@ void TestCommittedObjectCorruptionIsFatal()
     openevent::ReadObjectRequest read;
     read.set_object_id(object.object_id());
     read.set_object_token(object.object_token());
-    read.set_nbytes(1);
+    read.set_nbytes(8);
     openevent::ReadObjectResponse response;
     status = core->ReadObject(read, &response);
+    Check(status.ok() && response.data() == "modified" && fatal_calls == 0,
+          "same-size content replacement is outside the retained file integrity checks");
+    {
+        std::ofstream corrupt(root / "data" / "objects" / std::to_string(object.object_id()),
+                              std::ios::binary | std::ios::trunc);
+        corrupt << "short";
+        Check(corrupt.good(), "truncate committed object content");
+    }
+    read.set_nbytes(1);
+    status = core->ReadObject(read, &response);
     Check(!status.ok() && status.code() == grpc::StatusCode::DATA_LOSS && fatal_calls == 1,
-          "committed object corruption must return DATA_LOSS and trigger fatal shutdown once");
+          "committed object size corruption must return DATA_LOSS and trigger fatal shutdown once");
     status = core->ReadObject(read, &response);
     Check(!status.ok() && status.code() == grpc::StatusCode::DATA_LOSS && fatal_calls == 1,
           "fatal storage callback must be idempotent");
+
+    std::filesystem::remove_all(root);
+}
+
+void TestObjectIoErrorClassificationAndPaths()
+{
+    Check(openevent::ObjectIoStatus("write object", ENOSPC).code() ==
+              grpc::StatusCode::RESOURCE_EXHAUSTED,
+          "ENOSPC should report RESOURCE_EXHAUSTED");
+    Check(openevent::ObjectIoStatus("write object", EDQUOT).code() ==
+              grpc::StatusCode::RESOURCE_EXHAUSTED,
+          "EDQUOT should report RESOURCE_EXHAUSTED");
+    Check(openevent::ObjectIoStatus("write object", EIO).code() ==
+              grpc::StatusCode::UNAVAILABLE,
+          "other object I/O errors should report UNAVAILABLE");
+
+    const auto root =
+        std::filesystem::temp_directory_path() / "openevent_object_io_error_paths";
+    const auto objects_path = root / "objects";
+    std::filesystem::remove_all(root);
+    std::filesystem::create_directories(objects_path);
+
+    {
+        auto store = openevent::ObjectFileStore::Open(objects_path.string());
+        Check(store.ok(), store.status().message());
+        {
+            std::ofstream temporary(objects_path / ".tmp.1", std::ios::binary);
+            temporary << "collision";
+            Check(temporary.good(), "create colliding temporary object file");
+        }
+        openevent::Status status = store.value()->Write(1, "data");
+        Check(!status.ok() && status.code() == grpc::StatusCode::DATA_LOSS,
+              "existing temporary object file should report DATA_LOSS");
+    }
+
+    std::filesystem::remove(objects_path / ".tmp.1");
+    {
+        std::ofstream final_file(objects_path / "2", std::ios::binary);
+        final_file << "collision";
+        Check(final_file.good(), "create colliding final object file");
+    }
+    {
+        auto store = openevent::ObjectFileStore::Open(objects_path.string());
+        Check(store.ok(), store.status().message());
+        openevent::Status status = store.value()->Write(2, "data");
+        Check(!status.ok() && status.code() == grpc::StatusCode::DATA_LOSS,
+              "existing final object file should report DATA_LOSS");
+    }
+
+    auto missing = openevent::ObjectFileStore::Open((root / "missing").string());
+    Check(!missing.ok() && missing.status().code() == grpc::StatusCode::UNAVAILABLE,
+          "missing object directory should report UNAVAILABLE");
 
     std::filesystem::remove_all(root);
 }
@@ -1197,6 +1752,29 @@ void TestUnifiedStorageLayout()
     std::filesystem::remove_all(root);
 }
 
+void TestNestedStoragePathInitialization()
+{
+    const auto root =
+        std::filesystem::temp_directory_path() / "openevent_nested_storage_initialization";
+    const auto storage_path = root / "missing" / "parent" / "data";
+    std::filesystem::remove_all(root);
+
+    {
+        auto storage = openevent::UnifiedStorage::Open(storage_path.string());
+        Check(storage.ok(), storage.status().message());
+        Check(std::filesystem::is_directory(storage_path / "db"),
+              "nested initialization should create the database directory");
+        Check(std::filesystem::is_directory(storage_path / "objects"),
+              "nested initialization should create the object directory");
+    }
+    {
+        auto reopened = openevent::UnifiedStorage::Open(storage_path.string());
+        Check(reopened.ok(), reopened.status().message());
+    }
+
+    std::filesystem::remove_all(root);
+}
+
 void TestUint64KeyEncodingOrder()
 {
     const std::vector<uint64_t> values{9, 10, 255, 256};
@@ -1209,7 +1787,7 @@ void TestUint64KeyEncodingOrder()
     Check(sorted == encoded, "BE64 keys must preserve numeric order across byte boundaries");
 }
 
-void TestUnifiedStorageInitializationRecovery()
+void TestUnifiedStorageRejectsIncompleteInitialization()
 {
     for (int created_column_families = 0; created_column_families <= 2; ++created_column_families) {
         const auto root = std::filesystem::temp_directory_path() /
@@ -1220,28 +1798,38 @@ void TestUnifiedStorageInitializationRecovery()
                              created_column_families >= 1,
                              created_column_families >= 2);
 
-        {
-            auto storage = openevent::UnifiedStorage::Open(root.string());
-            Check(storage.ok(), storage.status().message());
-            auto snapshot = storage.value()->CreateSnapshot();
-            Check(snapshot.ok(), snapshot.status().message());
-            auto max_seq = storage.value()->GetMaxSeq(snapshot.value());
-            auto next_channel_id = storage.value()->GetNextChannelId(snapshot.value());
-            Check(max_seq.ok() && max_seq.value() == 0,
-                  "recovered initialization should restore max_seq=0");
-            Check(next_channel_id.ok() && next_channel_id.value() == 1,
-                  "recovered initialization should restore next_channel_id=1");
-        }
-
-        rocksdb::Options options;
-        std::vector<std::string> names;
-        rocksdb::Status status = rocksdb::DB::ListColumnFamilies(options, (root / "db").string(), &names);
-        Check(status.ok(), status.ToString());
-        Check(std::set<std::string>(names.begin(), names.end()) ==
-                  std::set<std::string>({rocksdb::kDefaultColumnFamilyName, "messages", "objects"}),
-              "recovered initialization should contain all required column families");
+        auto storage = openevent::UnifiedStorage::Open(root.string());
+        Check(!storage.ok(), "incomplete initialization must be rejected without online repair");
         std::filesystem::remove_all(root);
     }
+}
+
+void TestUnifiedStorageRejectsExtraRootEntries()
+{
+    const auto root =
+        std::filesystem::temp_directory_path() / "openevent_extra_storage_root_entries";
+    std::filesystem::remove_all(root);
+    {
+        auto storage = openevent::UnifiedStorage::Open(root.string());
+        Check(storage.ok(), storage.status().message());
+    }
+
+    const auto extra_path = root / "unexpected";
+    {
+        std::ofstream extra_file(extra_path);
+        Check(extra_file.good(), "create unexpected storage root file");
+    }
+    auto storage = openevent::UnifiedStorage::Open(root.string());
+    Check(!storage.ok(), "storage root with an extra file must be rejected");
+
+    std::filesystem::remove(extra_path);
+    std::error_code ec;
+    std::filesystem::create_directory(extra_path, ec);
+    Check(!ec, "create unexpected storage root directory: " + ec.message());
+    storage = openevent::UnifiedStorage::Open(root.string());
+    Check(!storage.ok(), "storage root with an extra directory must be rejected");
+
+    std::filesystem::remove_all(root);
 }
 
 void TestUnifiedStorageRejectsInvalidState()
@@ -1264,33 +1852,17 @@ void TestUnifiedStorageRejectsInvalidState()
     storage = openevent::UnifiedStorage::Open(bad_schema.string());
     Check(!storage.ok(), "unsupported storage schema must be rejected");
 
-    const auto bad_watermark = base / "bad-watermark";
+    const auto zero_next_channel_id = base / "zero-next-channel-id";
     {
-        auto initialized = openevent::UnifiedStorage::Open(bad_watermark.string());
+        auto initialized = openevent::UnifiedStorage::Open(zero_next_channel_id.string());
         Check(initialized.ok(), initialized.status().message());
     }
-    PutRawRecord(bad_watermark / "db", rocksdb::kDefaultColumnFamilyName, "meta:max_seq",
-                 openevent::EncodeUint64(1));
-    storage = openevent::UnifiedStorage::Open(bad_watermark.string());
-    Check(!storage.ok(), "message watermark without a matching message must be rejected");
-
-    const auto bad_message_root = base / "bad-message-root";
-    {
-        auto core = MakeCore(bad_message_root);
-        std::string token = AddToken(*core, 100);
-        uint64_t channel_id = CreateChannel(*core, 100, token, openevent::VISIBILITY_PUBLIC);
-        PublishAuto(*core, 100, token, channel_id, "valid-before-corruption");
-    }
-    const auto bad_message = bad_message_root / "data" / "db";
-    openevent::EventMessage mismatched_message;
-    mismatched_message.set_seq(2);
-    mismatched_message.set_payload("mismatched-seq");
-    PutRawRecord(bad_message,
-                 "messages",
-                 std::string("msg/") + openevent::EncodeUint64(1),
-                 mismatched_message.SerializeAsString());
-    storage = openevent::UnifiedStorage::Open(bad_message.string());
-    Check(!storage.ok(), "message key/value seq mismatch must be rejected");
+    PutRawRecord(zero_next_channel_id / "db",
+                 rocksdb::kDefaultColumnFamilyName,
+                 "meta:next_channel_id",
+                 openevent::EncodeUint64(0));
+    storage = openevent::UnifiedStorage::Open(zero_next_channel_id.string());
+    Check(!storage.ok(), "zero next Channel ID must be rejected");
 
     const auto conflicting_object_root = base / "conflicting-object-root";
     openevent::WriteObjectResponse written;
@@ -1307,9 +1879,6 @@ void TestUnifiedStorageRejectsInvalidState()
     preparing.set_type("application/octet-stream");
     preparing.set_description("test object");
     preparing.set_nbytes(8);
-    auto digest = openevent::ObjectFileStore::Sha256("conflict");
-    Check(digest.ok(), digest.status().message());
-    preparing.set_sha256(digest.value());
     PutRawRecord(conflicting_object_root / "data" / "db",
                  "objects",
                  std::string("preparing/") + openevent::EncodeUint64(written.object_id()),
@@ -1320,6 +1889,78 @@ void TestUnifiedStorageRejectsInvalidState()
     Check(std::filesystem::is_regular_file(
               conflicting_object_root / "data" / "objects" / std::to_string(written.object_id())),
           "conflicting metadata recovery must not delete a committed object file");
+
+    std::filesystem::remove_all(base);
+}
+
+void TestUnifiedStorageStartupDoesNotScanMessages()
+{
+    const auto base = std::filesystem::temp_directory_path() / "openevent_no_startup_message_scan";
+    std::filesystem::remove_all(base);
+
+    const auto bad_watermark = base / "bad-watermark";
+    {
+        auto initialized = openevent::UnifiedStorage::Open(bad_watermark.string());
+        Check(initialized.ok(), initialized.status().message());
+    }
+    PutRawRecord(bad_watermark / "db", rocksdb::kDefaultColumnFamilyName, "meta:max_seq",
+                 openevent::EncodeUint64(1));
+    {
+        auto storage = openevent::UnifiedStorage::Open(bad_watermark.string());
+        Check(storage.ok(), "startup must not compare max_seq with message records");
+        auto snapshot = storage.value()->CreateSnapshot();
+        Check(snapshot.ok(), snapshot.status().message());
+        auto scan = storage.value()->ScanMessages(
+            snapshot.value(),
+            1,
+            1,
+            1,
+            [](const openevent::EventMessage&) -> openevent::Result<openevent::MessageScanAction> {
+                return openevent::MessageScanAction::kContinue;
+            });
+        Check(!scan.ok() && scan.status().code() == grpc::StatusCode::DATA_LOSS,
+              "runtime message scan must reject a missing record below max_seq");
+    }
+
+    const auto bad_message_root = base / "bad-message-root";
+    std::string token;
+    uint64_t channel_id = 0;
+    {
+        auto core = MakeCore(bad_message_root);
+        token = AddToken(*core, 100);
+        channel_id = CreateChannel(*core, 100, token, openevent::VISIBILITY_PUBLIC);
+        PublishAuto(*core, 100, token, channel_id, "valid-before-corruption");
+    }
+    openevent::EventMessage mismatched_message;
+    mismatched_message.set_seq(2);
+    mismatched_message.set_payload("mismatched-seq");
+    PutRawRecord(bad_message_root / "data" / "db",
+                 "messages",
+                 std::string("msg/") + openevent::EncodeUint64(1),
+                 mismatched_message.SerializeAsString());
+    {
+        auto storage = openevent::UnifiedStorage::Open((bad_message_root / "data").string());
+        Check(storage.ok(), "startup must not deserialize historical messages");
+    }
+    int fatal_calls = 0;
+    auto unique_core = MakeCore(bad_message_root,
+                                1024,
+                                10000,
+                                0,
+                                [&](const openevent::Status&) { ++fatal_calls; });
+    auto core = std::shared_ptr<openevent::OpenEventCore>(std::move(unique_core));
+    openevent::EventServiceImpl service(core);
+    openevent::FetchRequest request;
+    request.set_principal(100);
+    request.set_token(token);
+    request.set_from_seq(1);
+    request.set_limit(1);
+    request.add_channels(channel_id);
+    openevent::FetchResponse response;
+    grpc::Status status = service.Fetch(nullptr, &request, &response);
+    Check(!status.ok() && status.error_code() == grpc::StatusCode::DATA_LOSS && fatal_calls == 1,
+          "reading invalid stored message data must return DATA_LOSS and trigger shutdown");
+    core.reset();
 
     std::filesystem::remove_all(base);
 }
@@ -1419,6 +2060,7 @@ int main()
     TestCasAbort();
     TestPrivateAcl();
     TestFetchChannelFilter();
+    TestSharedSubscriptionSnapshotRefresh();
     TestRecipientFilter();
     TestRecipientMustBeChannelMember();
     TestPayloadLimit();
@@ -1430,13 +2072,23 @@ int main()
     TestDeleteTokenOrdersBeforePublish();
     TestObjectWriteMetadataReadAndReopen();
     TestMessageObjectReferences();
+    TestObjectWriteInjectedFailures();
+    TestRpcStorageFailureTriggersFatalShutdown();
+    TestObjectWriteCrashRecoveryBoundaries();
+    TestConcurrentObjectWritesCanCommitOutOfIdOrder();
+    TestObjectWriteReauthenticatesBeforeCommit();
+    TestCancelledObjectWriteContinuesAfterPreparing();
     TestPreparingRecoveryAndNoDirectoryScan();
     TestCommittedObjectCorruptionIsFatal();
+    TestObjectIoErrorClassificationAndPaths();
     TestUnifiedStorageReopen();
     TestUnifiedStorageLayout();
+    TestNestedStoragePathInitialization();
     TestUint64KeyEncodingOrder();
-    TestUnifiedStorageInitializationRecovery();
+    TestUnifiedStorageRejectsIncompleteInitialization();
+    TestUnifiedStorageRejectsExtraRootEntries();
     TestUnifiedStorageRejectsInvalidState();
+    TestUnifiedStorageStartupDoesNotScanMessages();
     TestDefaultPayloadLimit();
     TestServerConfigRequiresDataPaths();
     TestLoadServerConfigRequiresExistingFile();

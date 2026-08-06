@@ -5,9 +5,9 @@
 namespace openevent {
 namespace {
 
-grpc::Status ToGrpcStatus(const Status& status)
+grpc::Status ToGrpcStatus(const std::shared_ptr<OpenEventCore>& core, const Status& status)
 {
-    return status.ToGrpc();
+    return core->HandleRpcStatus(status).ToGrpc();
 }
 
 }  // namespace
@@ -18,26 +18,26 @@ grpc::Status EventServiceImpl::GetStatus(grpc::ServerContext*,
                                          const GetStatusRequest* request,
                                          GetStatusResponse* response)
 {
-    return ToGrpcStatus(core_->GetStatus(*request, response));
+    return ToGrpcStatus(core_, core_->GetStatus(*request, response));
 }
 
 grpc::Status EventServiceImpl::Publish(grpc::ServerContext*,
                                        const PublishRequest* request,
                                        PublishResponse* response)
 {
-    return ToGrpcStatus(core_->Publish(*request, response));
+    return ToGrpcStatus(core_, core_->Publish(*request, response));
 }
 
 grpc::Status EventServiceImpl::PublishAutoSeq(grpc::ServerContext*,
                                               const PublishAutoSeqRequest* request,
                                               PublishAutoSeqResponse* response)
 {
-    return ToGrpcStatus(core_->PublishAutoSeq(*request, response));
+    return ToGrpcStatus(core_, core_->PublishAutoSeq(*request, response));
 }
 
 grpc::Status EventServiceImpl::Fetch(grpc::ServerContext*, const FetchRequest* request, FetchResponse* response)
 {
-    return ToGrpcStatus(core_->Fetch(*request, response));
+    return ToGrpcStatus(core_, core_->Fetch(*request, response));
 }
 
 grpc::Status EventServiceImpl::Subscribe(grpc::ServerContext* context,
@@ -47,7 +47,7 @@ grpc::Status EventServiceImpl::Subscribe(grpc::ServerContext* context,
     uint64_t max_seq = 0;
     Status start_status = core_->GetSubscriptionMaxSeq(request->principal(), request->token(), &max_seq);
     if (!start_status.ok()) {
-        return ToGrpcStatus(start_status);
+        return ToGrpcStatus(core_, start_status);
     }
 
     uint64_t next_seq = request->from_seq();
@@ -61,16 +61,18 @@ grpc::Status EventServiceImpl::Subscribe(grpc::ServerContext* context,
     }
 
     while (!context->IsCancelled()) {
-        const uint64_t observed_generation = core_->CommitGeneration();
         FetchResponse batch;
+        uint64_t snapshot_version = 0;
         Status status = core_->FetchSubscriptionBatch(request->principal(),
                                                       request->token(),
                                                       next_seq,
                                                       100,
                                                       request->only_my_recipient(),
-                                                      &batch);
+                                                      request->channels(),
+                                                      &batch,
+                                                      &snapshot_version);
         if (!status.ok()) {
-            return ToGrpcStatus(status);
+            return ToGrpcStatus(core_, status);
         }
 
         for (const auto& message : batch.messages()) {
@@ -83,7 +85,10 @@ grpc::Status EventServiceImpl::Subscribe(grpc::ServerContext* context,
 
         next_seq = batch.next_seq();
         if (batch.next_seq() > batch.last_seq()) {
-            core_->WaitForCommit(observed_generation, std::chrono::milliseconds(100));
+            while (!context->IsCancelled() &&
+                   !core_->WaitForSubscriptionSnapshot(snapshot_version,
+                                                       std::chrono::milliseconds(100))) {
+            }
         }
     }
 
@@ -99,7 +104,7 @@ grpc::Status ObjectStorageServiceImpl::WriteObject(grpc::ServerContext*,
                                                    const WriteObjectRequest* request,
                                                    WriteObjectResponse* response)
 {
-    return ToGrpcStatus(core_->WriteObject(*request, response));
+    return ToGrpcStatus(core_, core_->WriteObject(*request, response));
 }
 
 grpc::Status ObjectStorageServiceImpl::GetObjectMetadata(
@@ -107,14 +112,14 @@ grpc::Status ObjectStorageServiceImpl::GetObjectMetadata(
     const GetObjectMetadataRequest* request,
     GetObjectMetadataResponse* response)
 {
-    return ToGrpcStatus(core_->GetObjectMetadata(*request, response));
+    return ToGrpcStatus(core_, core_->GetObjectMetadata(*request, response));
 }
 
 grpc::Status ObjectStorageServiceImpl::ReadObject(grpc::ServerContext*,
                                                   const ReadObjectRequest* request,
                                                   ReadObjectResponse* response)
 {
-    return ToGrpcStatus(core_->ReadObject(*request, response));
+    return ToGrpcStatus(core_, core_->ReadObject(*request, response));
 }
 
 ChannelServiceImpl::ChannelServiceImpl(std::shared_ptr<OpenEventCore> core) : core_(std::move(core)) {}
@@ -123,63 +128,63 @@ grpc::Status ChannelServiceImpl::CreateChannel(grpc::ServerContext*,
                                                const CreateChannelRequest* request,
                                                CreateChannelResponse* response)
 {
-    return ToGrpcStatus(core_->CreateChannel(*request, response));
+    return ToGrpcStatus(core_, core_->CreateChannel(*request, response));
 }
 
 grpc::Status ChannelServiceImpl::GetChannel(grpc::ServerContext*,
                                             const GetChannelRequest* request,
                                             GetChannelResponse* response)
 {
-    return ToGrpcStatus(core_->GetChannel(*request, response));
+    return ToGrpcStatus(core_, core_->GetChannel(*request, response));
 }
 
 grpc::Status ChannelServiceImpl::ListChannels(grpc::ServerContext*,
                                               const ListChannelsRequest* request,
                                               ListChannelsResponse* response)
 {
-    return ToGrpcStatus(core_->ListChannels(*request, response));
+    return ToGrpcStatus(core_, core_->ListChannels(*request, response));
 }
 
 grpc::Status ChannelServiceImpl::AddMember(grpc::ServerContext*,
                                            const AddMemberRequest* request,
                                            AddMemberResponse* response)
 {
-    return ToGrpcStatus(core_->AddMember(*request, response));
+    return ToGrpcStatus(core_, core_->AddMember(*request, response));
 }
 
 grpc::Status ChannelServiceImpl::RemoveMember(grpc::ServerContext*,
                                               const RemoveMemberRequest* request,
                                               RemoveMemberResponse* response)
 {
-    return ToGrpcStatus(core_->RemoveMember(*request, response));
+    return ToGrpcStatus(core_, core_->RemoveMember(*request, response));
 }
 
 AdminServiceImpl::AdminServiceImpl(std::shared_ptr<OpenEventCore> core) : core_(std::move(core)) {}
 
 grpc::Status AdminServiceImpl::AddToken(grpc::ServerContext*, const AddTokenRequest* request, AddTokenResponse* response)
 {
-    return ToGrpcStatus(core_->AddToken(*request, response));
+    return ToGrpcStatus(core_, core_->AddToken(*request, response));
 }
 
 grpc::Status AdminServiceImpl::DeleteToken(grpc::ServerContext*,
                                            const DeleteTokenRequest* request,
                                            DeleteTokenResponse* response)
 {
-    return ToGrpcStatus(core_->DeleteToken(*request, response));
+    return ToGrpcStatus(core_, core_->DeleteToken(*request, response));
 }
 
 grpc::Status AdminServiceImpl::ListTokens(grpc::ServerContext*,
                                           const ListTokensRequest* request,
                                           ListTokensResponse* response)
 {
-    return ToGrpcStatus(core_->ListTokens(*request, response));
+    return ToGrpcStatus(core_, core_->ListTokens(*request, response));
 }
 
 grpc::Status AdminServiceImpl::ListMessages(grpc::ServerContext*,
                                             const ListMessagesRequest* request,
                                             ListMessagesResponse* response)
 {
-    return ToGrpcStatus(core_->ListMessages(*request, response));
+    return ToGrpcStatus(core_, core_->ListMessages(*request, response));
 }
 
 }  // namespace openevent

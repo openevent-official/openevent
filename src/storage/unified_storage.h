@@ -56,7 +56,6 @@ struct StoredObject {
     std::string type;
     std::string description;
     uint64_t nbytes = 0;
-    std::string sha256;
 };
 
 enum class MessageScanAction {
@@ -74,7 +73,9 @@ public:
     UnifiedStorage(const UnifiedStorage&) = delete;
     UnifiedStorage& operator=(const UnifiedStorage&) = delete;
 
-    static Result<std::unique_ptr<UnifiedStorage>> Open(const std::string& path);
+    static Result<std::unique_ptr<UnifiedStorage>> Open(
+        const std::string& path,
+        StorageFaultInjector fault_injector = {});
 
     Result<ReadSnapshot> CreateSnapshot() const;
     Status Commit(rocksdb::WriteBatch* batch);
@@ -98,6 +99,9 @@ public:
                                                            uint64_t object_id) const;
     Result<std::optional<StoredObject>> GetCommittedObject(const ReadSnapshot& snapshot,
                                                            uint64_t object_id) const;
+    Result<std::vector<std::optional<StoredObject>>> GetCommittedObjects(
+        const ReadSnapshot& snapshot,
+        const std::vector<uint64_t>& object_ids) const;
 
     Status SetMaxSeq(rocksdb::WriteBatch* batch, uint64_t seq) const;
     Status SetNextChannelId(rocksdb::WriteBatch* batch, uint64_t channel_id) const;
@@ -112,7 +116,9 @@ public:
 
     Status WriteObjectFile(uint64_t object_id, const std::string& data) const;
     Status CleanupObjectFiles(uint64_t object_id) const;
-    Result<std::string> ReadObjectFile(const StoredObject& object) const;
+    Result<std::string> ReadObjectFile(const StoredObject& object,
+                                       uint64_t offset,
+                                       uint64_t nbytes) const;
 
 private:
     friend class ReadSnapshot;
@@ -121,12 +127,13 @@ private:
                    rocksdb::ColumnFamilyHandle* meta,
                    rocksdb::ColumnFamilyHandle* messages,
                    rocksdb::ColumnFamilyHandle* objects,
-                   std::unique_ptr<ObjectFileStore> object_files);
+                   std::unique_ptr<ObjectFileStore> object_files,
+                   StorageFaultInjector fault_injector);
 
     static Status InitializeNew(const std::string& root_path);
-    static Status CompleteInitialization(const std::string& root_path,
-                                         const std::vector<std::string>& column_families);
-    static Result<std::unique_ptr<UnifiedStorage>> OpenExisting(const std::string& root_path);
+    static Result<std::unique_ptr<UnifiedStorage>> OpenExisting(
+        const std::string& root_path,
+        StorageFaultInjector fault_injector);
 
     Result<uint64_t> GetRequiredUint64(const ReadSnapshot& snapshot, const std::string& key) const;
     Result<std::optional<StoredObject>> GetObject(const ReadSnapshot& snapshot,
@@ -142,6 +149,7 @@ private:
     rocksdb::ColumnFamilyHandle* messages_ = nullptr;
     rocksdb::ColumnFamilyHandle* objects_ = nullptr;
     std::unique_ptr<ObjectFileStore> object_files_;
+    StorageFaultInjector fault_injector_;
 };
 
 }  // namespace openevent
