@@ -13,7 +13,6 @@ struct ServerConfig {
     std::string admin_listen_addr = "127.0.0.1:9528";
     std::string storage_path;
     size_t max_payload_bytes = 16777216;
-    uint32_t shutdown_grace_seconds = 10;
 };
 
 Result<ServerConfig> LoadServerConfig(const std::string& path);

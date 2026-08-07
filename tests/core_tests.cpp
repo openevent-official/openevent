@@ -318,6 +318,24 @@ void TestPrivateAcl()
     Check(response.next_seq() == 2, "next_seq should still advance globally");
     Check(response.last_seq() == 1, "last_seq should report committed tail");
 
+    fetch.add_channels(channel_id);
+    response.Clear();
+    status = core->Fetch(fetch, &response);
+    Check(!status.ok() && status.code() == grpc::StatusCode::PERMISSION_DENIED,
+          "explicit unreadable Fetch channel must be rejected");
+
+    google::protobuf::RepeatedField<uint64_t> subscription_channels;
+    subscription_channels.Add(channel_id);
+    uint64_t subscription_max_seq = 0;
+    status = core->GetSubscriptionMaxSeq(200, other_token, subscription_channels, &subscription_max_seq);
+    Check(!status.ok() && status.code() == grpc::StatusCode::PERMISSION_DENIED,
+          "explicit unreadable subscription channel must be rejected at startup");
+    response.Clear();
+    status = core->FetchSubscriptionBatch(
+        200, other_token, 1, 10, false, subscription_channels, &response);
+    Check(!status.ok() && status.code() == grpc::StatusCode::PERMISSION_DENIED,
+          "explicit unreadable subscription channel must be rejected");
+
     openevent::AddMemberRequest add;
     add.set_principal(100);
     add.set_token(owner_token);
@@ -331,6 +349,8 @@ void TestPrivateAcl()
     status = core->Fetch(fetch, &response);
     Check(status.ok(), status.message());
     Check(response.messages_size() == 1, "member should see private message");
+
+    fetch.clear_channels();
 
     std::filesystem::remove_all(root);
 }
@@ -387,6 +407,13 @@ void TestFetchChannelFilter()
     Check(response.messages_size() == 2, "empty channel filter should return all visible messages");
     Check(response.last_seq() == 2, "empty channel filter last_seq");
 
+    fetch.clear_channels();
+    fetch.add_channels(std::numeric_limits<uint64_t>::max());
+    response.Clear();
+    status = core->Fetch(fetch, &response);
+    Check(!status.ok() && status.code() == grpc::StatusCode::NOT_FOUND,
+          "explicit missing Fetch channel must be rejected");
+
     std::filesystem::remove_all(root);
 }
 
@@ -401,7 +428,8 @@ void TestSharedSubscriptionSnapshotRefresh()
         CreateChannel(*core, 100, token, openevent::VISIBILITY_PUBLIC);
 
     uint64_t max_seq = 0;
-    openevent::Status status = core->GetSubscriptionMaxSeq(100, token, &max_seq);
+    google::protobuf::RepeatedField<uint64_t> no_channels;
+    openevent::Status status = core->GetSubscriptionMaxSeq(100, token, no_channels, &max_seq);
     Check(status.ok() && max_seq == 0,
           "subscription startup must wait for the shared snapshot to cover prior commits");
     const uint64_t settled_version = core->SubscriptionSnapshotVersion();
@@ -1205,10 +1233,12 @@ void TestRpcStorageFailureTriggersFatalShutdown()
         Check(!status.ok() && status.error_code() == injected_status.code() && fatal_calls == 1,
               "fatal storage failure from a non-object RPC must trigger shutdown");
 
+        *inject_failure = false;
         response.Clear();
         status = service.CreateChannel(nullptr, &request, &response);
-        Check(!status.ok() && status.error_code() == injected_status.code() && fatal_calls == 1,
-              "fatal RPC storage callback must be idempotent");
+        Check(!status.ok() && status.error_code() == grpc::StatusCode::UNAVAILABLE &&
+                  fatal_calls == 1,
+              "RPCs after a fatal storage failure must be rejected without another storage access");
 
         core.reset();
         std::filesystem::remove_all(root);
@@ -1594,8 +1624,8 @@ void TestCommittedObjectCorruptionIsFatal()
     Check(!status.ok() && status.code() == grpc::StatusCode::DATA_LOSS && fatal_calls == 1,
           "committed object size corruption must return DATA_LOSS and trigger fatal shutdown once");
     status = core->ReadObject(read, &response);
-    Check(!status.ok() && status.code() == grpc::StatusCode::DATA_LOSS && fatal_calls == 1,
-          "fatal storage callback must be idempotent");
+    Check(!status.ok() && status.code() == grpc::StatusCode::UNAVAILABLE && fatal_calls == 1,
+          "object reads after a fatal storage error must be rejected without another callback");
 
     std::filesystem::remove_all(root);
 }
@@ -1969,7 +1999,6 @@ void TestDefaultPayloadLimit()
 {
     openevent::ServerConfig config;
     Check(config.max_payload_bytes == 16777216, "default payload limit should be 16 MiB");
-    Check(config.shutdown_grace_seconds == 10, "default shutdown grace should be 10 seconds");
 }
 
 void TestServerConfigRequiresDataPaths()
@@ -2015,16 +2044,13 @@ void TestLoadServerConfigReadsRequiredPaths()
                 << "storage:\n"
                 << "  path: \"" << storage_path.string() << "\"\n"
                 << "limits:\n"
-                << "  max_payload_bytes: 4096\n"
-                << "shutdown:\n"
-                << "  grace_seconds: 3\n";
+                << "  max_payload_bytes: 4096\n";
     config_file.close();
 
     auto config = openevent::LoadServerConfig(config_path.string());
     Check(config.ok(), config.status().message());
     Check(config.value().storage_path == storage_path.string(), "storage path should come from config");
     Check(config.value().max_payload_bytes == 4096, "payload limit should come from config");
-    Check(config.value().shutdown_grace_seconds == 3, "shutdown grace should come from config");
 
     std::filesystem::remove_all(root);
 }

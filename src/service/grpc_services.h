@@ -1,6 +1,8 @@
 #pragma once
 
 #include <memory>
+#include <mutex>
+#include <unordered_set>
 
 #include <grpcpp/grpcpp.h>
 
@@ -30,8 +32,20 @@ public:
                            const SubscribeRequest* request,
                            grpc::ServerWriter<SubscribeResponse>* writer) override;
 
+    // Ends all active subscription streams as part of server shutdown.
+    void StopSubscriptions();
+
 private:
+    bool RegisterSubscription(grpc::ServerContext* context);
+    void UnregisterSubscription(grpc::ServerContext* context);
+    grpc::Status RunSubscription(grpc::ServerContext* context,
+                                 const SubscribeRequest* request,
+                                 grpc::ServerWriter<SubscribeResponse>* writer);
+
     std::shared_ptr<OpenEventCore> core_;
+    std::mutex subscriptions_mu_;
+    std::unordered_set<grpc::ServerContext*> subscriptions_;
+    bool subscriptions_stopping_ = false;
 };
 
 class ObjectStorageServiceImpl final : public ::openevent::ObjectStorageService::Service {

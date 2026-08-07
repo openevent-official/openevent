@@ -23,9 +23,6 @@ storage:
 
 limits:
   max_payload_bytes: 16777216
-
-shutdown:
-  grace_seconds: 10
 ```
 
 ## 字段
@@ -63,12 +60,12 @@ shutdown:
   gRPC 接受的最大值；Fetch 和管理消息分页使用独立的 `max_payload_bytes + 1 MiB` 应用层响应软预算。
 - 必须大于 0。
 
-### `shutdown`
+## 关闭流程
 
-- `grace_seconds`：无符号整数，默认 `10`。
-- 收到 `SIGINT` 或 `SIGTERM` 后的优雅关闭窗口。两个 gRPC 服务会停止接收新请求，
-  并等待在途请求完成；达到 deadline 后仍未结束的 RPC（包括流式请求）会被取消，然后关闭存储。
-- 必须大于 0。
+收到 `SIGINT`、`SIGTERM` 或发生致命存储错误时，两个 gRPC Server 停止接收新调用；服务端先禁止
+新的 Subscribe，并主动取消全部已经建立的 Subscribe stream，然后调用不带 deadline 的 `Shutdown()`。
+普通在途 handler 不被主动取消，服务端等待它们完成后才关闭 Core 和 RocksDB；退出流程不设置超时。
+致命存储错误最终仍使进程以非零状态退出。完整生命周期规则以内部架构设计文档为准。
 
 ## 安全提示
 
@@ -93,8 +90,9 @@ shutdown:
 - 服务期间任何 RocksDB 操作失败都会使服务端以非零状态退出。RocksDB 损坏返回 `DATA_LOSS`，其他
   RocksDB 错误返回 `UNAVAILABLE`。正常查询不存在的 token、Channel 或 object 不属于 RocksDB 故障。
   启动期间任何 RocksDB 操作失败都会拒绝启动。
-- 已读出的持久化 bytes 不符合内部记录格式或必要记录关系时按存储损坏处理；遇到该数据的请求返回
-  `DATA_LOSS`，并使服务端以非零状态退出。启动仍不全量扫描历史消息或 committed 对象。
+- 已读出的持久化 bytes 不符合内部记录格式时按存储损坏处理；遇到该数据的请求返回 `DATA_LOSS`，
+  并使服务端以非零状态退出。消息所属 Channel 不存在时返回 `INTERNAL`，不触发服务端退出。启动仍
+  不全量扫描历史消息或 committed 对象。
 
 ## 校验错误
 
@@ -106,4 +104,3 @@ shutdown:
 - `grpc.listen_addr and admin.listen_addr must be different`
 - `storage.path must not be empty`
 - `limits.max_payload_bytes must be greater than 0`
-- `shutdown.grace_seconds must be greater than 0`

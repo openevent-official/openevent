@@ -23,9 +23,6 @@ storage:
 
 limits:
   max_payload_bytes: 16777216
-
-shutdown:
-  grace_seconds: 10
 ```
 
 ## Fields
@@ -70,13 +67,15 @@ shutdown:
   `max_payload_bytes + 1 MiB`.
 - Must be greater than 0.
 
-### `shutdown`
+## Shutdown Behavior
 
-- `grace_seconds`: unsigned integer, default `10`.
-- Grace period used after `SIGINT` or `SIGTERM`. Both gRPC servers stop accepting
-  new calls and drain in-flight calls until this deadline; any RPC that remains
-  active, including streaming calls, is then cancelled before storage is closed.
-- Must be greater than 0.
+On `SIGINT`, `SIGTERM`, or a fatal storage error, both gRPC servers stop accepting
+new calls. The server first rejects new Subscribe calls and actively cancels every
+established Subscribe stream, then uses `Shutdown()` without a deadline. Ordinary
+in-flight handlers are not actively cancelled; the process waits for them to finish
+before closing Core and RocksDB, with no shutdown timeout. A fatal storage error
+still causes the final process exit status to be non-zero. The internal architecture
+document is the authoritative source for the complete lifecycle rules.
 
 ## Security Notes
 
@@ -111,10 +110,11 @@ shutdown:
   errors return `UNAVAILABLE`. A normal lookup of a missing token, Channel, or
   object is not a RocksDB failure. Any RocksDB failure during startup prevents
   startup.
-- Stored bytes that violate the internal record format or required record
-  relationships are treated as corruption. A request that encounters such data
-  returns `DATA_LOSS` and causes a nonzero server exit. Startup still performs no
-  full historical message or committed object scan.
+- Stored bytes that violate the internal record format are treated as corruption.
+  A request that encounters such data returns `DATA_LOSS` and causes a nonzero
+  server exit. A message whose Channel is absent returns `INTERNAL` and does not
+  cause a server exit. Startup still performs no full historical message or
+  committed object scan.
 
 ## Validation Errors
 
@@ -126,4 +126,3 @@ shutdown:
 - `grpc.listen_addr and admin.listen_addr must be different`
 - `storage.path must not be empty`
 - `limits.max_payload_bytes must be greater than 0`
-- `shutdown.grace_seconds must be greater than 0`

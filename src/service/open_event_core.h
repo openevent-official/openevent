@@ -52,7 +52,10 @@ public:
 
     Status HandleRpcStatus(const Status& status) const;
 
-    Status GetSubscriptionMaxSeq(uint64_t principal, const std::string& token, uint64_t* max_seq) const;
+    Status GetSubscriptionMaxSeq(uint64_t principal,
+                                 const std::string& token,
+                                 const google::protobuf::RepeatedField<uint64_t>& channels,
+                                 uint64_t* max_seq) const;
     Status FetchSubscriptionBatch(uint64_t principal,
                                   const std::string& token,
                                   uint64_t from_seq,
@@ -73,6 +76,7 @@ private:
         uint64_t version = 0;
     };
 
+    Status EnsureAvailable() const;
     Result<ReadSnapshot> CreateLinearizedSnapshot();
     Result<SubscriptionSnapshot> AcquireSubscriptionSnapshot() const;
     void RefreshSubscriptionSnapshots();
@@ -101,6 +105,10 @@ private:
                         bool only_my_recipient,
                         const google::protobuf::RepeatedField<uint64_t>& channels,
                         FetchResponse* response) const;
+    Status ValidateReadableChannels(
+        const ReadSnapshot& snapshot,
+        uint64_t principal,
+        const google::protobuf::RepeatedField<uint64_t>& channels) const;
     Status ListAllMessages(const ReadSnapshot& snapshot,
                            uint64_t from_seq,
                            uint32_t limit,

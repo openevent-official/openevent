@@ -192,8 +192,10 @@ OpenEventCore::OpenEventCore(std::unique_ptr<UnifiedStorage> storage,
             FatalStorageError(snapshot.status());
         }
     }
-    subscription_snapshot_thread_ =
-        std::thread([this]() { RefreshSubscriptionSnapshots(); });
+    if (!fatal_error_triggered_.load(std::memory_order_acquire)) {
+        subscription_snapshot_thread_ =
+            std::thread([this]() { RefreshSubscriptionSnapshots(); });
+    }
 }
 
 OpenEventCore::~OpenEventCore()
@@ -209,6 +211,15 @@ OpenEventCore::~OpenEventCore()
     subscription_snapshot_.reset();
 }
 
+Status OpenEventCore::EnsureAvailable() const
+{
+    if (fatal_error_triggered_.load(std::memory_order_acquire)) {
+        return Status(grpc::StatusCode::UNAVAILABLE,
+                      "server is shutting down due to a fatal storage error");
+    }
+    return Status::Ok();
+}
+
 Result<ReadSnapshot> OpenEventCore::CreateLinearizedSnapshot()
 {
     std::lock_guard<std::mutex> lock(coordinator_mu_);
@@ -217,10 +228,15 @@ Result<ReadSnapshot> OpenEventCore::CreateLinearizedSnapshot()
 
 Result<OpenEventCore::SubscriptionSnapshot> OpenEventCore::AcquireSubscriptionSnapshot() const
 {
+    Status available = EnsureAvailable();
+    if (!available.ok()) {
+        return available;
+    }
     const uint64_t required_generation = commit_generation_.load(std::memory_order_acquire);
     std::unique_lock<std::mutex> lock(subscription_snapshot_mu_);
     subscription_snapshot_cv_.wait(lock, [&]() {
         return stop_subscription_snapshot_thread_ ||
+               fatal_error_triggered_.load(std::memory_order_acquire) ||
                subscription_snapshot_generation_ >= required_generation ||
                (!subscription_snapshot_status_.ok() &&
                 subscription_snapshot_attempt_generation_ >= required_generation);
@@ -230,6 +246,10 @@ Result<OpenEventCore::SubscriptionSnapshot> OpenEventCore::AcquireSubscriptionSn
         return subscription_snapshot_status_;
     }
     if (!subscription_snapshot_) {
+        if (fatal_error_triggered_.load(std::memory_order_acquire)) {
+            return Status(grpc::StatusCode::UNAVAILABLE,
+                          "subscription snapshot is unavailable after fatal storage error");
+        }
         return Status(grpc::StatusCode::UNAVAILABLE, "subscription snapshot is unavailable");
     }
     return SubscriptionSnapshot{subscription_snapshot_, subscription_snapshot_version_};
@@ -242,7 +262,8 @@ void OpenEventCore::RefreshSubscriptionSnapshots()
     std::unique_lock<std::mutex> lock(subscription_snapshot_mu_);
     while (!stop_subscription_snapshot_thread_) {
         if (subscription_snapshot_cv_.wait_until(lock, next_refresh, [&]() {
-                return stop_subscription_snapshot_thread_;
+                return stop_subscription_snapshot_thread_ ||
+                       fatal_error_triggered_.load(std::memory_order_acquire);
             })) {
             break;
         }
@@ -256,6 +277,9 @@ void OpenEventCore::RefreshSubscriptionSnapshots()
         lock.unlock();
         auto snapshot = storage_->CreateSnapshot();
         lock.lock();
+        if (fatal_error_triggered_.load(std::memory_order_acquire)) {
+            break;
+        }
         subscription_snapshot_attempt_generation_ = generation;
         if (snapshot.ok()) {
             subscription_snapshot_ =
@@ -265,11 +289,16 @@ void OpenEventCore::RefreshSubscriptionSnapshots()
             subscription_snapshot_status_ = Status::Ok();
         } else {
             subscription_snapshot_status_ = snapshot.status();
-            if (snapshot.status().requires_server_exit()) {
-                FatalStorageError(snapshot.status());
-            }
         }
         subscription_snapshot_cv_.notify_all();
+
+        if (!snapshot.ok() && snapshot.status().requires_server_exit()) {
+            const Status fatal_status = snapshot.status();
+            lock.unlock();
+            FatalStorageError(fatal_status);
+            lock.lock();
+            break;
+        }
 
         const auto now = std::chrono::steady_clock::now();
         if (next_refresh <= now) {
@@ -297,6 +326,10 @@ Status OpenEventCore::Authenticate(const ReadSnapshot& snapshot,
 
 Status OpenEventCore::GetStatus(const GetStatusRequest& request, GetStatusResponse* response)
 {
+    Status available = EnsureAvailable();
+    if (!available.ok()) {
+        return available;
+    }
     auto snapshot_result = CreateLinearizedSnapshot();
     if (!snapshot_result.ok()) {
         return snapshot_result.status();
@@ -403,6 +436,10 @@ Status OpenEventCore::CommitBatch(rocksdb::WriteBatch* batch)
 
 Status OpenEventCore::Publish(const PublishRequest& request, PublishResponse*)
 {
+    Status available = EnsureAvailable();
+    if (!available.ok()) {
+        return available;
+    }
     const uint64_t ts_ms = NowMs();
     Status payload_status = ValidatePayloadSize(request.payload());
     if (!payload_status.ok()) {
@@ -449,6 +486,10 @@ Status OpenEventCore::Publish(const PublishRequest& request, PublishResponse*)
 
 Status OpenEventCore::PublishAutoSeq(const PublishAutoSeqRequest& request, PublishAutoSeqResponse* response)
 {
+    Status available = EnsureAvailable();
+    if (!available.ok()) {
+        return available;
+    }
     const uint64_t ts_ms = NowMs();
     Status payload_status = ValidatePayloadSize(request.payload());
     if (!payload_status.ok()) {
@@ -546,8 +587,14 @@ Result<StoredObject> OpenEventCore::LoadAuthorizedObject(const ReadSnapshot& sna
 Status OpenEventCore::FatalStorageError(const Status& status) const
 {
     bool expected = false;
-    if (fatal_error_triggered_.compare_exchange_strong(expected, true, std::memory_order_acq_rel) &&
-        fatal_error_handler_) {
+    {
+        std::lock_guard<std::mutex> lock(subscription_snapshot_mu_);
+        if (!fatal_error_triggered_.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
+            return status;
+        }
+    }
+    subscription_snapshot_cv_.notify_all();
+    if (fatal_error_handler_) {
         fatal_error_handler_(status);
     }
     return status;
@@ -555,9 +602,10 @@ Status OpenEventCore::FatalStorageError(const Status& status) const
 
 Status OpenEventCore::HandleRpcStatus(const Status& status) const
 {
-    return status.requires_server_exit() || status.code() == grpc::StatusCode::DATA_LOSS
-               ? FatalStorageError(status)
-               : status;
+    if (status.requires_server_exit() || status.code() == grpc::StatusCode::DATA_LOSS) {
+        FatalStorageError(status);
+    }
+    return status;
 }
 
 Status OpenEventCore::CleanupPreparingObject(uint64_t object_id, const Status& result)
@@ -579,6 +627,10 @@ Status OpenEventCore::CleanupPreparingObject(uint64_t object_id, const Status& r
 
 Status OpenEventCore::WriteObject(const WriteObjectRequest& request, WriteObjectResponse* response)
 {
+    Status available = EnsureAvailable();
+    if (!available.ok()) {
+        return available;
+    }
     if (request.name().empty() || request.name().size() > kMaxObjectNameBytes ||
         request.type().empty() || request.type().size() > kMaxObjectTypeBytes ||
         request.description().size() > kMaxObjectDescriptionBytes || request.data().empty() ||
@@ -691,6 +743,10 @@ Status OpenEventCore::WriteObject(const WriteObjectRequest& request, WriteObject
 Status OpenEventCore::GetObjectMetadata(const GetObjectMetadataRequest& request,
                                         GetObjectMetadataResponse* response)
 {
+    Status available = EnsureAvailable();
+    if (!available.ok()) {
+        return available;
+    }
     auto snapshot_result = CreateLinearizedSnapshot();
     if (!snapshot_result.ok()) {
         return snapshot_result.status();
@@ -709,6 +765,10 @@ Status OpenEventCore::GetObjectMetadata(const GetObjectMetadataRequest& request,
 
 Status OpenEventCore::ReadObject(const ReadObjectRequest& request, ReadObjectResponse* response)
 {
+    Status available = EnsureAvailable();
+    if (!available.ok()) {
+        return available;
+    }
     if (request.nbytes() == 0) {
         return Status(grpc::StatusCode::INVALID_ARGUMENT, "nbytes must be greater than 0");
     }
@@ -743,6 +803,10 @@ Status OpenEventCore::ReadObject(const ReadObjectRequest& request, ReadObjectRes
 
 Status OpenEventCore::Fetch(const FetchRequest& request, FetchResponse* response)
 {
+    Status available = EnsureAvailable();
+    if (!available.ok()) {
+        return available;
+    }
     if (request.limit() == 0 || request.limit() > 1000) {
         return Status(grpc::StatusCode::INVALID_ARGUMENT, "limit must be in 1..1000");
     }
@@ -754,6 +818,11 @@ Status OpenEventCore::Fetch(const FetchRequest& request, FetchResponse* response
     Status auth = Authenticate(snapshot, request.principal(), request.token());
     if (!auth.ok()) {
         return auth;
+    }
+    Status channel_status =
+        ValidateReadableChannels(snapshot, request.principal(), request.channels());
+    if (!channel_status.ok()) {
+        return channel_status;
     }
     return FetchVisible(snapshot,
                         request.principal(),
@@ -800,8 +869,8 @@ Status OpenEventCore::FetchVisible(const ReadSnapshot& snapshot,
                     return channel_result.status();
                 }
                 if (!channel_result.value().has_value()) {
-                    return Status(grpc::StatusCode::DATA_LOSS,
-                                  "stored message references a missing channel");
+                    return Status(grpc::StatusCode::INTERNAL,
+                                  "message references a missing channel");
                 }
                 const bool can_read = CanRead(channel_result.value().value(), principal);
                 readable = readable_channels.emplace(message.channel_id(), can_read).first;
@@ -834,6 +903,10 @@ Status OpenEventCore::FetchVisible(const ReadSnapshot& snapshot,
 
 Status OpenEventCore::CreateChannel(const CreateChannelRequest& request, CreateChannelResponse* response)
 {
+    Status available = EnsureAvailable();
+    if (!available.ok()) {
+        return available;
+    }
     Status visibility_status = ValidateVisibility(request.visibility());
     if (!visibility_status.ok()) {
         return visibility_status;
@@ -890,6 +963,10 @@ Status OpenEventCore::CreateChannel(const CreateChannelRequest& request, CreateC
 
 Status OpenEventCore::GetChannel(const GetChannelRequest& request, GetChannelResponse* response)
 {
+    Status available = EnsureAvailable();
+    if (!available.ok()) {
+        return available;
+    }
     auto snapshot_result = CreateLinearizedSnapshot();
     if (!snapshot_result.ok()) {
         return snapshot_result.status();
@@ -915,6 +992,10 @@ Status OpenEventCore::GetChannel(const GetChannelRequest& request, GetChannelRes
 
 Status OpenEventCore::ListChannels(const ListChannelsRequest& request, ListChannelsResponse* response)
 {
+    Status available = EnsureAvailable();
+    if (!available.ok()) {
+        return available;
+    }
     Status filter_status = ValidateFilter(request.filter());
     if (!filter_status.ok()) {
         return filter_status;
@@ -955,6 +1036,10 @@ Status OpenEventCore::ListChannels(const ListChannelsRequest& request, ListChann
 
 Status OpenEventCore::AddMember(const AddMemberRequest& request, AddMemberResponse*)
 {
+    Status available = EnsureAvailable();
+    if (!available.ok()) {
+        return available;
+    }
     std::lock_guard<std::mutex> lock(coordinator_mu_);
     auto snapshot_result = storage_->CreateSnapshot();
     if (!snapshot_result.ok()) {
@@ -995,6 +1080,10 @@ Status OpenEventCore::AddMember(const AddMemberRequest& request, AddMemberRespon
 
 Status OpenEventCore::RemoveMember(const RemoveMemberRequest& request, RemoveMemberResponse*)
 {
+    Status available = EnsureAvailable();
+    if (!available.ok()) {
+        return available;
+    }
     std::lock_guard<std::mutex> lock(coordinator_mu_);
     auto snapshot_result = storage_->CreateSnapshot();
     if (!snapshot_result.ok()) {
@@ -1039,6 +1128,10 @@ Status OpenEventCore::RemoveMember(const RemoveMemberRequest& request, RemoveMem
 
 Status OpenEventCore::AddToken(const AddTokenRequest& request, AddTokenResponse* response)
 {
+    Status available = EnsureAvailable();
+    if (!available.ok()) {
+        return available;
+    }
     std::lock_guard<std::mutex> lock(coordinator_mu_);
     auto snapshot_result = storage_->CreateSnapshot();
     if (!snapshot_result.ok()) {
@@ -1082,6 +1175,10 @@ Status OpenEventCore::AddToken(const AddTokenRequest& request, AddTokenResponse*
 
 Status OpenEventCore::DeleteToken(const DeleteTokenRequest& request, DeleteTokenResponse*)
 {
+    Status available = EnsureAvailable();
+    if (!available.ok()) {
+        return available;
+    }
     std::lock_guard<std::mutex> lock(coordinator_mu_);
     rocksdb::WriteBatch batch;
     storage_->DeleteToken(&batch, request.target_token());
@@ -1090,6 +1187,10 @@ Status OpenEventCore::DeleteToken(const DeleteTokenRequest& request, DeleteToken
 
 Status OpenEventCore::ListTokens(const ListTokensRequest& request, ListTokensResponse* response)
 {
+    Status available = EnsureAvailable();
+    if (!available.ok()) {
+        return available;
+    }
     if (request.limit() == 0 || request.limit() > 1000) {
         return Status(grpc::StatusCode::INVALID_ARGUMENT, "limit must be in 1..1000");
     }
@@ -1122,6 +1223,10 @@ Status OpenEventCore::ListTokens(const ListTokensRequest& request, ListTokensRes
 
 Status OpenEventCore::ListMessages(const ListMessagesRequest& request, ListMessagesResponse* response)
 {
+    Status available = EnsureAvailable();
+    if (!available.ok()) {
+        return available;
+    }
     if (request.limit() == 0 || request.limit() > 1000) {
         return Status(grpc::StatusCode::INVALID_ARGUMENT, "limit must be in 1..1000");
     }
@@ -1152,12 +1257,24 @@ Status OpenEventCore::ListAllMessages(const ReadSnapshot& snapshot,
     }
 
     size_t response_bytes = 0;
+    std::unordered_set<uint64_t> known_channels;
     auto next_seq = storage_->ScanMessages(
         snapshot,
         start_seq,
         max_seq,
         max_scan_records_,
         [&](const EventMessage& message) -> Result<MessageScanAction> {
+            if (!known_channels.contains(message.channel_id())) {
+                auto channel = LoadChannel(snapshot, message.channel_id());
+                if (!channel.ok()) {
+                    return channel.status();
+                }
+                if (!channel.value().has_value()) {
+                    return Status(grpc::StatusCode::INTERNAL,
+                                  "message references a missing channel");
+                }
+                known_channels.insert(message.channel_id());
+            }
             const size_t message_bytes = message.ByteSizeLong();
             if (response->messages_size() > 0 &&
                 message_bytes > response_soft_limit_bytes_ - std::min(response_bytes, response_soft_limit_bytes_)) {
@@ -1177,10 +1294,16 @@ Status OpenEventCore::ListAllMessages(const ReadSnapshot& snapshot,
     return Status::Ok();
 }
 
-Status OpenEventCore::GetSubscriptionMaxSeq(uint64_t principal,
-                                            const std::string& token,
-                                            uint64_t* max_seq) const
+Status OpenEventCore::GetSubscriptionMaxSeq(
+    uint64_t principal,
+    const std::string& token,
+    const google::protobuf::RepeatedField<uint64_t>& channels,
+    uint64_t* max_seq) const
 {
+    Status available = EnsureAvailable();
+    if (!available.ok()) {
+        return available;
+    }
     auto snapshot_result = AcquireSubscriptionSnapshot();
     if (!snapshot_result.ok()) {
         return snapshot_result.status();
@@ -1189,6 +1312,10 @@ Status OpenEventCore::GetSubscriptionMaxSeq(uint64_t principal,
     Status auth = Authenticate(snapshot, principal, token);
     if (!auth.ok()) {
         return auth;
+    }
+    Status channel_status = ValidateReadableChannels(snapshot, principal, channels);
+    if (!channel_status.ok()) {
+        return channel_status;
     }
     auto result = storage_->GetMaxSeq(snapshot);
     if (!result.ok()) {
@@ -1216,6 +1343,10 @@ Status OpenEventCore::FetchSubscriptionBatch(uint64_t principal,
     if (!auth.ok()) {
         return auth;
     }
+    Status channel_status = ValidateReadableChannels(snapshot, principal, channels);
+    if (!channel_status.ok()) {
+        return channel_status;
+    }
     Status status = FetchVisible(snapshot, principal, from_seq, limit, only_my_recipient, channels, response);
     if (status.ok() && snapshot_version != nullptr) {
         *snapshot_version = snapshot_result.value().version;
@@ -1235,12 +1366,14 @@ bool OpenEventCore::WaitForSubscriptionSnapshot(uint64_t observed_version,
     std::unique_lock<std::mutex> lock(subscription_snapshot_mu_);
     subscription_snapshot_cv_.wait_for(lock, timeout, [&]() {
         return stop_subscription_snapshot_thread_ ||
+               fatal_error_triggered_.load(std::memory_order_acquire) ||
                subscription_snapshot_version_ != observed_version ||
                (!subscription_snapshot_status_.ok() &&
                 subscription_snapshot_attempt_generation_ >
                     subscription_snapshot_generation_);
     });
-    return subscription_snapshot_version_ != observed_version ||
+    return fatal_error_triggered_.load(std::memory_order_acquire) ||
+           subscription_snapshot_version_ != observed_version ||
            (!subscription_snapshot_status_.ok() &&
             subscription_snapshot_attempt_generation_ >
                 subscription_snapshot_generation_);
@@ -1248,6 +1381,10 @@ bool OpenEventCore::WaitForSubscriptionSnapshot(uint64_t observed_version,
 
 Result<uint64_t> OpenEventCore::MaxSeq() const
 {
+    Status available = EnsureAvailable();
+    if (!available.ok()) {
+        return available;
+    }
     auto snapshot_result = storage_->CreateSnapshot();
     if (!snapshot_result.ok()) {
         return snapshot_result.status();
@@ -1274,6 +1411,30 @@ bool OpenEventCore::CanRead(const ChannelInfo& channel, uint64_t principal) cons
         return true;
     }
     return IsMember(channel, principal);
+}
+
+Status OpenEventCore::ValidateReadableChannels(
+    const ReadSnapshot& snapshot,
+    uint64_t principal,
+    const google::protobuf::RepeatedField<uint64_t>& channels) const
+{
+    std::unordered_set<uint64_t> validated;
+    for (uint64_t channel_id : channels) {
+        if (!validated.insert(channel_id).second) {
+            continue;
+        }
+        auto channel_result = LoadChannel(snapshot, channel_id);
+        if (!channel_result.ok()) {
+            return channel_result.status();
+        }
+        if (!channel_result.value().has_value()) {
+            return Status(grpc::StatusCode::NOT_FOUND, "channel not found");
+        }
+        if (!CanRead(channel_result.value().value(), principal)) {
+            return Status(grpc::StatusCode::PERMISSION_DENIED, "channel not visible");
+        }
+    }
+    return Status::Ok();
 }
 
 bool OpenEventCore::CanWrite(const ChannelInfo& channel, uint64_t principal) const

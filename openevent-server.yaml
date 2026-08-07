@@ -9,6 +9,3 @@ storage:
 
 limits:
   max_payload_bytes: 16777216
-
-shutdown:
-  grace_seconds: 10

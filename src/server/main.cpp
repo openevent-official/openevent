@@ -1,10 +1,11 @@
 #include <algorithm>
 #include <atomic>
-#include <chrono>
 #include <csignal>
+#include <condition_variable>
 #include <iostream>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <pthread.h>
 #include <string>
 #include <thread>
@@ -57,17 +58,26 @@ int main(int argc, char** argv)
     }
 
     std::atomic<bool> fatal_storage_error{false};
+    std::condition_variable fatal_storage_error_cv;
+    std::mutex fatal_storage_error_mu;
     auto core = std::make_shared<openevent::OpenEventCore>(std::move(storage_result.value()),
                                                            config.max_payload_bytes,
                                                            10000,
                                                            0,
-                                                           [&fatal_storage_error](const openevent::Status& status) {
-                                                               fatal_storage_error.store(
-                                                                   true, std::memory_order_release);
+                                                           [&](const openevent::Status& status) {
+                                                               {
+                                                                   std::lock_guard<std::mutex> lock(
+                                                                       fatal_storage_error_mu);
+                                                                   fatal_storage_error.store(
+                                                                       true, std::memory_order_release);
+                                                               }
                                                                std::cerr << "fatal storage error: "
                                                                          << status.message() << "\n";
-                                                               ::kill(::getpid(), SIGTERM);
+                                                               fatal_storage_error_cv.notify_all();
                                                            });
+    if (fatal_storage_error.load(std::memory_order_acquire)) {
+        return 1;
+    }
 
     openevent::EventServiceImpl event_service(core);
     openevent::ObjectStorageServiceImpl object_storage_service(core);
@@ -103,9 +113,7 @@ int main(int argc, char** argv)
     std::unique_ptr<grpc::Server> public_server(public_builder.BuildAndStart());
     if (!public_server) {
         std::cerr << "failed to start public server at " << config.grpc_listen_addr << "\n";
-        const auto deadline = std::chrono::system_clock::now() +
-                              std::chrono::seconds(config.shutdown_grace_seconds);
-        admin_server->Shutdown(deadline);
+        admin_server->Shutdown();
         return 1;
     }
 
@@ -113,6 +121,14 @@ int main(int argc, char** argv)
     std::cout << "OpenEvent admin gRPC listening on " << config.admin_listen_addr << "\n";
 
     std::atomic<bool> shutdown_initiated{false};
+    std::atomic<bool> shutdown_signal_received{false};
+    std::atomic<bool> stop_shutdown_threads{false};
+    const auto shutdown_servers = [&]() {
+        event_service.StopSubscriptions();
+        std::thread public_shutdown([&]() { public_server->Shutdown(); });
+        admin_server->Shutdown();
+        public_shutdown.join();
+    };
     std::thread admin_thread([&admin_server]() { admin_server->Wait(); });
     std::thread shutdown_thread([&]() {
         int signal_number = 0;
@@ -120,21 +136,55 @@ int main(int argc, char** argv)
             return;
         }
 
-        const auto deadline = std::chrono::system_clock::now() +
-                              std::chrono::seconds(config.shutdown_grace_seconds);
-        shutdown_initiated.store(true, std::memory_order_release);
-        std::cerr << "received shutdown signal " << signal_number << ", draining requests\n";
+        shutdown_signal_received.store(true, std::memory_order_release);
+        const bool fatal = fatal_storage_error.load(std::memory_order_acquire);
+        const bool first_shutdown =
+            !shutdown_initiated.exchange(true, std::memory_order_acq_rel);
+        if (fatal) {
+            if (first_shutdown) {
+                std::cerr << "stopping servers after fatal storage error and waiting for in-flight requests\n";
+            }
+        } else if (first_shutdown) {
+            std::cerr << "received shutdown signal " << signal_number
+                      << ", waiting for in-flight requests\n";
+        }
+        if (first_shutdown) {
+            shutdown_servers();
+        }
+    });
+    std::thread fatal_shutdown_thread([&]() {
+        std::unique_lock<std::mutex> lock(fatal_storage_error_mu);
+        fatal_storage_error_cv.wait(lock, [&]() {
+            return fatal_storage_error.load(std::memory_order_acquire) ||
+                   stop_shutdown_threads.load(std::memory_order_acquire);
+        });
+        if (!fatal_storage_error.load(std::memory_order_acquire)) {
+            return;
+        }
+        lock.unlock();
 
-        std::thread public_shutdown([&]() { public_server->Shutdown(deadline); });
-        admin_server->Shutdown(deadline);
-        public_shutdown.join();
+        if (shutdown_initiated.exchange(true, std::memory_order_acq_rel)) {
+            return;
+        }
+        std::cerr << "stopping servers after fatal storage error and waiting for in-flight requests\n";
+        shutdown_servers();
     });
 
     public_server->Wait();
     if (!shutdown_initiated.load(std::memory_order_acquire)) {
+        event_service.StopSubscriptions();
         admin_server->Shutdown();
+    }
+    {
+        std::lock_guard<std::mutex> lock(fatal_storage_error_mu);
+        stop_shutdown_threads.store(true, std::memory_order_release);
+    }
+    fatal_storage_error_cv.notify_all();
+    if (!shutdown_signal_received.load(std::memory_order_acquire)) {
+        ::kill(::getpid(), SIGTERM);
     }
     admin_thread.join();
     shutdown_thread.join();
+    fatal_shutdown_thread.join();
     return fatal_storage_error.load(std::memory_order_acquire) ? 1 : 0;
 }

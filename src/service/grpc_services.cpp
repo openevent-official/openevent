@@ -40,12 +40,51 @@ grpc::Status EventServiceImpl::Fetch(grpc::ServerContext*, const FetchRequest* r
     return ToGrpcStatus(core_, core_->Fetch(*request, response));
 }
 
+bool EventServiceImpl::RegisterSubscription(grpc::ServerContext* context)
+{
+    std::lock_guard<std::mutex> lock(subscriptions_mu_);
+    if (subscriptions_stopping_) {
+        return false;
+    }
+    subscriptions_.insert(context);
+    return true;
+}
+
+void EventServiceImpl::UnregisterSubscription(grpc::ServerContext* context)
+{
+    std::lock_guard<std::mutex> lock(subscriptions_mu_);
+    subscriptions_.erase(context);
+}
+
+void EventServiceImpl::StopSubscriptions()
+{
+    std::lock_guard<std::mutex> lock(subscriptions_mu_);
+    subscriptions_stopping_ = true;
+    for (grpc::ServerContext* context : subscriptions_) {
+        context->TryCancel();
+    }
+}
+
 grpc::Status EventServiceImpl::Subscribe(grpc::ServerContext* context,
                                          const SubscribeRequest* request,
                                          grpc::ServerWriter<SubscribeResponse>* writer)
 {
+    if (!RegisterSubscription(context)) {
+        return grpc::Status(grpc::StatusCode::UNAVAILABLE, "server is shutting down");
+    }
+
+    grpc::Status status = RunSubscription(context, request, writer);
+    UnregisterSubscription(context);
+    return status;
+}
+
+grpc::Status EventServiceImpl::RunSubscription(grpc::ServerContext* context,
+                                               const SubscribeRequest* request,
+                                               grpc::ServerWriter<SubscribeResponse>* writer)
+{
     uint64_t max_seq = 0;
-    Status start_status = core_->GetSubscriptionMaxSeq(request->principal(), request->token(), &max_seq);
+    Status start_status = core_->GetSubscriptionMaxSeq(
+        request->principal(), request->token(), request->channels(), &max_seq);
     if (!start_status.ok()) {
         return ToGrpcStatus(core_, start_status);
     }

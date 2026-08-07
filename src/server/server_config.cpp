@@ -35,10 +35,6 @@ Status ValidateServerConfig(const ServerConfig& config)
     if (config.max_payload_bytes == 0) {
         return Status(grpc::StatusCode::INVALID_ARGUMENT, "limits.max_payload_bytes must be greater than 0");
     }
-    if (config.shutdown_grace_seconds == 0) {
-        return Status(grpc::StatusCode::INVALID_ARGUMENT,
-                      "shutdown.grace_seconds must be greater than 0");
-    }
     return Status::Ok();
 }
 
@@ -69,7 +65,6 @@ Result<ServerConfig> LoadServerConfig(const std::string& path)
         AssignIfPresent(root["admin"], "listen_addr", &config.admin_listen_addr);
         AssignIfPresent(root["storage"], "path", &config.storage_path);
         AssignIfPresent(root["limits"], "max_payload_bytes", &config.max_payload_bytes);
-        AssignIfPresent(root["shutdown"], "grace_seconds", &config.shutdown_grace_seconds);
     } catch (const YAML::Exception& e) {
         return Status(grpc::StatusCode::INVALID_ARGUMENT, "load config file: " + std::string(e.what()));
     }
