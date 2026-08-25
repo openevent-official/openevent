@@ -21,6 +21,20 @@ grpc::Status EventServiceImpl::GetStatus(grpc::ServerContext*,
     return ToGrpcStatus(core_, core_->GetStatus(*request, response));
 }
 
+grpc::Status EventServiceImpl::AllocateUuids(grpc::ServerContext*,
+                                             const AllocateUuidsRequest* request,
+                                             AllocateUuidsResponse* response)
+{
+    return ToGrpcStatus(core_, core_->AllocateUuids(*request, response));
+}
+
+grpc::Status EventServiceImpl::GetSeqByUuid(grpc::ServerContext*,
+                                            const GetSeqByUuidRequest* request,
+                                            GetSeqByUuidResponse* response)
+{
+    return ToGrpcStatus(core_, core_->GetSeqByUuid(*request, response));
+}
+
 grpc::Status EventServiceImpl::Publish(grpc::ServerContext*,
                                        const PublishRequest* request,
                                        PublishResponse* response)

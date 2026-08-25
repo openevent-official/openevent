@@ -152,6 +152,16 @@ std::string AddToken(openevent::OpenEventCore& core, uint64_t principal)
     return response.binding().token();
 }
 
+uint64_t AllocateUuid(openevent::OpenEventCore& core)
+{
+    openevent::AllocateUuidsRequest request;
+    request.set_count(1);
+    openevent::AllocateUuidsResponse response;
+    openevent::Status status = core.AllocateUuids(request, &response);
+    Check(status.ok() && response.uuids_size() == 1, "failed to allocate message uuid");
+    return response.uuids(0);
+}
+
 uint64_t CreateChannel(openevent::OpenEventCore& core, uint64_t principal, const std::string& token,
                        openevent::Visibility visibility)
 {
@@ -171,11 +181,13 @@ uint64_t CreateChannel(openevent::OpenEventCore& core, uint64_t principal, const
 void PublishAuto(openevent::OpenEventCore& core, uint64_t principal, const std::string& token,
                  uint64_t channel_id, const std::string& payload)
 {
+    const uint64_t uuid = AllocateUuid(core);
     openevent::PublishAutoSeqRequest request;
     request.set_principal(principal);
     request.set_token(token);
     request.set_channel_id(channel_id);
     request.set_payload(payload);
+    request.set_uuid(uuid);
     openevent::PublishAutoSeqResponse response;
     openevent::Status status = core.PublishAutoSeq(request, &response);
     Check(status.ok(), status.message());
@@ -288,9 +300,141 @@ void TestCasAbort()
     publish.set_channel_id(channel_id);
     publish.set_seq(2);
     publish.set_payload("bad");
+    publish.set_uuid(AllocateUuid(*core));
     openevent::PublishResponse response;
     openevent::Status status = core->Publish(publish, &response);
     Check(!status.ok() && status.code() == grpc::StatusCode::ABORTED, "expected aborted CAS publish");
+
+    std::filesystem::remove_all(root);
+}
+
+void TestUuidAllocationAndDeduplication()
+{
+    const auto root = std::filesystem::temp_directory_path() / "openevent_core_uuid_deduplication";
+    std::filesystem::remove_all(root);
+    auto core = MakeCore(root);
+    const std::string token = AddToken(*core, 100);
+    const uint64_t channel_id = CreateChannel(*core, 100, token, openevent::VISIBILITY_PUBLIC);
+
+    openevent::AllocateUuidsRequest invalid_allocation;
+    openevent::AllocateUuidsResponse allocated;
+    openevent::Status status = core->AllocateUuids(invalid_allocation, &allocated);
+    Check(!status.ok() && status.code() == grpc::StatusCode::INVALID_ARGUMENT,
+          "zero UUID allocation count must be rejected");
+    invalid_allocation.set_count(1025);
+    status = core->AllocateUuids(invalid_allocation, &allocated);
+    Check(!status.ok() && status.code() == grpc::StatusCode::INVALID_ARGUMENT,
+          "oversized UUID allocation count must be rejected");
+
+    openevent::AllocateUuidsRequest allocation;
+    allocation.set_count(3);
+    status = core->AllocateUuids(allocation, &allocated);
+    Check(status.ok() && allocated.uuids_size() == 3 && allocated.uuids(0) == 1 &&
+              allocated.uuids(1) == 2 && allocated.uuids(2) == 3,
+          "UUID allocation must return a globally monotonic contiguous batch");
+
+    openevent::GetSeqByUuidRequest get_seq;
+    openevent::GetSeqByUuidResponse get_seq_response;
+    status = core->GetSeqByUuid(get_seq, &get_seq_response);
+    Check(!status.ok() && status.code() == grpc::StatusCode::INVALID_ARGUMENT,
+          "UUID lookup must reject zero UUID");
+    get_seq.set_uuid(allocated.uuids(0));
+    status = core->GetSeqByUuid(get_seq, &get_seq_response);
+    Check(!status.ok() && status.code() == grpc::StatusCode::NOT_FOUND,
+          "UUID lookup must not report an allocated but unused UUID");
+    get_seq.set_uuid(99);
+    status = core->GetSeqByUuid(get_seq, &get_seq_response);
+    Check(!status.ok() && status.code() == grpc::StatusCode::NOT_FOUND,
+          "UUID lookup must not report an unallocated UUID");
+
+    openevent::PublishAutoSeqRequest publish;
+    publish.set_principal(100);
+    publish.set_token(token);
+    publish.set_channel_id(channel_id);
+    publish.set_payload("first");
+    openevent::PublishAutoSeqResponse published;
+
+    status = core->PublishAutoSeq(publish, &published);
+    Check(!status.ok() && status.code() == grpc::StatusCode::INVALID_ARGUMENT,
+          "a missing UUID must be rejected");
+    publish.set_uuid(99);
+    status = core->PublishAutoSeq(publish, &published);
+    Check(!status.ok() && status.code() == grpc::StatusCode::INVALID_ARGUMENT,
+          "a UUID not allocated by the server must be rejected");
+
+    publish.set_uuid(allocated.uuids(0));
+    status = core->PublishAutoSeq(publish, &published);
+    Check(status.ok() && published.seq() == 1, status.message());
+    get_seq.set_uuid(allocated.uuids(0));
+    status = core->GetSeqByUuid(get_seq, &get_seq_response);
+    Check(status.ok() && get_seq_response.seq() == published.seq(),
+          "UUID lookup must return the committed message sequence");
+
+    publish.set_payload("different-content-is-not-compared");
+    status = core->PublishAutoSeq(publish, &published);
+    Check(!status.ok() && status.code() == grpc::StatusCode::ALREADY_EXISTS,
+          "a used UUID must reject later writes without comparing content");
+    auto max_seq = core->MaxSeq();
+    Check(max_seq.ok() && max_seq.value() == 1,
+          "a duplicate UUID must not advance the message watermark");
+
+    publish.set_uuid(allocated.uuids(1));
+    status = core->PublishAutoSeq(publish, &published);
+    Check(status.ok() && published.seq() == 2, status.message());
+    core.reset();
+    core = MakeCore(root);
+
+    get_seq.set_uuid(allocated.uuids(1));
+    status = core->GetSeqByUuid(get_seq, &get_seq_response);
+    Check(status.ok() && get_seq_response.seq() == 2,
+          "UUID lookup must survive storage reopen");
+    publish.set_uuid(allocated.uuids(1));
+    status = core->PublishAutoSeq(publish, &published);
+    Check(!status.ok() && status.code() == grpc::StatusCode::ALREADY_EXISTS,
+          "UUID consumption must survive storage reopen");
+    publish.set_uuid(allocated.uuids(2));
+    status = core->PublishAutoSeq(publish, &published);
+    Check(status.ok() && published.seq() == 3, status.message());
+
+    openevent::AllocateUuidsRequest continued_allocation;
+    continued_allocation.set_count(2);
+    openevent::AllocateUuidsResponse continued;
+    status = core->AllocateUuids(continued_allocation, &continued);
+    Check(status.ok() && continued.uuids_size() == 2 && continued.uuids(0) == 4 &&
+              continued.uuids(1) == 5,
+          "UUID allocator watermark must survive storage reopen");
+
+    publish.set_uuid(continued.uuids(0));
+    status = core->PublishAutoSeq(publish, &published);
+    Check(status.ok() && published.seq() == 4, status.message());
+
+    openevent::PublishRequest cas_publish;
+    cas_publish.set_principal(100);
+    cas_publish.set_token(token);
+    cas_publish.set_channel_id(channel_id);
+    cas_publish.set_seq(5);
+    cas_publish.set_payload("manual-cas");
+    cas_publish.set_uuid(continued.uuids(1));
+    openevent::PublishResponse cas_response;
+    status = core->Publish(cas_publish, &cas_response);
+    Check(status.ok(), status.message());
+
+    cas_publish.set_payload(std::string(1025, 'x'));
+    status = core->Publish(cas_publish, &cas_response);
+    Check(!status.ok() && status.code() == grpc::StatusCode::ALREADY_EXISTS,
+          "a manual Publish retry must check UUID before stale CAS and payload validation");
+
+    openevent::FetchRequest fetch;
+    fetch.set_principal(100);
+    fetch.set_token(token);
+    fetch.set_from_seq(1);
+    fetch.set_limit(10);
+    openevent::FetchResponse fetched;
+    status = core->Fetch(fetch, &fetched);
+    Check(status.ok() && fetched.messages_size() == 5 && fetched.messages(0).uuid() == 1 &&
+              fetched.messages(1).uuid() == 2 && fetched.messages(2).uuid() == 3 &&
+              fetched.messages(3).uuid() == 4 && fetched.messages(4).uuid() == 5,
+          "stored EventMessage values must expose their allocated UUIDs");
 
     std::filesystem::remove_all(root);
 }
@@ -477,6 +621,7 @@ void TestRecipientFilter()
     request.set_channel_id(channel_id);
     request.add_recipients(200);
     request.set_payload("direct");
+    request.set_uuid(AllocateUuid(*core));
     openevent::PublishAutoSeqResponse publish_response;
     status = core->PublishAutoSeq(request, &publish_response);
     Check(status.ok(), status.message());
@@ -510,6 +655,7 @@ void TestRecipientMustBeChannelMember()
     auto_request.set_channel_id(channel_id);
     auto_request.add_recipients(200);
     auto_request.set_payload("direct");
+    auto_request.set_uuid(AllocateUuid(*core));
     openevent::PublishAutoSeqResponse auto_response;
     openevent::Status status = core->PublishAutoSeq(auto_request, &auto_response);
     Check(!status.ok() && status.code() == grpc::StatusCode::INVALID_ARGUMENT,
@@ -522,6 +668,7 @@ void TestRecipientMustBeChannelMember()
     publish.set_seq(1);
     publish.add_recipients(200);
     publish.set_payload("direct");
+    publish.set_uuid(AllocateUuid(*core));
     openevent::PublishResponse publish_response;
     status = core->Publish(publish, &publish_response);
     Check(!status.ok() && status.code() == grpc::StatusCode::INVALID_ARGUMENT,
@@ -548,12 +695,14 @@ void TestPayloadLimit()
     auto_request.set_token(token);
     auto_request.set_channel_id(channel_id);
     auto_request.set_payload("1234");
+    auto_request.set_uuid(AllocateUuid(*core));
     openevent::PublishAutoSeqResponse auto_response;
     openevent::Status status = core->PublishAutoSeq(auto_request, &auto_response);
     Check(status.ok(), status.message());
     Check(auto_response.seq() == 1, "payload at max limit should publish");
 
     auto_request.set_payload("12345");
+    auto_request.set_uuid(AllocateUuid(*core));
     auto_response.Clear();
     status = core->PublishAutoSeq(auto_request, &auto_response);
     Check(!status.ok() && status.code() == grpc::StatusCode::RESOURCE_EXHAUSTED,
@@ -565,6 +714,7 @@ void TestPayloadLimit()
     publish.set_channel_id(channel_id);
     publish.set_seq(2);
     publish.set_payload("12345");
+    publish.set_uuid(AllocateUuid(*core));
     openevent::PublishResponse publish_response;
     status = core->Publish(publish, &publish_response);
     Check(!status.ok() && status.code() == grpc::StatusCode::RESOURCE_EXHAUSTED,
@@ -592,6 +742,7 @@ void TestGuaranteedNonCommitStatuses()
     request.set_token("invalid-token");
     request.set_channel_id(channel_id);
     request.set_payload("ok");
+    request.set_uuid(AllocateUuid(*core));
     openevent::PublishAutoSeqResponse response;
     openevent::Status status = core->PublishAutoSeq(request, &response);
     Check(!status.ok() && status.code() == grpc::StatusCode::UNAUTHENTICATED,
@@ -628,6 +779,7 @@ void TestGuaranteedNonCommitStatuses()
     cas.set_channel_id(channel_id);
     cas.set_seq(2);
     cas.set_payload("ok");
+    cas.set_uuid(AllocateUuid(*core));
     openevent::PublishResponse cas_response;
     status = core->Publish(cas, &cas_response);
     Check(!status.ok() && status.code() == grpc::StatusCode::ABORTED,
@@ -1019,6 +1171,7 @@ void TestMessageObjectReferences()
     publish.set_token(token);
     publish.set_channel_id(channel_id);
     publish.set_payload("references");
+    publish.set_uuid(AllocateUuid(*core));
     for (const auto* key : {&first, &second, &first}) {
         auto* object_key = publish.add_object_keys();
         object_key->set_object_id(key->object_id());
@@ -1068,6 +1221,7 @@ void TestMessageObjectReferences()
         object_key->set_object_id(first.object_id());
         object_key->set_object_token(first.object_token());
     }
+    publish.set_uuid(AllocateUuid(*core));
     status = core->PublishAutoSeq(publish, &publish_response);
     Check(status.ok(), "a message with exactly 1024 ObjectKeys must commit");
     const uint64_t watermark = publish_response.seq();
@@ -1075,6 +1229,7 @@ void TestMessageObjectReferences()
     auto* too_many = publish.add_object_keys();
     too_many->set_object_id(first.object_id());
     too_many->set_object_token(first.object_token());
+    publish.set_uuid(AllocateUuid(*core));
     status = core->PublishAutoSeq(publish, &publish_response);
     Check(!status.ok() && status.code() == grpc::StatusCode::INVALID_ARGUMENT,
           "a message with 1025 ObjectKeys must be rejected");
@@ -1089,6 +1244,7 @@ void TestMessageObjectReferences()
     auto* invalid_key = publish.add_object_keys();
     invalid_key->set_object_id(second.object_id());
     invalid_key->set_object_token("wrong-token");
+    publish.set_uuid(AllocateUuid(*core));
     status = core->PublishAutoSeq(publish, &publish_response);
     Check(!status.ok() && status.code() == grpc::StatusCode::NOT_FOUND,
           "one invalid ObjectKey must reject the complete message");
@@ -1103,6 +1259,7 @@ void TestMessageObjectReferences()
     invalid_key = publish.add_object_keys();
     invalid_key->set_object_id(first.object_id());
     invalid_key->set_object_token("wrong-token");
+    publish.set_uuid(AllocateUuid(*core));
     status = core->PublishAutoSeq(publish, &publish_response);
     Check(!status.ok() && status.code() == grpc::StatusCode::NOT_FOUND,
           "duplicate object IDs must validate every supplied token");
@@ -1114,6 +1271,7 @@ void TestMessageObjectReferences()
     invalid_key = publish.add_object_keys();
     invalid_key->set_object_id(0);
     invalid_key->set_object_token(first.object_token());
+    publish.set_uuid(AllocateUuid(*core));
     status = core->PublishAutoSeq(publish, &publish_response);
     Check(!status.ok() && status.code() == grpc::StatusCode::INVALID_ARGUMENT,
           "a malformed ObjectKey must be rejected before commit");
@@ -1597,6 +1755,7 @@ void TestCommittedObjectCorruptionIsFatal()
     publish.set_principal(100);
     publish.set_token(token);
     publish.set_channel_id(channel_id);
+    publish.set_uuid(AllocateUuid(*core));
     auto* object_key = publish.add_object_keys();
     object_key->set_object_id(object.object_id());
     object_key->set_object_token(object.object_token());
@@ -1696,6 +1855,7 @@ void TestUnifiedStorageReopen()
         publish.set_token(token);
         publish.set_channel_id(channel_id);
         publish.set_payload("persisted");
+        publish.set_uuid(AllocateUuid(*core));
         openevent::PublishAutoSeqResponse response;
         openevent::Status status = core->PublishAutoSeq(publish, &response);
         Check(status.ok(), status.message());
@@ -1894,6 +2054,18 @@ void TestUnifiedStorageRejectsInvalidState()
     storage = openevent::UnifiedStorage::Open(zero_next_channel_id.string());
     Check(!storage.ok(), "zero next Channel ID must be rejected");
 
+    const auto zero_next_uuid = base / "zero-next-uuid";
+    {
+        auto initialized = openevent::UnifiedStorage::Open(zero_next_uuid.string());
+        Check(initialized.ok(), initialized.status().message());
+    }
+    PutRawRecord(zero_next_uuid / "db",
+                 rocksdb::kDefaultColumnFamilyName,
+                 "meta:next_uuid",
+                 openevent::EncodeUint64(0));
+    storage = openevent::UnifiedStorage::Open(zero_next_uuid.string());
+    Check(!storage.ok(), "zero next UUID must be rejected");
+
     const auto conflicting_object_root = base / "conflicting-object-root";
     openevent::WriteObjectResponse written;
     {
@@ -2084,6 +2256,7 @@ int main()
 {
     TestPublishFetch();
     TestCasAbort();
+    TestUuidAllocationAndDeduplication();
     TestPrivateAcl();
     TestFetchChannelFilter();
     TestSharedSubscriptionSnapshotRefresh();

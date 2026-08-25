@@ -13,7 +13,7 @@ OpenEvent 通过共享 protobuf 协议定义 gRPC 服务：
 
 API 契约包括：
 
-- `EventService`：状态查询、消息发布、批量拉取和订阅。
+- `EventService`：状态查询、UUID 分配和已提交 seq 查询、消息发布、批量拉取和订阅。
 - `ObjectStorageService`：不可变对象写入、metadata 查询和部分读取。
 - `ChannelService`：Channel 创建、查询、列表和成员管理。
 - `AdminService`：token 管理和全部消息的管理查询。

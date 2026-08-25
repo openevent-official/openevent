@@ -81,6 +81,8 @@ public:
     Status Commit(rocksdb::WriteBatch* batch);
 
     Result<uint64_t> GetMaxSeq(const ReadSnapshot& snapshot) const;
+    Result<uint64_t> GetNextUuid(const ReadSnapshot& snapshot) const;
+    Result<std::optional<uint64_t>> GetUsedUuidSeq(const ReadSnapshot& snapshot, uint64_t uuid) const;
     Result<uint64_t> GetNextChannelId(const ReadSnapshot& snapshot) const;
     Result<uint64_t> GetNextObjectId(const ReadSnapshot& snapshot) const;
     Result<std::optional<uint64_t>> GetPrincipalForToken(const ReadSnapshot& snapshot,
@@ -104,6 +106,8 @@ public:
         const std::vector<uint64_t>& object_ids) const;
 
     Status SetMaxSeq(rocksdb::WriteBatch* batch, uint64_t seq) const;
+    Status SetNextUuid(rocksdb::WriteBatch* batch, uint64_t uuid) const;
+    Status PutUsedUuid(rocksdb::WriteBatch* batch, uint64_t uuid, uint64_t seq) const;
     Status SetNextChannelId(rocksdb::WriteBatch* batch, uint64_t channel_id) const;
     Status SetNextObjectId(rocksdb::WriteBatch* batch, uint64_t object_id) const;
     Status PutMessage(rocksdb::WriteBatch* batch, const EventMessage& message) const;

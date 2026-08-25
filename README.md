@@ -34,6 +34,7 @@ the same OpenEvent event queue.
 ## Features
 
 - Globally ordered messages based on `seq`.
+- Server-allocated monotonic UUIDs for message deduplication and committed-sequence lookup.
 - Supports both client-assigned `seq` publishing and server-assigned `seq`.
 - Channels support `public`, `protected`, and `private` visibility.
 - Supports batch fetch and server-streaming subscription.

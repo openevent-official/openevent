@@ -28,6 +28,7 @@ OpenEvent 是面向 AI Agent 系统的基础设施，核心组件是一条有序
 ## 特性
 
 - 基于 `seq` 的全局有序消息。
+- 服务端分配单调递增 UUID，用于消息去重和已提交 seq 查询。
 - 支持客户端指定 `seq` 发布，也支持服务端自动分配 `seq`。
 - Channel 支持 public、protected、private 三种可见性。
 - 支持批量拉取和服务端流式订阅。

@@ -13,7 +13,8 @@ OpenEvent exposes gRPC services through the shared protobuf schema:
 
 The API contract covers:
 
-- `EventService`: status query, message publishing, batch fetch, and subscription.
+- `EventService`: status query, UUID allocation and committed-sequence lookup, message publishing, batch fetch, and
+  subscription.
 - `ObjectStorageService`: immutable object writes, metadata queries, and partial reads.
 - `ChannelService`: channel creation, query, listing, and member management.
 - `AdminService`: token management and administrative message queries.

@@ -19,6 +19,7 @@ namespace openevent {
 namespace {
 
 constexpr size_t kResponseEnvelopeBytes = 1024 * 1024;
+constexpr uint32_t kMaxUuidBatch = 1024;
 
 uint64_t NowMs()
 {
@@ -348,10 +349,102 @@ Status OpenEventCore::GetStatus(const GetStatusRequest& request, GetStatusRespon
     return Status::Ok();
 }
 
+Status OpenEventCore::AllocateUuids(const AllocateUuidsRequest& request,
+                                    AllocateUuidsResponse* response)
+{
+    Status available = EnsureAvailable();
+    if (!available.ok()) {
+        return available;
+    }
+    if (request.count() == 0 || request.count() > kMaxUuidBatch) {
+        return Status(grpc::StatusCode::INVALID_ARGUMENT,
+                      "uuid allocation count must be in the range 1..1024");
+    }
+
+    std::lock_guard<std::mutex> lock(coordinator_mu_);
+    auto snapshot_result = storage_->CreateSnapshot();
+    if (!snapshot_result.ok()) {
+        return snapshot_result.status();
+    }
+    ReadSnapshot snapshot = std::move(snapshot_result.value());
+    auto next_uuid = storage_->GetNextUuid(snapshot);
+    if (!next_uuid.ok()) {
+        return next_uuid.status();
+    }
+    const uint64_t first_uuid = next_uuid.value();
+    const uint64_t count = request.count();
+    const uint64_t next_value = first_uuid + count;
+
+    rocksdb::WriteBatch batch;
+    Status status = storage_->SetNextUuid(&batch, next_value);
+    if (!status.ok()) {
+        return status;
+    }
+    status = CommitBatch(&batch);
+    if (!status.ok()) {
+        return status;
+    }
+    response->clear_uuids();
+    for (uint64_t offset = 0; offset < count; ++offset) {
+        response->add_uuids(first_uuid + offset);
+    }
+    return Status::Ok();
+}
+
+Status OpenEventCore::GetSeqByUuid(const GetSeqByUuidRequest& request,
+                                   GetSeqByUuidResponse* response)
+{
+    Status available = EnsureAvailable();
+    if (!available.ok()) {
+        return available;
+    }
+    if (request.uuid() == 0) {
+        return Status(grpc::StatusCode::INVALID_ARGUMENT, "uuid must be nonzero");
+    }
+
+    auto snapshot_result = CreateLinearizedSnapshot();
+    if (!snapshot_result.ok()) {
+        return snapshot_result.status();
+    }
+    ReadSnapshot snapshot = std::move(snapshot_result.value());
+    auto seq = storage_->GetUsedUuidSeq(snapshot, request.uuid());
+    if (!seq.ok()) {
+        return seq.status();
+    }
+    if (!seq.value().has_value()) {
+        return Status(grpc::StatusCode::NOT_FOUND, "uuid has not been consumed by a committed message");
+    }
+    response->set_seq(seq.value().value());
+    return Status::Ok();
+}
+
+Status OpenEventCore::ValidateAvailableUuid(const ReadSnapshot& snapshot, uint64_t uuid) const
+{
+    if (uuid == 0) {
+        return Status(grpc::StatusCode::INVALID_ARGUMENT, "uuid must be allocated by the server");
+    }
+    auto next_uuid = storage_->GetNextUuid(snapshot);
+    if (!next_uuid.ok()) {
+        return next_uuid.status();
+    }
+    if (uuid >= next_uuid.value()) {
+        return Status(grpc::StatusCode::INVALID_ARGUMENT, "uuid was not allocated by the server");
+    }
+    auto uuid_seq = storage_->GetUsedUuidSeq(snapshot, uuid);
+    if (!uuid_seq.ok()) {
+        return uuid_seq.status();
+    }
+    if (uuid_seq.value().has_value()) {
+        return Status(grpc::StatusCode::ALREADY_EXISTS, "uuid has already been used");
+    }
+    return Status::Ok();
+}
+
 Status OpenEventCore::BuildPublishBatch(const ReadSnapshot& snapshot,
                                         uint64_t principal,
                                         uint64_t channel_id,
                                         uint64_t seq,
+                                        uint64_t uuid,
                                         const google::protobuf::RepeatedField<uint64_t>& recipients,
                                         const std::string& payload,
                                         const google::protobuf::RepeatedPtrField<ObjectKey>& object_keys,
@@ -411,11 +504,16 @@ Status OpenEventCore::BuildPublishBatch(const ReadSnapshot& snapshot,
     }
     message.set_payload(payload);
     message.set_ts_ms(ts_ms);
+    message.set_uuid(uuid);
     for (const auto& object_key : object_keys) {
         *message.add_object_keys() = object_key;
     }
 
     Status status = storage_->PutMessage(batch, message);
+    if (!status.ok()) {
+        return status;
+    }
+    status = storage_->PutUsedUuid(batch, uuid, seq);
     if (!status.ok()) {
         return status;
     }
@@ -441,14 +539,6 @@ Status OpenEventCore::Publish(const PublishRequest& request, PublishResponse*)
         return available;
     }
     const uint64_t ts_ms = NowMs();
-    Status payload_status = ValidatePayloadSize(request.payload());
-    if (!payload_status.ok()) {
-        return payload_status;
-    }
-    Status object_keys_status = ValidateObjectKeysShape(request.object_keys());
-    if (!object_keys_status.ok()) {
-        return object_keys_status;
-    }
 
     std::lock_guard<std::mutex> lock(coordinator_mu_);
     auto snapshot_result = storage_->CreateSnapshot();
@@ -460,6 +550,18 @@ Status OpenEventCore::Publish(const PublishRequest& request, PublishResponse*)
     if (!auth.ok()) {
         return auth;
     }
+    Status uuid_status = ValidateAvailableUuid(snapshot, request.uuid());
+    if (!uuid_status.ok()) {
+        return uuid_status;
+    }
+    Status payload_status = ValidatePayloadSize(request.payload());
+    if (!payload_status.ok()) {
+        return payload_status;
+    }
+    Status object_keys_status = ValidateObjectKeysShape(request.object_keys());
+    if (!object_keys_status.ok()) {
+        return object_keys_status;
+    }
     auto max_seq = storage_->GetMaxSeq(snapshot);
     if (!max_seq.ok()) {
         return max_seq.status();
@@ -467,12 +569,12 @@ Status OpenEventCore::Publish(const PublishRequest& request, PublishResponse*)
     if (request.seq() != max_seq.value() + 1) {
         return Status(grpc::StatusCode::ABORTED, "seq must equal max_seq + 1");
     }
-
     rocksdb::WriteBatch batch;
     Status status = BuildPublishBatch(snapshot,
                                       request.principal(),
                                       request.channel_id(),
                                       request.seq(),
+                                      request.uuid(),
                                       request.recipients(),
                                       request.payload(),
                                       request.object_keys(),
@@ -491,14 +593,6 @@ Status OpenEventCore::PublishAutoSeq(const PublishAutoSeqRequest& request, Publi
         return available;
     }
     const uint64_t ts_ms = NowMs();
-    Status payload_status = ValidatePayloadSize(request.payload());
-    if (!payload_status.ok()) {
-        return payload_status;
-    }
-    Status object_keys_status = ValidateObjectKeysShape(request.object_keys());
-    if (!object_keys_status.ok()) {
-        return object_keys_status;
-    }
 
     std::lock_guard<std::mutex> lock(coordinator_mu_);
     auto snapshot_result = storage_->CreateSnapshot();
@@ -509,6 +603,18 @@ Status OpenEventCore::PublishAutoSeq(const PublishAutoSeqRequest& request, Publi
     Status auth = Authenticate(snapshot, request.principal(), request.token());
     if (!auth.ok()) {
         return auth;
+    }
+    Status uuid_status = ValidateAvailableUuid(snapshot, request.uuid());
+    if (!uuid_status.ok()) {
+        return uuid_status;
+    }
+    Status payload_status = ValidatePayloadSize(request.payload());
+    if (!payload_status.ok()) {
+        return payload_status;
+    }
+    Status object_keys_status = ValidateObjectKeysShape(request.object_keys());
+    if (!object_keys_status.ok()) {
+        return object_keys_status;
     }
     auto max_seq = storage_->GetMaxSeq(snapshot);
     if (!max_seq.ok()) {
@@ -521,6 +627,7 @@ Status OpenEventCore::PublishAutoSeq(const PublishAutoSeqRequest& request, Publi
                                       request.principal(),
                                       request.channel_id(),
                                       seq,
+                                      request.uuid(),
                                       request.recipients(),
                                       request.payload(),
                                       request.object_keys(),

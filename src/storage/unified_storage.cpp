@@ -19,18 +19,20 @@
 namespace openevent {
 namespace {
 
-constexpr uint64_t kSchemaVersion = 3;
+constexpr uint64_t kSchemaVersion = 4;
 constexpr uint64_t kInitializing = 1;
 constexpr const char* kMessagesColumnFamily = "messages";
 constexpr const char* kObjectsColumnFamily = "objects";
 constexpr const char* kSchemaVersionKey = "meta:schema_version";
 constexpr const char* kInitStateKey = "meta:init_state";
 constexpr const char* kMaxSeqKey = "meta:max_seq";
+constexpr const char* kNextUuidKey = "meta:next_uuid";
 constexpr const char* kNextChannelIdKey = "meta:next_channel_id";
 constexpr const char* kNextObjectIdKey = "meta:next_object_id";
 constexpr const char* kChannelPrefix = "ch/";
 constexpr const char* kTokenPrefix = "token:";
 constexpr const char* kMessagePrefix = "msg/";
+constexpr const char* kUuidPrefix = "uuid/";
 constexpr const char* kPreparingObjectPrefix = "preparing/";
 constexpr const char* kCommittedObjectPrefix = "object/";
 
@@ -430,6 +432,7 @@ Status UnifiedStorage::InitializeNew(const std::string& path)
     rocksdb::WriteBatch batch;
     batch.Put(kSchemaVersionKey, EncodeUint64(kSchemaVersion));
     batch.Put(kMaxSeqKey, EncodeUint64(uint64_t{0}));
+    batch.Put(kNextUuidKey, EncodeUint64(uint64_t{1}));
     batch.Put(kNextChannelIdKey, EncodeUint64(uint64_t{1}));
     batch.Put(kNextObjectIdKey, EncodeUint64(uint64_t{1}));
     batch.Delete(kInitStateKey);
@@ -540,6 +543,34 @@ Result<uint64_t> UnifiedStorage::GetRequiredUint64(const ReadSnapshot& snapshot,
 Result<uint64_t> UnifiedStorage::GetMaxSeq(const ReadSnapshot& snapshot) const
 {
     return GetRequiredUint64(snapshot, kMaxSeqKey);
+}
+
+Result<uint64_t> UnifiedStorage::GetNextUuid(const ReadSnapshot& snapshot) const
+{
+    return GetRequiredUint64(snapshot, kNextUuidKey);
+}
+
+Result<std::optional<uint64_t>> UnifiedStorage::GetUsedUuidSeq(const ReadSnapshot& snapshot,
+                                                               uint64_t uuid) const
+{
+    if (uuid == 0) {
+        return Status(grpc::StatusCode::INVALID_ARGUMENT, "uuid must be nonzero");
+    }
+    rocksdb::ReadOptions options;
+    options.snapshot = snapshot.snapshot_;
+    std::string value;
+    rocksdb::Status status = db_->Get(options, meta_, NumericKey(kUuidPrefix, uuid), &value);
+    if (status.IsNotFound()) {
+        return std::optional<uint64_t>{};
+    }
+    if (!status.ok()) {
+        return RocksToStatus(status, "read used uuid");
+    }
+    auto seq = DecodeRequiredUint64(value, "used uuid");
+    if (!seq.ok()) {
+        return seq.status();
+    }
+    return std::optional<uint64_t>{seq.value()};
 }
 
 Result<uint64_t> UnifiedStorage::GetNextChannelId(const ReadSnapshot& snapshot) const
@@ -800,6 +831,24 @@ Status UnifiedStorage::SetMaxSeq(rocksdb::WriteBatch* batch, uint64_t seq) const
     return Status::Ok();
 }
 
+Status UnifiedStorage::SetNextUuid(rocksdb::WriteBatch* batch, uint64_t uuid) const
+{
+    if (uuid == 0) {
+        return Status(grpc::StatusCode::INVALID_ARGUMENT, "next uuid must be nonzero");
+    }
+    batch->Put(meta_, kNextUuidKey, EncodeUint64(uuid));
+    return Status::Ok();
+}
+
+Status UnifiedStorage::PutUsedUuid(rocksdb::WriteBatch* batch, uint64_t uuid, uint64_t seq) const
+{
+    if (uuid == 0 || seq == 0) {
+        return Status(grpc::StatusCode::INVALID_ARGUMENT, "used uuid and seq must be nonzero");
+    }
+    batch->Put(meta_, NumericKey(kUuidPrefix, uuid), EncodeUint64(seq));
+    return Status::Ok();
+}
+
 Status UnifiedStorage::SetNextChannelId(rocksdb::WriteBatch* batch, uint64_t channel_id) const
 {
     batch->Put(meta_, kNextChannelIdKey, EncodeUint64(channel_id));
@@ -980,6 +1029,12 @@ Status UnifiedStorage::Validate() const
     auto max_seq = GetMaxSeq(snapshot);
     if (!max_seq.ok()) {
         return max_seq.status();
+    }
+    auto next_uuid = GetNextUuid(snapshot);
+    if (!next_uuid.ok() || next_uuid.value() == 0) {
+        return next_uuid.ok()
+                   ? Status(grpc::StatusCode::DATA_LOSS, "invalid next uuid")
+                   : next_uuid.status();
     }
     auto next_channel_id = GetNextChannelId(snapshot);
     if (!next_channel_id.ok() || next_channel_id.value() == 0) {

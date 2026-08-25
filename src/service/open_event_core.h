@@ -31,6 +31,8 @@ public:
     ~OpenEventCore();
 
     Status GetStatus(const GetStatusRequest& request, GetStatusResponse* response);
+    Status AllocateUuids(const AllocateUuidsRequest& request, AllocateUuidsResponse* response);
+    Status GetSeqByUuid(const GetSeqByUuidRequest& request, GetSeqByUuidResponse* response);
     Status Publish(const PublishRequest& request, PublishResponse* response);
     Status PublishAutoSeq(const PublishAutoSeqRequest& request, PublishAutoSeqResponse* response);
     Status Fetch(const FetchRequest& request, FetchResponse* response);
@@ -81,10 +83,12 @@ private:
     Result<SubscriptionSnapshot> AcquireSubscriptionSnapshot() const;
     void RefreshSubscriptionSnapshots();
     Status Authenticate(const ReadSnapshot& snapshot, uint64_t principal, const std::string& token) const;
+    Status ValidateAvailableUuid(const ReadSnapshot& snapshot, uint64_t uuid) const;
     Status BuildPublishBatch(const ReadSnapshot& snapshot,
                              uint64_t principal,
                              uint64_t channel_id,
                              uint64_t seq,
+                             uint64_t uuid,
                              const google::protobuf::RepeatedField<uint64_t>& recipients,
                              const std::string& payload,
                              const google::protobuf::RepeatedPtrField<ObjectKey>& object_keys,

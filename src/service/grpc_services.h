@@ -19,6 +19,12 @@ public:
     grpc::Status GetStatus(grpc::ServerContext* context,
                            const GetStatusRequest* request,
                            GetStatusResponse* response) override;
+    grpc::Status AllocateUuids(grpc::ServerContext* context,
+                               const AllocateUuidsRequest* request,
+                               AllocateUuidsResponse* response) override;
+    grpc::Status GetSeqByUuid(grpc::ServerContext* context,
+                              const GetSeqByUuidRequest* request,
+                              GetSeqByUuidResponse* response) override;
     grpc::Status Publish(grpc::ServerContext* context,
                          const PublishRequest* request,
                          PublishResponse* response) override;
