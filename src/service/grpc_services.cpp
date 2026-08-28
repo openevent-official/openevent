@@ -103,6 +103,9 @@ grpc::Status EventServiceImpl::RunSubscription(grpc::ServerContext* context,
         return ToGrpcStatus(core_, start_status);
     }
 
+    // A valid idle or fully filtered subscription still needs a connection-ready signal.
+    writer->SendInitialMetadata();
+
     uint64_t next_seq = request->from_seq();
     if (next_seq == 0) {
         next_seq = max_seq + 1;
