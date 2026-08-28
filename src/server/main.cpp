@@ -21,6 +21,20 @@
 
 namespace {
 
+constexpr int kSubscribeKeepaliveTimeMs = 30 * 1000;
+constexpr int kSubscribeKeepaliveTimeoutMs = 10 * 1000;
+constexpr int kMinimumClientPingIntervalMs = 20 * 1000;
+
+void ConfigurePublicServerKeepalive(grpc::ServerBuilder* builder)
+{
+    builder->AddChannelArgument("grpc.keepalive_time_ms", kSubscribeKeepaliveTimeMs);
+    builder->AddChannelArgument("grpc.keepalive_timeout_ms", kSubscribeKeepaliveTimeoutMs);
+    builder->AddChannelArgument("grpc.http2.min_ping_interval_without_data_ms",
+                                kMinimumClientPingIntervalMs);
+    builder->AddChannelArgument("grpc.http2.max_pings_without_data", 0);
+    builder->AddChannelArgument("grpc.http2.max_ping_strikes", 2);
+}
+
 void PrintUsage(const char* program)
 {
     std::cerr << "usage: " << program << " <config.yaml>\n";
@@ -106,6 +120,7 @@ int main(int argc, char** argv)
     grpc::ServerBuilder public_builder;
     public_builder.SetMaxReceiveMessageSize(grpc_message_limit);
     public_builder.SetMaxSendMessageSize(grpc_message_limit);
+    ConfigurePublicServerKeepalive(&public_builder);
     public_builder.AddListeningPort(config.grpc_listen_addr, grpc::InsecureServerCredentials());
     public_builder.RegisterService(&event_service);
     public_builder.RegisterService(&object_storage_service);
