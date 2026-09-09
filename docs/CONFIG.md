@@ -42,47 +42,54 @@ limits:
 ### `storage`
 
 - `path`: string, no default, must be explicitly configured.
-- The OpenEvent data root. It has a fixed layout: `path/db` contains one RocksDB
-  instance with `default` (metadata), `messages`, and `objects` Column Families;
-  `path/objects` contains one immutable file per committed object, named by its
-  decimal object ID.
+- The OpenEvent data root managed by the server for messages, Channels, tokens,
+  and object data.
 - Must not be empty. A first deployment uses a missing or empty new directory;
-  the server initializes a missing directory, and the runtime user must have
-  write permission to its parent. Later starts accept only the complete target
-  schema. If initialization was interrupted or the nonempty directory has any
-  incomplete layout, the server rejects startup instead of repairing it.
-- Object data is limited to 4 MiB per object and is not stored in RocksDB. Objects
-  are never updated, deleted, or garbage-collected by the current server, so each
-  object permanently consumes data space and one inode.
+  the server initializes a missing directory, writes the permanent `system.v1`
+  message at seq 0, and the runtime user must have write permission to its
+  parent. Later starts accept only a complete target data directory; unfinished
+  initialization or an incomplete directory is rejected rather than repaired.
+  A directory whose initialization is complete undergoes normal startup checks.
+- Messages and objects are stored permanently under the
+  [API retention policy](https://github.com/openevent-official/openevent-sdk/blob/main/docs/API.md#1-basic-conventions).
+  Capacity planning, alert thresholds, and operational shutdown procedures are
+  deployment choices; the server does not provide these management functions.
 
 ### `limits`
 
 - `max_payload_bytes`: unsigned integer, default `16777216` (16 MiB).
-- Maximum size of a single message `payload`.
+- Limits only the payload bytes of new `Publish` and `PublishAutoSeq` writes; it
+  does not limit reads of committed messages.
 - `Publish` and `PublishAutoSeq` return `RESOURCE_EXHAUSTED` when the payload
   exceeds this limit.
-- Both gRPC servers derive their send/receive hard limit from
-  `max(max_payload_bytes, 4 MiB) + 2 MiB`, capped at the largest value accepted by gRPC.
-  Fetch and administrative message pages use a separate soft response budget of
-  `max_payload_bytes + 1 MiB`.
-- Must be greater than 0.
+- Must be greater than 0 and no greater than `62914560` bytes (60 MiB). If the
+  configured value exceeds this limit, configuration validation fails and the
+  server exits before opening either listen port.
+
+## Transport and Page Budgets
+
+- Both gRPC servers use a fixed per-message send/receive hard limit of
+  `67108864` bytes (64 MiB), independent of `max_payload_bytes`.
+- Fetch and ListMessages use a fixed soft response budget of `17825792` bytes
+  (17 MiB) per page, independent of the write limit. A single message larger than
+  the soft budget can still be returned on its own; the budget determines page
+  boundaries and does not reject historical messages.
+- After lowering `max_payload_bytes`, historical messages remain readable under
+  the [Payload API](https://github.com/openevent-official/openevent-sdk/blob/main/docs/API.md#23-payload).
+  Custom clients and proxies must allow these responses through their transport
+  limits, which must not be reduced to match the current write limit.
 
 ## Shutdown Behavior
 
-On `SIGINT`, `SIGTERM`, or a fatal storage error, both gRPC servers stop accepting
-new calls. The server first rejects new Subscribe calls and actively cancels every
-established Subscribe stream, then uses `Shutdown()` without a deadline. Ordinary
-in-flight handlers are not actively cancelled; the process waits for them to finish
-before closing Core and RocksDB, with no shutdown timeout. A fatal storage error
-still causes the final process exit status to be non-zero. The internal architecture
-document is the authoritative source for the complete lifecycle rules.
+On `SIGINT`, `SIGTERM`, or a fatal storage error, the server stops accepting new
+calls and actively ends established Subscribe streams. Ordinary in-flight calls
+complete or return an error according to the API contract. A fatal storage error
+still causes a non-zero final process exit status.
 
 ## Security Notes
 
-- `AdminService` requests do not carry business `principal/token`.
-- The admin port should only listen on localhost or a trusted management
-  network.
-- Do not expose the admin port directly to the public internet.
+Admin port isolation, transport protection, and credential handling requirements
+are defined in the [security policy](../SECURITY.md#deployment-security-notes).
 
 ## Deployment Notes
 
@@ -94,27 +101,16 @@ document is the authoritative source for the complete lifecycle rules.
 - Use a local Linux filesystem that supports durable file `fsync`, directory
   `fsync`, and non-overwriting atomic `renameat2(RENAME_NOREPLACE)`. NFS and
   filesystems without those semantics are unsupported.
-- Monitor both free bytes and free inodes under `storage.path`. The server has no
-  object deletion or background garbage collection.
-- Back up `db/` and `objects/` as one consistent unit using a stopped service or a
-  filesystem/storage snapshot with equivalent consistency. Copying either child
-  independently can produce committed metadata without matching object data.
-- Startup does not scan historical messages or compare the message watermark
-  with stored message records. It only scans known incomplete object writes,
-  not committed object metadata, files, or the complete object directory.
-  Missing committed object data, a non-regular file, or a metadata/file size
-  mismatch is detected when ReadObject accesses it, returns `DATA_LOSS`, and
-  causes a nonzero server exit. Same-size content changes are not detected.
-- Any RocksDB operation failure encountered while serving requests causes a
-  nonzero server exit. RocksDB corruption returns `DATA_LOSS`; other RocksDB
-  errors return `UNAVAILABLE`. A normal lookup of a missing token, Channel, or
-  object is not a RocksDB failure. Any RocksDB failure during startup prevents
-  startup.
-- Stored bytes that violate the internal record format are treated as corruption.
-  A request that encounters such data returns `DATA_LOSS` and causes a nonzero
-  server exit. A message whose Channel is absent returns `INTERNAL` and does not
-  cause a server exit. Startup still performs no full historical message or
-  committed object scan.
+- Back up and restore only while the server is stopped. Wait for the server
+  process to exit completely and keep it stopped throughout the operation.
+  Back up and restore the entire storage directory as one unit. Online backups
+  and partial directory copies are unsupported.
+
+## Documentation Boundary
+
+- Public RPC error codes and observable behavior are defined in the [API contract](https://github.com/openevent-official/openevent-sdk/blob/main/docs/API.md).
+- Internal directory layout, recovery checks, and storage-corruption handling are
+  server design details and are not expanded in this configuration document.
 
 ## Validation Errors
 
@@ -126,3 +122,4 @@ document is the authoritative source for the complete lifecycle rules.
 - `grpc.listen_addr and admin.listen_addr must be different`
 - `storage.path must not be empty`
 - `limits.max_payload_bytes must be greater than 0`
+- `limits.max_payload_bytes must not exceed 62914560 (60 MiB)`

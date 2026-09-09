@@ -34,6 +34,8 @@ the same OpenEvent event queue.
 ## Features
 
 - Globally ordered messages based on `seq`.
+- A permanent `system.v1` initialization message at `seq=0`; application
+  messages start at `seq=1`.
 - Server-allocated monotonic UUIDs for message deduplication and committed-sequence lookup.
 - Supports both client-assigned `seq` publishing and server-assigned `seq`.
 - Channels support `public`, `protected`, and `private` visibility.
@@ -47,6 +49,7 @@ the same OpenEvent event queue.
 
 ```text
 openevent/
+├── Makefile
 ├── CMakeLists.txt
 ├── openevent-server.yaml
 ├── docs/
@@ -83,20 +86,34 @@ git submodule update --init --recursive
 Configure a build directory:
 
 ```bash
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug
+make configure
 ```
 
 Build:
 
 ```bash
-cmake --build build -j2
+make build
 ```
 
 Run tests:
 
 ```bash
-ctest --test-dir build --output-on-failure
+make test
 ```
+
+`make test` includes core and storage fault-injection tests. Run server startup,
+restart, and shutdown regression tests with:
+
+```bash
+make test-runtime
+```
+
+This target requires `openevent-sdk>=0.8.0`, `pytest`, and `packaging` already installed
+in the current Python environment; it does not install the SDK. Select Python with
+`PYTHON`, and set build options with `BUILD_TYPE`, `JOBS`, and `CMAKE_ARGS`.
+Test data and logs stay under `build/`.
+After editing documentation, run `make check-docs` to check translation heading
+structure, current release references, and local links.
 
 The server binary is generated at:
 
@@ -132,8 +149,7 @@ To change the executable subdirectory, pass `CMAKE_INSTALL_BINDIR` during
 configuration:
 
 ```bash
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_BINDIR=sbin
-cmake --build build -j2
+make build BUILD_TYPE=Release CMAKE_ARGS="-DCMAKE_INSTALL_BINDIR=sbin"
 cmake --install build --prefix /opt/openevent
 ```
 
@@ -196,6 +212,7 @@ repository for SDK build, installation, and test instructions.
 - [Python SDK](https://github.com/openevent-official/openevent-sdk/blob/main/README.md)
 - [Python SDK usage](https://github.com/openevent-official/openevent-sdk/blob/main/docs/USAGE.md)
 - [SDK API contract](https://github.com/openevent-official/openevent-sdk/blob/main/docs/API.md)
+- [System message protocol](https://github.com/openevent-official/openevent-sdk/blob/main/docs/SYSTEM_PROTOCOL.md)
 
 The documentation is written for GitHub's native Markdown renderer. No
 documentation build step is required.
@@ -209,7 +226,7 @@ documentation build step is required.
 
 ## Project Status
 
-OpenEvent is still in an early stage. Public API behavior is defined by the
+The server and SDK are at version `0.8.0`. Deploy with a new data directory; old data directories and protocols are unsupported. Public API behavior is defined by the
 [SDK API contract](https://github.com/openevent-official/openevent-sdk/blob/main/docs/API.md);
 clients should rely on the documented gRPC contract, not server implementation
 details.

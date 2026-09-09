@@ -25,8 +25,8 @@ Please include:
 
 - Do not expose `AdminService` directly to the public internet.
 - Bind the admin port to localhost or a trusted management network.
-- Protect principal tokens, object tokens, and admin page tokens in logs, shell
-  history, CI output, traces, and issue reports.
+- Protect principal tokens and object tokens in logs, shell history, CI output,
+  traces, and issue reports.
 - An ObjectKey is a permanent transferable bearer credential. Anyone holding its
   object ID and token can read the object without principal authentication. There
   is currently no revocation, rotation, or deletion operation.

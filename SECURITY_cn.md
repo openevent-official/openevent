@@ -22,7 +22,7 @@
 
 - 不要把 `AdminService` 直接暴露到公网。
 - 管理端口应绑定到本机或可信管理网络。
-- 避免在日志、shell 历史、CI 输出、trace 和 issue 中泄露 principal token、对象 token 和管理分页 token。
+- 避免在日志、shell 历史、CI 输出、trace 和 issue 中泄露 principal token 和对象 token。
 - ObjectKey 是永久、可转交的 bearer credential。任何持有 object ID 和 token 的调用方都能在没有
   principal 认证的情况下读取对象；当前没有撤销、轮换或删除操作。
 - 把 ObjectKey 附加到消息会向所有有权读取该消息的调用方以及 AdminService ListMessages 披露它；

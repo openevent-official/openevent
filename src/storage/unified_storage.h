@@ -38,16 +38,6 @@ private:
     const rocksdb::Snapshot* snapshot_ = nullptr;
 };
 
-struct TokenBindingRecord {
-    std::string token;
-    uint64_t principal = 0;
-};
-
-struct TokenBindingPage {
-    std::vector<TokenBindingRecord> bindings;
-    bool has_more = false;
-};
-
 struct StoredObject {
     uint64_t object_id = 0;
     std::string object_token;
@@ -89,9 +79,6 @@ public:
                                                          const std::string& token) const;
     Result<std::optional<ChannelInfo>> GetChannel(const ReadSnapshot& snapshot, uint64_t channel_id) const;
     Result<std::vector<ChannelInfo>> ListChannels(const ReadSnapshot& snapshot) const;
-    Result<TokenBindingPage> ListTokens(const ReadSnapshot& snapshot,
-                                        const std::string& start_after,
-                                        uint32_t limit) const;
     Result<uint64_t> ScanMessages(const ReadSnapshot& snapshot,
                                   uint64_t from_seq,
                                   uint64_t last_seq,
@@ -134,7 +121,7 @@ private:
                    std::unique_ptr<ObjectFileStore> object_files,
                    StorageFaultInjector fault_injector);
 
-    static Status InitializeNew(const std::string& root_path);
+    static Status InitializeNew(const std::string& root_path, const StorageFaultInjector& fault_injector);
     static Result<std::unique_ptr<UnifiedStorage>> OpenExisting(
         const std::string& root_path,
         StorageFaultInjector fault_injector);

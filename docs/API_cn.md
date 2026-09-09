@@ -10,6 +10,8 @@ OpenEvent 通过共享 protobuf 协议定义 gRPC 服务：
   [`openevent-sdk/proto/admin.proto`](https://github.com/openevent-official/openevent-sdk/blob/main/proto/admin.proto)
 - API 行为和错误语义：
   [`openevent-sdk/docs/API_cn.md`](https://github.com/openevent-official/openevent-sdk/blob/main/docs/API_cn.md)
+- 系统 Channel 初始化消息协议：
+  [`openevent-sdk/docs/SYSTEM_PROTOCOL_cn.md`](https://github.com/openevent-official/openevent-sdk/blob/main/docs/SYSTEM_PROTOCOL_cn.md)
 
 API 契约包括：
 

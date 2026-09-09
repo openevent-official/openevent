@@ -107,7 +107,8 @@ void CreatePartialStorage(const std::filesystem::path& path,
 void PutRawRecord(const std::filesystem::path& path,
                   const std::string& column_family,
                   const std::string& key,
-                  const std::string& value)
+                  const std::string& value,
+                  bool erase = false)
 {
     rocksdb::Options list_options;
     std::vector<std::string> names;
@@ -127,7 +128,8 @@ void PutRawRecord(const std::filesystem::path& path,
     auto name_it = std::find(names.begin(), names.end(), column_family);
     Check(name_it != names.end(), "column family not found: " + column_family);
     const size_t index = static_cast<size_t>(std::distance(names.begin(), name_it));
-    status = db->Put(SyncWriteOptions(), handles[index], key, value);
+    status = erase ? db->Delete(SyncWriteOptions(), handles[index], key)
+                   : db->Put(SyncWriteOptions(), handles[index], key, value);
     Check(status.ok(), status.ToString());
 
     for (auto* handle : handles) {
@@ -336,8 +338,8 @@ void TestUuidAllocationAndDeduplication()
     openevent::GetSeqByUuidRequest get_seq;
     openevent::GetSeqByUuidResponse get_seq_response;
     status = core->GetSeqByUuid(get_seq, &get_seq_response);
-    Check(!status.ok() && status.code() == grpc::StatusCode::INVALID_ARGUMENT,
-          "UUID lookup must reject zero UUID");
+    Check(status.ok() && get_seq_response.seq() == 0,
+          "UUID zero must resolve to the system initialization message");
     get_seq.set_uuid(allocated.uuids(0));
     status = core->GetSeqByUuid(get_seq, &get_seq_response);
     Check(!status.ok() && status.code() == grpc::StatusCode::NOT_FOUND,
@@ -792,60 +794,6 @@ void TestGuaranteedNonCommitStatuses()
     std::filesystem::remove_all(root);
 }
 
-void TestListTokensPagination()
-{
-    const auto root = std::filesystem::temp_directory_path() / "openevent_core_list_tokens_pagination";
-    std::filesystem::remove_all(root);
-    auto core = MakeCore(root);
-
-    std::vector<std::string> expected{
-        AddToken(*core, 100),
-        AddToken(*core, 200),
-        AddToken(*core, 300),
-    };
-    std::sort(expected.begin(), expected.end());
-
-    std::vector<std::string> actual;
-    std::set<std::string> cursors;
-    std::string page_token;
-    for (;;) {
-        openevent::ListTokensRequest request;
-        request.set_page_token(page_token);
-        request.set_limit(1);
-        openevent::ListTokensResponse response;
-        openevent::Status status = core->ListTokens(request, &response);
-        Check(status.ok(), status.message());
-        Check(response.bindings_size() == 1, "each token page should contain one binding");
-        actual.push_back(response.bindings(0).token());
-
-        page_token = response.next_page_token();
-        if (page_token.empty()) {
-            break;
-        }
-        Check(cursors.insert(page_token).second, "token page cursor must advance");
-    }
-    Check(actual == expected, "token pagination should return every binding in key order");
-
-    openevent::ListTokensRequest invalid_limit;
-    openevent::ListTokensResponse response;
-    openevent::Status status = core->ListTokens(invalid_limit, &response);
-    Check(!status.ok() && status.code() == grpc::StatusCode::INVALID_ARGUMENT,
-          "zero ListTokens limit should be rejected");
-    invalid_limit.set_limit(1001);
-    status = core->ListTokens(invalid_limit, &response);
-    Check(!status.ok() && status.code() == grpc::StatusCode::INVALID_ARGUMENT,
-          "oversized ListTokens limit should be rejected");
-
-    openevent::ListTokensRequest invalid_cursor;
-    invalid_cursor.set_page_token("not-a-server-cursor");
-    invalid_cursor.set_limit(1);
-    status = core->ListTokens(invalid_cursor, &response);
-    Check(!status.ok() && status.code() == grpc::StatusCode::INVALID_ARGUMENT,
-          "malformed ListTokens cursor should be rejected");
-
-    std::filesystem::remove_all(root);
-}
-
 void TestListMessagesPagination()
 {
     const auto root = std::filesystem::temp_directory_path() / "openevent_core_list_messages";
@@ -859,7 +807,7 @@ void TestListMessagesPagination()
     PublishAuto(*core, 100, token, private_channel, "private-message");
 
     std::vector<std::string> payloads;
-    uint64_t next_seq = 0;
+    uint64_t next_seq = 1;
     for (;;) {
         openevent::ListMessagesRequest request;
         request.set_from_seq(next_seq);
@@ -901,7 +849,8 @@ void TestFetchScanBudgetAdvancesCursor()
     uint64_t channel_id = CreateChannel(*core, 100, owner_token, openevent::VISIBILITY_PRIVATE);
     PublishAuto(*core, 100, owner_token, channel_id, "first-hidden");
     PublishAuto(*core, 100, owner_token, channel_id, "second-hidden");
-    PublishAuto(*core, 100, owner_token, channel_id, "third-hidden");
+    const auto public_channel = CreateChannel(*core, 100, owner_token, openevent::VISIBILITY_PUBLIC);
+    PublishAuto(*core, 100, owner_token, public_channel, "third-visible");
 
     openevent::FetchRequest request;
     request.set_principal(200);
@@ -919,7 +868,8 @@ void TestFetchScanBudgetAdvancesCursor()
     response.Clear();
     status = core->Fetch(request, &response);
     Check(status.ok(), status.message());
-    Check(response.messages_size() == 0, "remaining hidden record should stay filtered");
+    Check(response.messages_size() == 1 && response.messages(0).payload() == "third-visible",
+          "continuing an empty nonterminal page must find the later visible message");
     Check(response.next_seq() == 4, "second scan-budget page should reach the tail");
 
     std::filesystem::remove_all(root);
@@ -1292,9 +1242,9 @@ void TestObjectWriteInjectedFailures()
     };
     const std::vector<FailureCase> cases{
         {"preparing-commit", openevent::StorageFaultPoint::kBeforeCommit, 0,
-         grpc::StatusCode::UNAVAILABLE, false, 1, false},
+         grpc::StatusCode::UNAVAILABLE, false, 1, true},
         {"preparing-after-commit", openevent::StorageFaultPoint::kAfterCommit, 0,
-         grpc::StatusCode::UNAVAILABLE, false, 2, false},
+         grpc::StatusCode::UNAVAILABLE, false, 2, true},
         {"file-write", openevent::StorageFaultPoint::kBeforeTemporaryFileWrite, 0,
          grpc::StatusCode::RESOURCE_EXHAUSTED, false, 2, false},
         {"file-fsync", openevent::StorageFaultPoint::kBeforeFileFsync, 0,
@@ -1659,6 +1609,112 @@ void TestCancelledObjectWriteContinuesAfterPreparing()
     }
     core.reset();
     CheckRecoveredObjectState(root, true, 2);
+    std::filesystem::remove_all(root);
+}
+
+void TestTimedOutPublishDoesNotCommitAfterCoordinatorWait()
+{
+    const auto root =
+        std::filesystem::temp_directory_path() / "openevent_publish_deadline_after_coordinator_wait";
+    std::filesystem::remove_all(root);
+    struct State {
+        std::mutex mutex;
+        std::condition_variable cv;
+        bool active = false;
+        bool first_commit_blocked = false;
+        bool release_first = false;
+        int commit_attempts = 0;
+    };
+    auto state = std::make_shared<State>();
+    auto injector = [state](openevent::StorageFaultPoint point) {
+        if (point != openevent::StorageFaultPoint::kBeforeCommit) {
+            return openevent::Status::Ok();
+        }
+        std::unique_lock<std::mutex> lock(state->mutex);
+        if (!state->active) {
+            return openevent::Status::Ok();
+        }
+        ++state->commit_attempts;
+        if (state->commit_attempts == 1) {
+            state->first_commit_blocked = true;
+            state->cv.notify_all();
+            state->cv.wait(lock, [&]() { return state->release_first; });
+        }
+        return openevent::Status::Ok();
+    };
+
+    auto unique_core = MakeCore(root, 1024, 10000, 0, {}, injector);
+    const std::string token = AddToken(*unique_core, 100);
+    const uint64_t channel_id =
+        CreateChannel(*unique_core, 100, token, openevent::VISIBILITY_PUBLIC);
+    const uint64_t first_uuid = AllocateUuid(*unique_core);
+    const uint64_t timed_out_uuid = AllocateUuid(*unique_core);
+    auto core = std::shared_ptr<openevent::OpenEventCore>(std::move(unique_core));
+    {
+        std::lock_guard<std::mutex> lock(state->mutex);
+        state->active = true;
+    }
+
+    openevent::PublishAutoSeqRequest first_request;
+    first_request.set_principal(100);
+    first_request.set_token(token);
+    first_request.set_channel_id(channel_id);
+    first_request.set_payload("first");
+    first_request.set_uuid(first_uuid);
+    openevent::PublishAutoSeqResponse first_response;
+    openevent::Status first_status;
+    std::thread first([&]() { first_status = core->PublishAutoSeq(first_request, &first_response); });
+    {
+        std::unique_lock<std::mutex> lock(state->mutex);
+        state->cv.wait(lock, [&]() { return state->first_commit_blocked; });
+    }
+
+    openevent::EventServiceImpl service(core);
+    grpc::ServerBuilder builder;
+    int port = 0;
+    builder.AddListeningPort("127.0.0.1:0", grpc::InsecureServerCredentials(), &port);
+    builder.RegisterService(&service);
+    std::unique_ptr<grpc::Server> server = builder.BuildAndStart();
+    Check(server != nullptr && port > 0, "start publish deadline test gRPC server");
+    auto channel = grpc::CreateChannel("127.0.0.1:" + std::to_string(port),
+                                       grpc::InsecureChannelCredentials());
+    auto stub = openevent::EventService::NewStub(channel);
+
+    grpc::ClientContext context;
+    context.set_deadline(std::chrono::system_clock::now() + std::chrono::milliseconds(100));
+    openevent::PublishAutoSeqRequest timed_out_request;
+    timed_out_request.set_principal(100);
+    timed_out_request.set_token(token);
+    timed_out_request.set_channel_id(channel_id);
+    timed_out_request.set_payload("timed-out");
+    timed_out_request.set_uuid(timed_out_uuid);
+    openevent::PublishAutoSeqResponse timed_out_response;
+    grpc::Status timed_out_status =
+        stub->PublishAutoSeq(&context, timed_out_request, &timed_out_response);
+    Check(timed_out_status.error_code() == grpc::StatusCode::DEADLINE_EXCEEDED,
+          "queued publish must reach its client deadline");
+
+    {
+        std::lock_guard<std::mutex> lock(state->mutex);
+        state->release_first = true;
+    }
+    state->cv.notify_all();
+    first.join();
+    Check(first_status.ok() && first_response.seq() == 1,
+          "the publish holding the coordinator must commit first");
+
+    server->Shutdown();
+    server->Wait();
+    auto max_seq = core->MaxSeq();
+    Check(max_seq.ok() && max_seq.value() == 1,
+          "a publish whose deadline expired while waiting for the coordinator must not commit");
+    {
+        std::lock_guard<std::mutex> lock(state->mutex);
+        Check(state->commit_attempts == 1,
+              "the timed-out publish must be rejected before attempting storage commit");
+    }
+
+    core.reset();
     std::filesystem::remove_all(root);
 }
 
@@ -2190,6 +2246,22 @@ void TestServerConfigRequiresDataPaths()
           "public and admin listen addresses must be different");
 }
 
+void TestServerConfigPayloadLimit()
+{
+    openevent::ServerConfig config;
+    config.storage_path = "/tmp/openevent-data";
+
+    config.max_payload_bytes = openevent::kMaxPayloadBytesLimit;
+    openevent::Status status = openevent::ValidateServerConfig(config);
+    Check(status.ok(), "60 MiB payload limit should be accepted");
+
+    config.max_payload_bytes = openevent::kMaxPayloadBytesLimit + 1;
+    status = openevent::ValidateServerConfig(config);
+    Check(!status.ok() && status.code() == grpc::StatusCode::INVALID_ARGUMENT &&
+              status.message() == "limits.max_payload_bytes must not exceed 62914560 (60 MiB)",
+          "payload limit above 60 MiB should be rejected before listening");
+}
+
 void TestLoadServerConfigRequiresExistingFile()
 {
     const auto path = std::filesystem::temp_directory_path() / "openevent_missing_config.yaml";
@@ -2224,6 +2296,19 @@ void TestLoadServerConfigReadsRequiredPaths()
     Check(config.value().storage_path == storage_path.string(), "storage path should come from config");
     Check(config.value().max_payload_bytes == 4096, "payload limit should come from config");
 
+    {
+        std::ofstream oversized_config(config_path);
+        oversized_config << "storage:\n"
+                         << "  path: \"" << storage_path.string() << "\"\n"
+                         << "limits:\n"
+                         << "  max_payload_bytes: 62914561\n";
+        oversized_config.close();
+
+        auto rejected = openevent::LoadServerConfig(config_path.string());
+        Check(!rejected.ok() && rejected.status().code() == grpc::StatusCode::INVALID_ARGUMENT,
+              "config above 60 MiB should fail during load");
+    }
+
     std::filesystem::remove_all(root);
 }
 
@@ -2245,8 +2330,162 @@ void TestSystemChannelShape()
     Check(response.channel().visibility() == openevent::VISIBILITY_PROTECTED, "system channel visibility");
     Check(!response.channel().has_creator(), "system channel creator must be unset");
     Check(response.channel().members_size() == 0, "system channel members must be empty");
-    Check(response.channel().name().empty(), "system channel name should use proto default");
+    Check(response.channel().name() == "system", "system channel name");
+    Check(response.channel().protocol() == "system.v1", "system channel protocol");
 
+    std::filesystem::remove_all(root);
+}
+
+void TestInitializationCommitBoundary()
+{
+    using Point = openevent::StorageFaultPoint;
+    for (const auto point : {Point::kAfterInitializationMarker, Point::kBeforeInitializationCommit,
+                            Point::kAfterInitializationCommit}) {
+        const auto root = std::filesystem::temp_directory_path() /
+                          ("openevent_initialization_crash_" + std::to_string(static_cast<int>(point)));
+        std::filesystem::remove_all(root);
+        const pid_t child = ::fork();
+        Check(child >= 0, "fork initialization crash test");
+        if (child == 0) {
+            openevent::UnifiedStorage::Open(root.string(), [point](Point observed) {
+                if (observed == point) {
+                    ::_exit(73);
+                }
+                return openevent::Status::Ok();
+            });
+            ::_exit(74);
+        }
+        int result = 0;
+        Check(::waitpid(child, &result, 0) == child && WIFEXITED(result) && WEXITSTATUS(result) == 73,
+              "process must crash at the requested initialization boundary");
+        auto storage = openevent::UnifiedStorage::Open(root.string());
+        Check(storage.ok() == (point == Point::kAfterInitializationCommit),
+              "only deletion of the initialization marker completes initialization");
+        storage.value().reset();
+        std::filesystem::remove_all(root);
+    }
+}
+
+void TestMessageCommitFailureAndRestart()
+{
+    using Point = openevent::StorageFaultPoint;
+    for (const auto point : {Point::kBeforeCommit, Point::kAfterCommit}) {
+        const auto root = std::filesystem::temp_directory_path() /
+                          ("openevent_message_commit_failure_" + std::to_string(static_cast<int>(point)));
+        std::filesystem::remove_all(root);
+        bool active = false;
+        int fatal_calls = 0;
+        auto core = MakeCore(root, 1024, 10000, 0,
+            [&](const openevent::Status&) { ++fatal_calls; },
+            [&](Point observed) {
+                return active && observed == point
+                           ? openevent::Status(grpc::StatusCode::UNAVAILABLE, "injected DB write failure")
+                           : openevent::Status::Ok();
+            });
+        auto token = AddToken(*core, 100);
+        auto channel = CreateChannel(*core, 100, token, openevent::VISIBILITY_PUBLIC);
+        auto uuid = AllocateUuid(*core);
+        openevent::PublishAutoSeqRequest request;
+        request.set_principal(100);
+        request.set_token(token);
+        request.set_channel_id(channel);
+        request.set_uuid(uuid);
+        request.set_payload("atomic-message");
+        openevent::PublishAutoSeqResponse response;
+        active = true;
+        auto status = core->PublishAutoSeq(request, &response);
+        Check(status.code() == grpc::StatusCode::UNAVAILABLE && fatal_calls == 1,
+              "every DB write error must make the core unavailable");
+        Check(core->PublishAutoSeq(request, &response).code() == grpc::StatusCode::UNAVAILABLE,
+              "no new publish starts after the fatal error");
+        core.reset();
+        core = MakeCore(root);
+        auto max_seq = core->MaxSeq();
+        Check(max_seq.ok() && max_seq.value() == (point == Point::kAfterCommit ? 1 : 0),
+              "restored state decides whether the failed write persisted");
+        status = core->PublishAutoSeq(request, &response);
+        Check(point == Point::kAfterCommit ? status.code() == grpc::StatusCode::ALREADY_EXISTS : status.ok(),
+              "UUID and message must recover together and support retry with the same UUID");
+        openevent::GetSeqByUuidRequest lookup;
+        lookup.set_uuid(uuid);
+        openevent::GetSeqByUuidResponse found;
+        Check(core->GetSeqByUuid(lookup, &found).ok() && found.seq() == 1,
+              "the retried logical message must have one committed seq");
+        core.reset();
+        std::filesystem::remove_all(root);
+    }
+}
+
+void TestSystemMessagePersistenceAndValidation()
+{
+    const auto root = std::filesystem::temp_directory_path() / "openevent_system_message";
+    std::filesystem::remove_all(root);
+    auto core = MakeCore(root);
+    const auto token = AddToken(*core, 100);
+    openevent::FetchRequest fetch;
+    fetch.set_principal(100);
+    fetch.set_token(token);
+    fetch.set_limit(1);
+    openevent::FetchResponse fetched;
+    Check(core->Fetch(fetch, &fetched).ok() && fetched.messages_size() == 1,
+          "from seq zero must return the initialization message");
+    const auto original = fetched.messages(0);
+    Check(original.seq() == 0 && original.principal() == 0 && original.uuid() == 0 &&
+              original.channel_id() == 0 && original.recipients().empty() && original.object_keys().empty(),
+          "initialization message reserved fields");
+    Check(fetched.next_seq() == 1 && fetched.last_seq() == 0, "system page cursor");
+    fetch.set_only_my_recipient(true);
+    Check(core->Fetch(fetch, &fetched).ok() && fetched.messages().empty() && fetched.next_seq() == 1,
+          "recipient filtering must consume the system message without returning it");
+    const auto channel = CreateChannel(*core, 100, token, openevent::VISIBILITY_PUBLIC);
+    PublishAuto(*core, 100, token, channel, "business");
+    core.reset();
+    core = MakeCore(root);
+    fetch.set_only_my_recipient(false);
+    Check(core->Fetch(fetch, &fetched).ok() && fetched.messages(0).SerializeAsString() == original.SerializeAsString(),
+          "restart must preserve the exact initialization event and timestamp");
+    openevent::GetStatusRequest request;
+    request.set_principal(100);
+    request.set_token(token);
+    openevent::GetStatusResponse status;
+    Check(core->GetStatus(request, &status).ok() && status.min_seq() == 0 && status.max_seq() == 1,
+          "min_seq remains zero after business writes");
+    core.reset();
+
+    const auto db_path = root / "data" / "db";
+    const auto message_key = std::string("msg/") + openevent::EncodeUint64(0);
+    const auto uuid_key = std::string("uuid/") + openevent::EncodeUint64(0);
+    auto rejected = [&]() {
+        auto storage = openevent::UnifiedStorage::Open((root / "data").string());
+        Check(!storage.ok() && storage.status().code() == grpc::StatusCode::DATA_LOSS,
+              "invalid system state must reject startup without repairing it");
+    };
+    PutRawRecord(db_path, "messages", message_key, "", true);
+    rejected();
+    PutRawRecord(db_path, "messages", message_key, "malformed protobuf");
+    rejected();
+    for (const auto& payload : {std::string("not JSON"), std::string("{}"),
+            std::string(R"({"kind":"system.initialization","data":{"schema_version":2},"timestamps":{"event_ms":0}})"),
+            std::string(R"({"kind":"system.initialization","data":{"schema_version":1},"timestamps":{"event_ms":"0"}})"),
+            std::string(R"({"kind":"system.initialization","data":{"schema_version":1},"timestamps":{"event_ms":-1}})")}) {
+        auto invalid = original;
+        invalid.set_payload(payload);
+        PutRawRecord(db_path, "messages", message_key, invalid.SerializeAsString());
+        rejected();
+    }
+    auto invalid = original;
+    invalid.set_principal(1);
+    PutRawRecord(db_path, "messages", message_key, invalid.SerializeAsString());
+    rejected();
+    invalid = original;
+    invalid.set_ts_ms(original.ts_ms() + 1);
+    PutRawRecord(db_path, "messages", message_key, invalid.SerializeAsString());
+    rejected();
+    PutRawRecord(db_path, "messages", message_key, original.SerializeAsString());
+    PutRawRecord(db_path, rocksdb::kDefaultColumnFamilyName, uuid_key, "", true);
+    rejected();
+    PutRawRecord(db_path, rocksdb::kDefaultColumnFamilyName, uuid_key, openevent::EncodeUint64(1));
+    rejected();
     std::filesystem::remove_all(root);
 }
 
@@ -2264,7 +2503,6 @@ int main()
     TestRecipientMustBeChannelMember();
     TestPayloadLimit();
     TestGuaranteedNonCommitStatuses();
-    TestListTokensPagination();
     TestListMessagesPagination();
     TestFetchScanBudgetAdvancesCursor();
     TestResponseSoftBudgetPagination();
@@ -2277,6 +2515,7 @@ int main()
     TestConcurrentObjectWritesCanCommitOutOfIdOrder();
     TestObjectWriteReauthenticatesBeforeCommit();
     TestCancelledObjectWriteContinuesAfterPreparing();
+    TestTimedOutPublishDoesNotCommitAfterCoordinatorWait();
     TestPreparingRecoveryAndNoDirectoryScan();
     TestCommittedObjectCorruptionIsFatal();
     TestObjectIoErrorClassificationAndPaths();
@@ -2290,8 +2529,12 @@ int main()
     TestUnifiedStorageStartupDoesNotScanMessages();
     TestDefaultPayloadLimit();
     TestServerConfigRequiresDataPaths();
+    TestServerConfigPayloadLimit();
     TestLoadServerConfigRequiresExistingFile();
     TestLoadServerConfigReadsRequiredPaths();
     TestSystemChannelShape();
+    TestInitializationCommitBoundary();
+    TestMessageCommitFailureAndRestart();
+    TestSystemMessagePersistenceAndValidation();
     return 0;
 }

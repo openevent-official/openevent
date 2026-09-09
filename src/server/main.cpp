@@ -1,9 +1,7 @@
-#include <algorithm>
 #include <atomic>
 #include <csignal>
 #include <condition_variable>
 #include <iostream>
-#include <limits>
 #include <memory>
 #include <mutex>
 #include <pthread.h>
@@ -14,7 +12,7 @@
 #include <grpcpp/grpcpp.h>
 
 #include "server/server_config.h"
-#include "common/object_limits.h"
+#include "common/message_limits.h"
 #include "service/grpc_services.h"
 #include "service/open_event_core.h"
 #include "storage/unified_storage.h"
@@ -29,6 +27,7 @@ void ConfigurePublicServerKeepalive(grpc::ServerBuilder* builder)
 {
     builder->AddChannelArgument("grpc.keepalive_time_ms", kSubscribeKeepaliveTimeMs);
     builder->AddChannelArgument("grpc.keepalive_timeout_ms", kSubscribeKeepaliveTimeoutMs);
+    builder->AddChannelArgument("grpc.keepalive_permit_without_calls", 1);
     builder->AddChannelArgument("grpc.http2.min_ping_interval_without_data_ms",
                                 kMinimumClientPingIntervalMs);
     builder->AddChannelArgument("grpc.http2.max_pings_without_data", 0);
@@ -98,13 +97,7 @@ int main(int argc, char** argv)
     openevent::ChannelServiceImpl channel_service(core);
     openevent::AdminServiceImpl admin_service(core);
 
-    constexpr size_t kGrpcEnvelopeBytes = 2 * 1024 * 1024;
-    const size_t max_grpc_size = static_cast<size_t>(std::numeric_limits<int>::max());
-    const size_t largest_body = std::max(config.max_payload_bytes, openevent::kMaxObjectBytes);
-    const size_t configured_grpc_size = largest_body > max_grpc_size - kGrpcEnvelopeBytes
-                                            ? max_grpc_size
-                                            : largest_body + kGrpcEnvelopeBytes;
-    const int grpc_message_limit = static_cast<int>(configured_grpc_size);
+    const int grpc_message_limit = openevent::kGrpcMessageBytes;
 
     grpc::ServerBuilder admin_builder;
     admin_builder.SetMaxReceiveMessageSize(grpc_message_limit);

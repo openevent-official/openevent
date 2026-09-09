@@ -35,6 +35,10 @@ Status ValidateServerConfig(const ServerConfig& config)
     if (config.max_payload_bytes == 0) {
         return Status(grpc::StatusCode::INVALID_ARGUMENT, "limits.max_payload_bytes must be greater than 0");
     }
+    if (config.max_payload_bytes > kMaxPayloadBytesLimit) {
+        return Status(grpc::StatusCode::INVALID_ARGUMENT,
+                      "limits.max_payload_bytes must not exceed 62914560 (60 MiB)");
+    }
     return Status::Ok();
 }
 

@@ -106,9 +106,6 @@ public:
     grpc::Status DeleteToken(grpc::ServerContext* context,
                              const DeleteTokenRequest* request,
                              DeleteTokenResponse* response) override;
-    grpc::Status ListTokens(grpc::ServerContext* context,
-                            const ListTokensRequest* request,
-                            ListTokensResponse* response) override;
     grpc::Status ListMessages(grpc::ServerContext* context,
                               const ListMessagesRequest* request,
                               ListMessagesResponse* response) override;

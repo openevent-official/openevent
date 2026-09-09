@@ -7,6 +7,9 @@
 namespace openevent {
 
 enum class StorageFaultPoint {
+    kAfterInitializationMarker,
+    kBeforeInitializationCommit,
+    kAfterInitializationCommit,
     kBeforeCommit,
     kAfterCommit,
     kAfterTemporaryFileCreate,

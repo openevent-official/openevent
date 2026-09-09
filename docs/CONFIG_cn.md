@@ -42,36 +42,39 @@ limits:
 ### `storage`
 
 - `path`：字符串，无默认值，必须通过配置显式提供。
-- OpenEvent 数据根目录，固定布局为：`path/db` 保存一个 RocksDB 实例，其中包含 `default`
-  （metadata）、`messages` 和 `objects` 三个 Column Family；`path/objects` 为每个 committed 对象
-  保存一个不可变文件，文件名是十进制 object ID。
-- 不能为空。首次部署使用不存在或为空的新目录；目录不存在时由服务端初始化，运行用户必须拥有
-  对应父目录的写入权限。后续启动只接受完整的目标 schema。初始化中断或非空目录布局不完整时，
-  服务端拒绝启动，不在线修复。
-- 对象 data 不进入 RocksDB，每个对象最大 4 MiB。当前服务端不更新、删除或回收对象，因此每个
-  对象永久占用 data 空间和一个 inode。
+- OpenEvent 数据根目录，由服务端管理消息、Channel、token 和对象数据。
+- 不能为空。首次部署使用不存在或为空的新目录；目录不存在时由服务端初始化并写入永久的 seq 0
+  `system.v1` 消息，运行用户必须拥有对应父目录的写入权限。后续启动只接受完整的目标数据目录；
+  初始化未完成或目录不完整时，服务端拒绝启动，不在线修复。已经完成初始化的目录按正常启动流程检查。
+- 消息和对象按 [API 保留策略](https://github.com/openevent-official/openevent-sdk/blob/main/docs/API_cn.md#1-基础约定)
+  永久保存；容量规划、告警阈值和停机处置由部署方按需安排，服务端不提供这些管理功能。
 
 ### `limits`
 
 - `max_payload_bytes`：无符号整数，默认 `16777216`（16 MiB）
-- 单条消息 `payload` 的最大字节数。
+- 只限制 `Publish` 和 `PublishAutoSeq` 写入的单条消息 `payload` 字节数，不限制已提交消息的读取。
 - `Publish` 和 `PublishAutoSeq` 收到超过该限制的消息时返回 `RESOURCE_EXHAUSTED`。
-- 两个 gRPC Server 的收发硬上限由 `max(max_payload_bytes, 4 MiB) + 2 MiB` 推导，并封顶为
-  gRPC 接受的最大值；Fetch 和管理消息分页使用独立的 `max_payload_bytes + 1 MiB` 应用层响应软预算。
-- 必须大于 0。
+- 必须大于 0，且不能超过 `62914560` bytes（60 MiB）。超过上限时配置校验失败，服务端在打开两个监听
+  端口前退出。
+
+## 传输和分页预算
+
+- 两个 gRPC Server 的单条收发消息硬上限固定为 `67108864` bytes（64 MiB），不随 `max_payload_bytes` 改变。
+- Fetch 和 ListMessages 的每页响应软预算固定为 `17825792` bytes（17 MiB），不随写入限制改变。
+  单条消息超过软预算时仍可单独返回；预算只决定一页装多少消息，不作为历史消息的拒绝条件。
+- 下调 `max_payload_bytes` 后，历史消息仍按
+  [Payload API](https://github.com/openevent-official/openevent-sdk/blob/main/docs/API_cn.md#23-payload) 读取。
+  使用自定义客户端或代理时，其传输上限也必须能够容纳这些响应，不能根据当前写入限制调小。
 
 ## 关闭流程
 
-收到 `SIGINT`、`SIGTERM` 或发生致命存储错误时，两个 gRPC Server 停止接收新调用；服务端先禁止
-新的 Subscribe，并主动取消全部已经建立的 Subscribe stream，然后调用不带 deadline 的 `Shutdown()`。
-普通在途 handler 不被主动取消，服务端等待它们完成后才关闭 Core 和 RocksDB；退出流程不设置超时。
-致命存储错误最终仍使进程以非零状态退出。完整生命周期规则以内部架构设计文档为准。
+收到 `SIGINT`、`SIGTERM` 或发生致命存储错误时，服务端停止接收新调用，并主动结束已经建立的
+Subscribe stream；普通在途调用按 API 契约完成或返回错误。
+致命存储错误最终仍使进程以非零状态退出。
 
 ## 安全提示
 
-- `AdminService` 请求不携带业务 `principal/token`。
-- 管理端口应只监听本机或可信管理网络。
-- 不要把管理端口直接暴露到公网。
+管理端口隔离、传输保护和凭据保管要求统一见 [安全策略](../SECURITY_cn.md#部署安全提示)。
 
 ## 部署提示
 
@@ -80,19 +83,13 @@ limits:
 - 运行服务的系统用户必须能读取配置文件，并能创建和写入配置中的数据目录。
 - 必须使用支持持久文件 `fsync`、目录 `fsync` 和不覆盖原子
   `renameat2(RENAME_NOREPLACE)` 的本地 Linux 文件系统。不支持 NFS 或缺少这些语义的文件系统。
-- 同时监控 `storage.path` 下的可用字节数和 inode；服务端没有对象删除或后台垃圾回收。
-- 必须在服务停止时，或使用具有同等一致性的文件系统/存储快照，把 `db/` 和 `objects/` 作为一个
-  一致单元备份。单独复制任一子目录可能得到缺少对应对象 data 的 committed metadata。
-- 启动不扫描历史消息，也不比较消息水位和已存消息记录。对象恢复只扫描已知的未完成写入，
-  不扫描 committed 对象 metadata、文件或完整对象目录。ReadObject 访问时才会发现 committed
-  对象 data 缺失、不是普通文件或与 metadata 大小不一致，返回 `DATA_LOSS`，并使服务端以非零状态
-  退出；同大小的内容变更不会被发现。
-- 服务期间任何 RocksDB 操作失败都会使服务端以非零状态退出。RocksDB 损坏返回 `DATA_LOSS`，其他
-  RocksDB 错误返回 `UNAVAILABLE`。正常查询不存在的 token、Channel 或 object 不属于 RocksDB 故障。
-  启动期间任何 RocksDB 操作失败都会拒绝启动。
-- 已读出的持久化 bytes 不符合内部记录格式时按存储损坏处理；遇到该数据的请求返回 `DATA_LOSS`，
-  并使服务端以非零状态退出。消息所属 Channel 不存在时返回 `INTERNAL`，不触发服务端退出。启动仍
-  不全量扫描历史消息或 committed 对象。
+- 备份和恢复只能在服务停止时进行。必须等待服务端进程完全退出，并在整个操作期间保持停服。
+  存储目录必须作为一个整体备份和恢复；当前不支持在线备份，也不能只复制其中一部分。
+
+## 文档边界
+
+- 公开 RPC 的错误码和可观察行为见 [API 契约](https://github.com/openevent-official/openevent-sdk/blob/main/docs/API_cn.md)。
+- 数据目录内部布局、恢复检查和存储损坏处理属于服务端内部设计，不在本配置文档中展开。
 
 ## 校验错误
 
@@ -104,3 +101,4 @@ limits:
 - `grpc.listen_addr and admin.listen_addr must be different`
 - `storage.path must not be empty`
 - `limits.max_payload_bytes must be greater than 0`
+- `limits.max_payload_bytes must not exceed 62914560 (60 MiB)`

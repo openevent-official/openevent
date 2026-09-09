@@ -28,6 +28,7 @@ OpenEvent 是面向 AI Agent 系统的基础设施，核心组件是一条有序
 ## 特性
 
 - 基于 `seq` 的全局有序消息。
+- 永久保留 `seq=0` 的 `system.v1` 初始化消息，业务消息从 `seq=1` 开始。
 - 服务端分配单调递增 UUID，用于消息去重和已提交 seq 查询。
 - 支持客户端指定 `seq` 发布，也支持服务端自动分配 `seq`。
 - Channel 支持 public、protected、private 三种可见性。
@@ -40,6 +41,7 @@ OpenEvent 是面向 AI Agent 系统的基础设施，核心组件是一条有序
 
 ```text
 openevent/
+├── Makefile
 ├── CMakeLists.txt
 ├── openevent-server.yaml
 ├── docs/
@@ -76,20 +78,31 @@ git submodule update --init --recursive
 配置构建目录：
 
 ```bash
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug
+make configure
 ```
 
 构建：
 
 ```bash
-cmake --build build -j2
+make build
 ```
 
 运行测试：
 
 ```bash
-ctest --test-dir build --output-on-failure
+make test
 ```
+
+`make test` 包含核心和存储故障注入测试。运行服务端启动、重启与关闭回归：
+
+```bash
+make test-runtime
+```
+
+该 target 使用当前 Python 环境中已安装的 `openevent-sdk>=0.8.0`、`pytest` 和 `packaging`，
+不自动安装 SDK。通过 `PYTHON` 选择 Python 环境，通过 `BUILD_TYPE`、`JOBS` 和 `CMAKE_ARGS` 设置构建参数。
+测试数据与日志保存在 `build/`。
+文档修改后运行 `make check-docs`，检查中英文章节结构、当前版本引用和本地链接。
 
 构建产物位于：
 
@@ -123,8 +136,7 @@ cmake --install build --prefix /opt/openevent
 如需修改可执行文件安装子目录，在配置阶段传入 `CMAKE_INSTALL_BINDIR`：
 
 ```bash
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_BINDIR=sbin
-cmake --build build -j2
+make build BUILD_TYPE=Release CMAKE_ARGS="-DCMAKE_INSTALL_BINDIR=sbin"
 cmake --install build --prefix /opt/openevent
 ```
 
@@ -184,6 +196,7 @@ SDK 的构建、安装和测试说明见
 - [Python SDK](https://github.com/openevent-official/openevent-sdk/blob/main/README_cn.md)
 - [Python SDK 使用指南](https://github.com/openevent-official/openevent-sdk/blob/main/docs/USAGE_cn.md)
 - [SDK API 契约](https://github.com/openevent-official/openevent-sdk/blob/main/docs/API_cn.md)
+- [系统消息协议](https://github.com/openevent-official/openevent-sdk/blob/main/docs/SYSTEM_PROTOCOL_cn.md)
 
 文档面向 GitHub 原生 Markdown 渲染编写，不需要额外的文档构建步骤。
 
@@ -195,6 +208,6 @@ SDK 的构建、安装和测试说明见
 
 ## 项目状态
 
-OpenEvent 仍处于早期阶段。公开 API 行为以
+当前服务端和 SDK 版本为 `0.8.0`，按新数据目录部署，不兼容旧数据目录或旧协议。公开 API 行为以
 [SDK API 契约](https://github.com/openevent-official/openevent-sdk/blob/main/docs/API_cn.md)
 为准；调用方应依赖文档化的 gRPC 契约，避免依赖服务端实现细节。

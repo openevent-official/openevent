@@ -8,6 +8,8 @@
 
 namespace openevent {
 
+inline constexpr size_t kMaxPayloadBytesLimit = 62914560;
+
 struct ServerConfig {
     std::string grpc_listen_addr = "0.0.0.0:9527";
     std::string admin_listen_addr = "127.0.0.1:9528";

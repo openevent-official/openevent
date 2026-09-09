@@ -5,7 +5,6 @@
 #include <chrono>
 #include <cstring>
 #include <iomanip>
-#include <limits>
 #include <sstream>
 #include <unordered_map>
 #include <unordered_set>
@@ -13,12 +12,14 @@
 
 #include <sys/random.h>
 
+#include <grpcpp/server_context.h>
+
 #include "common/object_limits.h"
+#include "common/message_limits.h"
 
 namespace openevent {
 namespace {
 
-constexpr size_t kResponseEnvelopeBytes = 1024 * 1024;
 constexpr uint32_t kMaxUuidBatch = 1024;
 
 uint64_t NowMs()
@@ -107,56 +108,6 @@ bool SameObject(const StoredObject& left, const StoredObject& right)
            left.nbytes == right.nbytes;
 }
 
-std::string EncodeTokenPageToken(const std::string& token)
-{
-    constexpr char kHex[] = "0123456789abcdef";
-    std::string encoded = "v1:";
-    encoded.reserve(encoded.size() + token.size() * 2);
-    for (unsigned char ch : token) {
-        encoded.push_back(kHex[ch >> 4]);
-        encoded.push_back(kHex[ch & 0x0f]);
-    }
-    return encoded;
-}
-
-int HexValue(char ch)
-{
-    if (ch >= '0' && ch <= '9') {
-        return ch - '0';
-    }
-    if (ch >= 'a' && ch <= 'f') {
-        return ch - 'a' + 10;
-    }
-    return -1;
-}
-
-Result<std::string> DecodeTokenPageToken(const std::string& page_token)
-{
-    if (page_token.empty()) {
-        return std::string{};
-    }
-
-    constexpr size_t kGeneratedTokenSize = 36;
-    constexpr char kPrefix[] = "v1:";
-    constexpr size_t kPrefixSize = sizeof(kPrefix) - 1;
-    if (page_token.size() != kPrefixSize + kGeneratedTokenSize * 2 ||
-        page_token.compare(0, kPrefixSize, kPrefix) != 0) {
-        return Status(grpc::StatusCode::INVALID_ARGUMENT, "invalid page_token");
-    }
-
-    std::string decoded;
-    decoded.reserve(kGeneratedTokenSize);
-    for (size_t i = kPrefixSize; i < page_token.size(); i += 2) {
-        const int high = HexValue(page_token[i]);
-        const int low = HexValue(page_token[i + 1]);
-        if (high < 0 || low < 0) {
-            return Status(grpc::StatusCode::INVALID_ARGUMENT, "invalid page_token");
-        }
-        decoded.push_back(static_cast<char>((high << 4) | low));
-    }
-    return decoded;
-}
-
 template <typename Repeated>
 bool Contains(const Repeated& values, uint64_t value)
 {
@@ -175,9 +126,7 @@ OpenEventCore::OpenEventCore(std::unique_ptr<UnifiedStorage> storage,
       max_scan_records_(max_scan_records),
       response_soft_limit_bytes_(
           response_soft_limit_bytes == 0
-              ? (max_payload_bytes > std::numeric_limits<size_t>::max() - kResponseEnvelopeBytes
-                     ? std::numeric_limits<size_t>::max()
-                     : max_payload_bytes + kResponseEnvelopeBytes)
+              ? kMessagePageSoftBytes
               : response_soft_limit_bytes),
       fatal_error_handler_(std::move(fatal_error_handler))
 {
@@ -217,6 +166,23 @@ Status OpenEventCore::EnsureAvailable() const
     if (fatal_error_triggered_.load(std::memory_order_acquire)) {
         return Status(grpc::StatusCode::UNAVAILABLE,
                       "server is shutting down due to a fatal storage error");
+    }
+    return Status::Ok();
+}
+
+Status OpenEventCore::CheckRpcActive(const grpc::ServerContext* context) const
+{
+    if (context == nullptr) {
+        return Status::Ok();
+    }
+
+    const auto deadline = context->deadline();
+    if (deadline != std::chrono::system_clock::time_point::max() &&
+        std::chrono::system_clock::now() >= deadline) {
+        return Status(grpc::StatusCode::DEADLINE_EXCEEDED, "RPC deadline exceeded");
+    }
+    if (context->IsCancelled()) {
+        return Status(grpc::StatusCode::CANCELLED, "RPC cancelled");
     }
     return Status::Ok();
 }
@@ -312,6 +278,9 @@ Status OpenEventCore::Authenticate(const ReadSnapshot& snapshot,
                                    uint64_t principal,
                                    const std::string& token) const
 {
+    if (principal == 0) {
+        return Status(grpc::StatusCode::INVALID_ARGUMENT, "principal must be greater than 0");
+    }
     if (token.empty()) {
         return Status(grpc::StatusCode::UNAUTHENTICATED, "token is required");
     }
@@ -345,7 +314,7 @@ Status OpenEventCore::GetStatus(const GetStatusRequest& request, GetStatusRespon
         return max_seq.status();
     }
     response->set_max_seq(max_seq.value());
-    response->set_min_seq(max_seq.value() == 0 ? 0 : 1);
+    response->set_min_seq(0);
     return Status::Ok();
 }
 
@@ -398,10 +367,6 @@ Status OpenEventCore::GetSeqByUuid(const GetSeqByUuidRequest& request,
     if (!available.ok()) {
         return available;
     }
-    if (request.uuid() == 0) {
-        return Status(grpc::StatusCode::INVALID_ARGUMENT, "uuid must be nonzero");
-    }
-
     auto snapshot_result = CreateLinearizedSnapshot();
     if (!snapshot_result.ok()) {
         return snapshot_result.status();
@@ -532,15 +497,24 @@ Status OpenEventCore::CommitBatch(rocksdb::WriteBatch* batch)
     return status;
 }
 
-Status OpenEventCore::Publish(const PublishRequest& request, PublishResponse*)
+Status OpenEventCore::Publish(const PublishRequest& request,
+                              PublishResponse*,
+                              const grpc::ServerContext* context)
 {
     Status available = EnsureAvailable();
     if (!available.ok()) {
         return available;
     }
+    if (request.principal() == 0 || Contains(request.recipients(), uint64_t{0})) {
+        return Status(grpc::StatusCode::INVALID_ARGUMENT, "principal and recipients must be greater than 0");
+    }
     const uint64_t ts_ms = NowMs();
 
     std::lock_guard<std::mutex> lock(coordinator_mu_);
+    Status rpc_status = CheckRpcActive(context);
+    if (!rpc_status.ok()) {
+        return rpc_status;
+    }
     auto snapshot_result = storage_->CreateSnapshot();
     if (!snapshot_result.ok()) {
         return snapshot_result.status();
@@ -583,18 +557,31 @@ Status OpenEventCore::Publish(const PublishRequest& request, PublishResponse*)
     if (!status.ok()) {
         return status;
     }
+    rpc_status = CheckRpcActive(context);
+    if (!rpc_status.ok()) {
+        return rpc_status;
+    }
     return CommitBatch(&batch);
 }
 
-Status OpenEventCore::PublishAutoSeq(const PublishAutoSeqRequest& request, PublishAutoSeqResponse* response)
+Status OpenEventCore::PublishAutoSeq(const PublishAutoSeqRequest& request,
+                                     PublishAutoSeqResponse* response,
+                                     const grpc::ServerContext* context)
 {
     Status available = EnsureAvailable();
     if (!available.ok()) {
         return available;
     }
+    if (request.principal() == 0 || Contains(request.recipients(), uint64_t{0})) {
+        return Status(grpc::StatusCode::INVALID_ARGUMENT, "principal and recipients must be greater than 0");
+    }
     const uint64_t ts_ms = NowMs();
 
     std::lock_guard<std::mutex> lock(coordinator_mu_);
+    Status rpc_status = CheckRpcActive(context);
+    if (!rpc_status.ok()) {
+        return rpc_status;
+    }
     auto snapshot_result = storage_->CreateSnapshot();
     if (!snapshot_result.ok()) {
         return snapshot_result.status();
@@ -635,6 +622,10 @@ Status OpenEventCore::PublishAutoSeq(const PublishAutoSeqRequest& request, Publi
                                       &batch);
     if (!status.ok()) {
         return status;
+    }
+    rpc_status = CheckRpcActive(context);
+    if (!rpc_status.ok()) {
+        return rpc_status;
     }
     status = CommitBatch(&batch);
     if (!status.ok()) {
@@ -737,6 +728,9 @@ Status OpenEventCore::WriteObject(const WriteObjectRequest& request, WriteObject
     Status available = EnsureAvailable();
     if (!available.ok()) {
         return available;
+    }
+    if (request.principal() == 0) {
+        return Status(grpc::StatusCode::INVALID_ARGUMENT, "principal must be greater than 0");
     }
     if (request.name().empty() || request.name().size() > kMaxObjectNameBytes ||
         request.type().empty() || request.type().size() > kMaxObjectTypeBytes ||
@@ -955,7 +949,7 @@ Status OpenEventCore::FetchVisible(const ReadSnapshot& snapshot,
     const uint64_t max_seq = max_seq_result.value();
     response->clear_messages();
     response->set_last_seq(max_seq);
-    if (from_seq == 0 || from_seq > max_seq) {
+    if (from_seq > max_seq) {
         response->set_next_seq(max_seq + 1);
         return Status::Ok();
     }
@@ -976,7 +970,7 @@ Status OpenEventCore::FetchVisible(const ReadSnapshot& snapshot,
                     return channel_result.status();
                 }
                 if (!channel_result.value().has_value()) {
-                    return Status(grpc::StatusCode::INTERNAL,
+                    return Status(grpc::StatusCode::DATA_LOSS,
                                   "message references a missing channel");
                 }
                 const bool can_read = CanRead(channel_result.value().value(), principal);
@@ -1013,6 +1007,12 @@ Status OpenEventCore::CreateChannel(const CreateChannelRequest& request, CreateC
     Status available = EnsureAvailable();
     if (!available.ok()) {
         return available;
+    }
+    if (request.principal() == 0 || Contains(request.members(), uint64_t{0}) ||
+        request.name().empty() || request.name().size() > 255 ||
+        request.protocol().size() > 255 || request.description().size() > 4096 ||
+        request.members_size() > 1024) {
+        return Status(grpc::StatusCode::INVALID_ARGUMENT, "invalid Channel parameters");
     }
     Status visibility_status = ValidateVisibility(request.visibility());
     if (!visibility_status.ok()) {
@@ -1147,6 +1147,9 @@ Status OpenEventCore::AddMember(const AddMemberRequest& request, AddMemberRespon
     if (!available.ok()) {
         return available;
     }
+    if (request.principal() == 0 || request.target_principal() == 0) {
+        return Status(grpc::StatusCode::INVALID_ARGUMENT, "principals must be greater than 0");
+    }
     std::lock_guard<std::mutex> lock(coordinator_mu_);
     auto snapshot_result = storage_->CreateSnapshot();
     if (!snapshot_result.ok()) {
@@ -1190,6 +1193,9 @@ Status OpenEventCore::RemoveMember(const RemoveMemberRequest& request, RemoveMem
     Status available = EnsureAvailable();
     if (!available.ok()) {
         return available;
+    }
+    if (request.principal() == 0 || request.target_principal() == 0) {
+        return Status(grpc::StatusCode::INVALID_ARGUMENT, "principals must be greater than 0");
     }
     std::lock_guard<std::mutex> lock(coordinator_mu_);
     auto snapshot_result = storage_->CreateSnapshot();
@@ -1239,6 +1245,9 @@ Status OpenEventCore::AddToken(const AddTokenRequest& request, AddTokenResponse*
     if (!available.ok()) {
         return available;
     }
+    if (request.target_principal() == 0) {
+        return Status(grpc::StatusCode::INVALID_ARGUMENT, "target_principal must be greater than 0");
+    }
     std::lock_guard<std::mutex> lock(coordinator_mu_);
     auto snapshot_result = storage_->CreateSnapshot();
     if (!snapshot_result.ok()) {
@@ -1286,46 +1295,13 @@ Status OpenEventCore::DeleteToken(const DeleteTokenRequest& request, DeleteToken
     if (!available.ok()) {
         return available;
     }
+    if (request.target_token().empty()) {
+        return Status(grpc::StatusCode::INVALID_ARGUMENT, "target_token must not be empty");
+    }
     std::lock_guard<std::mutex> lock(coordinator_mu_);
     rocksdb::WriteBatch batch;
     storage_->DeleteToken(&batch, request.target_token());
     return CommitBatch(&batch);
-}
-
-Status OpenEventCore::ListTokens(const ListTokensRequest& request, ListTokensResponse* response)
-{
-    Status available = EnsureAvailable();
-    if (!available.ok()) {
-        return available;
-    }
-    if (request.limit() == 0 || request.limit() > 1000) {
-        return Status(grpc::StatusCode::INVALID_ARGUMENT, "limit must be in 1..1000");
-    }
-    auto start_after = DecodeTokenPageToken(request.page_token());
-    if (!start_after.ok()) {
-        return start_after.status();
-    }
-    auto snapshot_result = CreateLinearizedSnapshot();
-    if (!snapshot_result.ok()) {
-        return snapshot_result.status();
-    }
-    ReadSnapshot snapshot = std::move(snapshot_result.value());
-    auto page = storage_->ListTokens(snapshot, start_after.value(), request.limit());
-    if (!page.ok()) {
-        return page.status();
-    }
-
-    response->clear_bindings();
-    response->clear_next_page_token();
-    for (const auto& binding : page.value().bindings) {
-        auto* item = response->add_bindings();
-        item->set_token(binding.token);
-        item->set_principal(binding.principal);
-    }
-    if (page.value().has_more) {
-        response->set_next_page_token(EncodeTokenPageToken(page.value().bindings.back().token));
-    }
-    return Status::Ok();
 }
 
 Status OpenEventCore::ListMessages(const ListMessagesRequest& request, ListMessagesResponse* response)
@@ -1357,7 +1333,7 @@ Status OpenEventCore::ListAllMessages(const ReadSnapshot& snapshot,
     const uint64_t max_seq = max_seq_result.value();
     response->clear_messages();
     response->set_last_seq(max_seq);
-    const uint64_t start_seq = from_seq == 0 ? 1 : from_seq;
+    const uint64_t start_seq = from_seq;
     if (start_seq > max_seq) {
         response->set_next_seq(max_seq + 1);
         return Status::Ok();
@@ -1377,7 +1353,7 @@ Status OpenEventCore::ListAllMessages(const ReadSnapshot& snapshot,
                     return channel.status();
                 }
                 if (!channel.value().has_value()) {
-                    return Status(grpc::StatusCode::INTERNAL,
+                    return Status(grpc::StatusCode::DATA_LOSS,
                                   "message references a missing channel");
                 }
                 known_channels.insert(message.channel_id());
@@ -1584,6 +1560,8 @@ ChannelInfo OpenEventCore::SystemChannel() const
 {
     ChannelInfo channel;
     channel.set_channel_id(0);
+    channel.set_name("system");
+    channel.set_protocol("system.v1");
     channel.set_visibility(VISIBILITY_PROTECTED);
     return channel;
 }

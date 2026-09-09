@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.20)
 
-project(OpenEvent VERSION 0.6.0 LANGUAGES CXX)
+project(OpenEvent VERSION 0.8.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -90,6 +90,7 @@ install(TARGETS openevent_server
 
 include(CTest)
 if(BUILD_TESTING)
+    file(MAKE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/tmp")
     add_executable(openevent_core_tests tests/core_tests.cpp)
     target_link_libraries(openevent_core_tests PRIVATE openevent_service)
     add_test(NAME openevent_core_tests COMMAND openevent_core_tests)

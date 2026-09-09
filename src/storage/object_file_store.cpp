@@ -233,7 +233,7 @@ Result<std::string> ObjectFileStore::ReadRange(uint64_t object_id,
     const std::string final = FinalName(object_id);
     int fd = -1;
     do {
-        fd = ::openat(directory_fd_, final.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+        fd = ::openat(directory_fd_, final.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
     } while (fd < 0 && errno == EINTR);
     if (fd < 0) {
         const int error = errno;

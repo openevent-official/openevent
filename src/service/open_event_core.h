@@ -17,6 +17,10 @@
 #include "openevent.pb.h"
 #include "storage/unified_storage.h"
 
+namespace grpc {
+class ServerContext;
+}
+
 namespace openevent {
 
 class OpenEventCore {
@@ -33,8 +37,12 @@ public:
     Status GetStatus(const GetStatusRequest& request, GetStatusResponse* response);
     Status AllocateUuids(const AllocateUuidsRequest& request, AllocateUuidsResponse* response);
     Status GetSeqByUuid(const GetSeqByUuidRequest& request, GetSeqByUuidResponse* response);
-    Status Publish(const PublishRequest& request, PublishResponse* response);
-    Status PublishAutoSeq(const PublishAutoSeqRequest& request, PublishAutoSeqResponse* response);
+    Status Publish(const PublishRequest& request,
+                   PublishResponse* response,
+                   const grpc::ServerContext* context = nullptr);
+    Status PublishAutoSeq(const PublishAutoSeqRequest& request,
+                          PublishAutoSeqResponse* response,
+                          const grpc::ServerContext* context = nullptr);
     Status Fetch(const FetchRequest& request, FetchResponse* response);
 
     Status WriteObject(const WriteObjectRequest& request, WriteObjectResponse* response);
@@ -49,7 +57,6 @@ public:
 
     Status AddToken(const AddTokenRequest& request, AddTokenResponse* response);
     Status DeleteToken(const DeleteTokenRequest& request, DeleteTokenResponse* response);
-    Status ListTokens(const ListTokensRequest& request, ListTokensResponse* response);
     Status ListMessages(const ListMessagesRequest& request, ListMessagesResponse* response);
 
     Status HandleRpcStatus(const Status& status) const;
@@ -79,6 +86,7 @@ private:
     };
 
     Status EnsureAvailable() const;
+    Status CheckRpcActive(const grpc::ServerContext* context) const;
     Result<ReadSnapshot> CreateLinearizedSnapshot();
     Result<SubscriptionSnapshot> AcquireSubscriptionSnapshot() const;
     void RefreshSubscriptionSnapshots();

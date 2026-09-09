@@ -35,18 +35,18 @@ grpc::Status EventServiceImpl::GetSeqByUuid(grpc::ServerContext*,
     return ToGrpcStatus(core_, core_->GetSeqByUuid(*request, response));
 }
 
-grpc::Status EventServiceImpl::Publish(grpc::ServerContext*,
+grpc::Status EventServiceImpl::Publish(grpc::ServerContext* context,
                                        const PublishRequest* request,
                                        PublishResponse* response)
 {
-    return ToGrpcStatus(core_, core_->Publish(*request, response));
+    return ToGrpcStatus(core_, core_->Publish(*request, response, context));
 }
 
-grpc::Status EventServiceImpl::PublishAutoSeq(grpc::ServerContext*,
+grpc::Status EventServiceImpl::PublishAutoSeq(grpc::ServerContext* context,
                                               const PublishAutoSeqRequest* request,
                                               PublishAutoSeqResponse* response)
 {
-    return ToGrpcStatus(core_, core_->PublishAutoSeq(*request, response));
+    return ToGrpcStatus(core_, core_->PublishAutoSeq(*request, response, context));
 }
 
 grpc::Status EventServiceImpl::Fetch(grpc::ServerContext*, const FetchRequest* request, FetchResponse* response)
@@ -103,18 +103,15 @@ grpc::Status EventServiceImpl::RunSubscription(grpc::ServerContext* context,
         return ToGrpcStatus(core_, start_status);
     }
 
-    // A valid idle or fully filtered subscription still needs a connection-ready signal.
-    writer->SendInitialMetadata();
-
     uint64_t next_seq = request->from_seq();
-    if (next_seq == 0) {
-        next_seq = max_seq + 1;
-    } else if (next_seq > max_seq) {
-        SubscribeResponse response;
-        response.set_next_seq(max_seq + 1);
-        writer->Write(response);
-        return grpc::Status::OK;
+    if (next_seq > max_seq) {
+        return grpc::Status(grpc::StatusCode::OUT_OF_RANGE, "from_seq exceeds max_seq");
     }
+
+    // Send acceptance only after authentication, Channel and start validation.
+    // Keep it nonempty so SDKs can distinguish acceptance from trailers-only rejection.
+    context->AddInitialMetadata("openevent-subscription", "accepted");
+    writer->SendInitialMetadata();
 
     while (!context->IsCancelled()) {
         FetchResponse batch;
@@ -227,13 +224,6 @@ grpc::Status AdminServiceImpl::DeleteToken(grpc::ServerContext*,
                                            DeleteTokenResponse* response)
 {
     return ToGrpcStatus(core_, core_->DeleteToken(*request, response));
-}
-
-grpc::Status AdminServiceImpl::ListTokens(grpc::ServerContext*,
-                                          const ListTokensRequest* request,
-                                          ListTokensResponse* response)
-{
-    return ToGrpcStatus(core_, core_->ListTokens(*request, response));
 }
 
 grpc::Status AdminServiceImpl::ListMessages(grpc::ServerContext*,
