@@ -104,8 +104,8 @@ grpc::Status EventServiceImpl::RunSubscription(grpc::ServerContext* context,
     }
 
     uint64_t next_seq = request->from_seq();
-    if (next_seq > max_seq) {
-        return grpc::Status(grpc::StatusCode::OUT_OF_RANGE, "from_seq exceeds max_seq");
+    if (next_seq > max_seq && next_seq - max_seq > 1) {
+        return grpc::Status(grpc::StatusCode::OUT_OF_RANGE, "from_seq exceeds max_seq + 1");
     }
 
     // Send acceptance only after authentication, Channel and start validation.

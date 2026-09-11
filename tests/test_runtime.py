@@ -94,7 +94,7 @@ def test_lower_write_limit_preserves_large_history(tmp_path):
         assert admin.list_messages(seq, 1000).messages[0].payload == payload
         stream = client.subscribe(1, token, from_seq=seq)
         try:
-            stream.wait_started(5)
+            stream.wait_started(5_000)
             assert next(stream).message.payload == payload
         finally:
             stream.cancel()
@@ -123,7 +123,7 @@ def test_committed_object_damage_exits_on_read(tmp_path, damage):
         # Startup and metadata access must not inspect committed object files.
         assert client.get_object_metadata(key.object_id, key.object_token).nbytes == 8
         stream = client.subscribe(1, token, channels=[0])
-        stream.wait_started(5)
+        stream.wait_started(5_000)
         assert next(stream).message.seq == 0
         ended = Event()
         stream.add_done_callback(lambda _: ended.set())
@@ -141,7 +141,7 @@ def test_normal_shutdown_ends_idle_subscriptions(tmp_path):
     with running(tmp_path) as (process, client, admin):
         token = admin.add_token(1).binding.token
         stream = client.subscribe(1, token, only_my_recipient=True)
-        stream.wait_started(5)
+        stream.wait_started(5_000)
         ended = Event()
         stream.add_done_callback(lambda _: ended.set())
         try:
