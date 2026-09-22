@@ -148,6 +148,15 @@ cmake --install build --prefix /opt/openevent
 
 `cmake --install build` 通常不会自动重新编译源码；安装前请先执行构建步骤。
 
+也可以使用 Makefile 封装，一步完成构建和安装：
+
+```bash
+make install PREFIX=/opt/openevent
+```
+
+`make install` 先构建当前源码，只有构建成功后才安装本次产物；构建失败时停止安装。
+默认安装前缀为 `/usr/local`，可以通过 `PREFIX` 修改。
+
 ## 配置
 
 服务端启动时必须传入一个有效的 YAML 配置文件路径；配置文件缺失或类型无效时，
@@ -208,6 +217,6 @@ SDK 的构建、安装和测试说明见
 
 ## 项目状态
 
-当前服务端和 SDK 版本为 `0.8.0`，按新数据目录部署，不兼容旧数据目录或旧协议。公开 API 行为以
+当前服务端版本为 `0.8.0`，SDK 版本为 `0.8.1`，按新数据目录部署，不兼容旧数据目录或旧协议。公开 API 行为以
 [SDK API 契约](https://github.com/openevent-official/openevent-sdk/blob/main/docs/API_cn.md)
 为准；调用方应依赖文档化的 gRPC 契约，避免依赖服务端实现细节。

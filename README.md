@@ -162,6 +162,16 @@ The executable is then installed at:
 `cmake --install build` usually does not rebuild source files automatically, so
 run the build step before installing.
 
+You can also build and install in one step with the Makefile wrapper:
+
+```bash
+make install PREFIX=/opt/openevent
+```
+
+`make install` builds the current source and installs only after a successful build.
+A failed build stops installation. Its default prefix is `/usr/local`; override it
+with `PREFIX`.
+
 ## Configuration
 
 The server must be started with a valid YAML configuration file path. The server
@@ -226,7 +236,7 @@ documentation build step is required.
 
 ## Project Status
 
-The server and SDK are at version `0.8.0`. Deploy with a new data directory; old data directories and protocols are unsupported. Public API behavior is defined by the
+The server is at version `0.8.0` and the SDK at `0.8.1`. Deploy with a new data directory; old data directories and protocols are unsupported. Public API behavior is defined by the
 [SDK API contract](https://github.com/openevent-official/openevent-sdk/blob/main/docs/API.md);
 clients should rely on the documented gRPC contract, not server implementation
 details.

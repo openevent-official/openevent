@@ -4,14 +4,18 @@ BUILD_TYPE ?= Debug
 JOBS ?= 2
 CMAKE_ARGS ?=
 PYTHON ?= python3
+PREFIX ?= /usr/local
 
-.PHONY: build configure test test-runtime check-docs
+.PHONY: build configure install test test-runtime check-docs
 
 configure:
 	cmake -S . -B $(BUILD_DIR) -DCMAKE_BUILD_TYPE=$(BUILD_TYPE) $(CMAKE_ARGS)
 
 build: configure
 	cmake --build $(BUILD_DIR) -j$(JOBS)
+
+install: build
+	cmake --install $(BUILD_DIR) --prefix "$(PREFIX)"
 
 test: build
 	TMPDIR="$(abspath $(BUILD_DIR))/tmp" ctest --test-dir $(BUILD_DIR) --output-on-failure
