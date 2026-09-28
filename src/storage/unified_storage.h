@@ -75,8 +75,8 @@ public:
     Result<std::optional<uint64_t>> GetUsedUuidSeq(const ReadSnapshot& snapshot, uint64_t uuid) const;
     Result<uint64_t> GetNextChannelId(const ReadSnapshot& snapshot) const;
     Result<uint64_t> GetNextObjectId(const ReadSnapshot& snapshot) const;
-    Result<std::optional<uint64_t>> GetPrincipalForToken(const ReadSnapshot& snapshot,
-                                                         const std::string& token) const;
+    Result<bool> HasToken(const ReadSnapshot& snapshot, uint64_t principal,
+                          const std::string& token) const;
     Result<std::optional<ChannelInfo>> GetChannel(const ReadSnapshot& snapshot, uint64_t channel_id) const;
     Result<std::vector<ChannelInfo>> ListChannels(const ReadSnapshot& snapshot) const;
     Result<uint64_t> ScanMessages(const ReadSnapshot& snapshot,
@@ -99,8 +99,8 @@ public:
     Status SetNextObjectId(rocksdb::WriteBatch* batch, uint64_t object_id) const;
     Status PutMessage(rocksdb::WriteBatch* batch, const EventMessage& message) const;
     Status PutChannel(rocksdb::WriteBatch* batch, const ChannelInfo& channel) const;
-    Status PutToken(rocksdb::WriteBatch* batch, const std::string& token, uint64_t principal) const;
-    void DeleteToken(rocksdb::WriteBatch* batch, const std::string& token) const;
+    Status PutToken(rocksdb::WriteBatch* batch, uint64_t principal, const std::string& token) const;
+    void DeleteToken(rocksdb::WriteBatch* batch, uint64_t principal, const std::string& token) const;
     Status PutPreparingObject(rocksdb::WriteBatch* batch, const StoredObject& object) const;
     Status PutCommittedObject(rocksdb::WriteBatch* batch, const StoredObject& object) const;
     void DeletePreparingObject(rocksdb::WriteBatch* batch, uint64_t object_id) const;

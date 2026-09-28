@@ -147,11 +147,11 @@ uint64_t NowMs()
 std::string AddToken(openevent::OpenEventCore& core, uint64_t principal)
 {
     openevent::AddTokenRequest request;
-    request.set_target_principal(principal);
+    request.set_principal(principal);
     openevent::AddTokenResponse response;
     openevent::Status status = core.AddToken(request, &response);
     Check(status.ok(), status.message());
-    return response.binding().token();
+    return response.token();
 }
 
 uint64_t AllocateUuid(openevent::OpenEventCore& core)
@@ -929,6 +929,112 @@ void TestResponseSoftBudgetPagination()
     std::filesystem::remove_all(root);
 }
 
+void TestPrincipalTokenCredentials()
+{
+    const auto root = std::filesystem::temp_directory_path() / "openevent_core_principal_tokens";
+    std::filesystem::remove_all(root);
+    const std::string shared_token = "shared-token";
+    const std::string other_token = "other-token";
+    {
+        auto storage = openevent::UnifiedStorage::Open((root / "data").string());
+        Check(storage.ok(), storage.status().message());
+        rocksdb::WriteBatch batch;
+        Check(storage.value()->PutToken(&batch, 100, shared_token).ok(), "store first credential");
+        Check(storage.value()->PutToken(&batch, 200, shared_token).ok(), "reuse token for another principal");
+        Check(storage.value()->PutToken(&batch, 100, other_token).ok(), "store another token for same principal");
+        Check(storage.value()->Commit(&batch).ok(), "commit credential set");
+        batch.Clear();
+        Check(storage.value()->PutToken(&batch, 100, shared_token).ok(), "replay identical credential");
+        Check(storage.value()->Commit(&batch).ok(), "identical credential remains one set entry");
+    }
+
+    auto core = MakeCore(root);
+    auto authenticate = [&](uint64_t principal, const std::string& token) {
+        openevent::GetStatusRequest request;
+        request.set_principal(principal);
+        request.set_token(token);
+        openevent::GetStatusResponse response;
+        return core->GetStatus(request, &response);
+    };
+    Check(authenticate(100, shared_token).ok() && authenticate(200, shared_token).ok(),
+          "same token must authenticate both persisted principal/token pairs");
+    Check(authenticate(100, other_token).ok(), "one principal can retain multiple tokens");
+    Check(authenticate(300, shared_token).code() == grpc::StatusCode::UNAUTHENTICATED,
+          "a token valid for another principal must not authenticate an absent pair");
+
+    openevent::DeleteTokenRequest remove;
+    remove.set_principal(300);
+    remove.set_token(shared_token);
+    openevent::DeleteTokenResponse response;
+    Check(core->DeleteToken(remove, &response).ok(), "deleting an absent pair is idempotent");
+    Check(authenticate(100, shared_token).ok() && authenticate(200, shared_token).ok(),
+          "deleting absent pair must not delete same token for another principal");
+    remove.set_principal(100);
+    Check(core->DeleteToken(remove, &response).ok(), "delete one principal/token pair");
+    Check(core->DeleteToken(remove, &response).ok(), "repeated pair deletion is idempotent");
+
+    for (int pass = 0; pass < 2; ++pass) {
+        Check(authenticate(100, shared_token).code() == grpc::StatusCode::UNAUTHENTICATED,
+              "deleted pair must fail authentication before and after restart");
+        Check(authenticate(200, shared_token).ok(),
+              "deletion must preserve same token belonging to another principal");
+        Check(authenticate(100, other_token).ok(),
+              "deletion must preserve another token belonging to the same principal");
+        if (pass == 0) {
+            core.reset();
+            core = MakeCore(root);
+        }
+    }
+    core.reset();
+    std::filesystem::remove_all(root);
+}
+
+void TestTokenManagementRejectsInvalidParameters()
+{
+    const auto root = std::filesystem::temp_directory_path() / "openevent_core_invalid_tokens";
+    std::filesystem::remove_all(root);
+    auto core = MakeCore(root);
+    openevent::AddTokenRequest add;
+    openevent::AddTokenResponse added;
+    Check(core->AddToken(add, &added).code() == grpc::StatusCode::INVALID_ARGUMENT,
+          "AddToken must reject principal zero");
+    openevent::DeleteTokenRequest remove;
+    remove.set_token("nonempty");
+    openevent::DeleteTokenResponse removed;
+    Check(core->DeleteToken(remove, &removed).code() == grpc::StatusCode::INVALID_ARGUMENT,
+          "DeleteToken must reject principal zero even with a nonempty token");
+    remove.set_principal(100);
+    remove.clear_token();
+    Check(core->DeleteToken(remove, &removed).code() == grpc::StatusCode::INVALID_ARGUMENT,
+          "DeleteToken must reject an empty token even with a nonzero principal");
+    core.reset();
+    std::filesystem::remove_all(root);
+}
+
+void TestCorruptCredentialRecordIsFatal()
+{
+    const auto root = std::filesystem::temp_directory_path() / "openevent_core_corrupt_credential";
+    std::filesystem::remove_all(root);
+    auto core = MakeCore(root);
+    const std::string token = AddToken(*core, 100);
+    core.reset();
+    PutRawRecord(root / "data" / "db", rocksdb::kDefaultColumnFamilyName,
+                 std::string("token/") + openevent::EncodeUint64(100) + token, "unexpected-value");
+    int fatal_calls = 0;
+    core = MakeCore(root, 1024, 10000, 0, [&](const openevent::Status&) { ++fatal_calls; });
+    openevent::GetStatusRequest request;
+    request.set_principal(100);
+    request.set_token(token);
+    openevent::GetStatusResponse response;
+    const auto status = core->HandleRpcStatus(core->GetStatus(request, &response));
+    Check(status.code() == grpc::StatusCode::DATA_LOSS && fatal_calls == 1,
+          "credential records with nonempty values must be fatal storage corruption");
+    Check(core->GetStatus(request, &response).code() == grpc::StatusCode::UNAVAILABLE,
+          "new RPCs must fail after credential storage corruption");
+    core.reset();
+    std::filesystem::remove_all(root);
+}
+
 void TestDeleteTokenOrdersBeforePublish()
 {
     const auto root = std::filesystem::temp_directory_path() / "openevent_core_delete_token_publish";
@@ -938,7 +1044,8 @@ void TestDeleteTokenOrdersBeforePublish()
     std::string token = AddToken(*core, 100);
     uint64_t channel_id = CreateChannel(*core, 100, token, openevent::VISIBILITY_PUBLIC);
     openevent::DeleteTokenRequest delete_request;
-    delete_request.set_target_token(token);
+    delete_request.set_principal(100);
+    delete_request.set_token(token);
     openevent::DeleteTokenResponse delete_response;
     openevent::Status status = core->DeleteToken(delete_request, &delete_response);
     Check(status.ok(), status.message());
@@ -1082,7 +1189,8 @@ void TestObjectWriteMetadataReadAndReopen()
     Check(second.object_id() == 2, "committed object IDs must increase globally");
 
     openevent::DeleteTokenRequest delete_token;
-    delete_token.set_target_token(token);
+    delete_token.set_principal(100);
+    delete_token.set_token(token);
     openevent::DeleteTokenResponse delete_response;
     status = core->DeleteToken(delete_token, &delete_response);
     Check(status.ok(), status.message());
@@ -1518,7 +1626,8 @@ void TestObjectWriteReauthenticatesBeforeCommit()
         state->cv.wait(lock, [&]() { return state->blocked; });
     }
     openevent::DeleteTokenRequest delete_request;
-    delete_request.set_target_token(token);
+    delete_request.set_principal(100);
+    delete_request.set_token(token);
     openevent::DeleteTokenResponse delete_response;
     Check(core->DeleteToken(delete_request, &delete_response).ok(), "delete token during object file I/O");
     {
@@ -2098,6 +2207,19 @@ void TestUnifiedStorageRejectsInvalidState()
     storage = openevent::UnifiedStorage::Open(bad_schema.string());
     Check(!storage.ok(), "unsupported storage schema must be rejected");
 
+    const auto old_schema = base / "old-token-schema";
+    {
+        auto initialized = openevent::UnifiedStorage::Open(old_schema.string());
+        Check(initialized.ok(), initialized.status().message());
+    }
+    PutRawRecord(old_schema / "db", rocksdb::kDefaultColumnFamilyName, "meta:schema_version",
+                 openevent::EncodeUint64(5));
+    PutRawRecord(old_schema / "db", rocksdb::kDefaultColumnFamilyName, "token:old-token",
+                 openevent::EncodeUint64(100));
+    storage = openevent::UnifiedStorage::Open(old_schema.string());
+    Check(!storage.ok() && storage.status().code() == grpc::StatusCode::DATA_LOSS,
+          "schema 5 token bindings must be rejected without migration");
+
     const auto zero_next_channel_id = base / "zero-next-channel-id";
     {
         auto initialized = openevent::UnifiedStorage::Open(zero_next_channel_id.string());
@@ -2506,6 +2628,9 @@ int main()
     TestListMessagesPagination();
     TestFetchScanBudgetAdvancesCursor();
     TestResponseSoftBudgetPagination();
+    TestPrincipalTokenCredentials();
+    TestTokenManagementRejectsInvalidParameters();
+    TestCorruptCredentialRecordIsFatal();
     TestDeleteTokenOrdersBeforePublish();
     TestObjectWriteMetadataReadAndReopen();
     TestMessageObjectReferences();

@@ -23,7 +23,7 @@
 namespace openevent {
 namespace {
 
-constexpr uint64_t kSchemaVersion = 5;
+constexpr uint64_t kSchemaVersion = 6;
 constexpr uint64_t kInitializing = 1;
 constexpr const char* kMessagesColumnFamily = "messages";
 constexpr const char* kObjectsColumnFamily = "objects";
@@ -34,7 +34,7 @@ constexpr const char* kNextUuidKey = "meta:next_uuid";
 constexpr const char* kNextChannelIdKey = "meta:next_channel_id";
 constexpr const char* kNextObjectIdKey = "meta:next_object_id";
 constexpr const char* kChannelPrefix = "ch/";
-constexpr const char* kTokenPrefix = "token:";
+constexpr const char* kTokenPrefix = "token/";
 constexpr const char* kMessagePrefix = "msg/";
 constexpr const char* kUuidPrefix = "uuid/";
 constexpr const char* kPreparingObjectPrefix = "preparing/";
@@ -118,6 +118,11 @@ rocksdb::WriteOptions SynchronousWriteOptions()
 std::string NumericKey(const char* prefix, uint64_t value)
 {
     return std::string(prefix) + EncodeUint64(value);
+}
+
+std::string TokenKey(uint64_t principal, const std::string& token)
+{
+    return NumericKey(kTokenPrefix, principal) + token;
 }
 
 Result<uint64_t> DecodeRequiredUint64(const std::string& value, const std::string& description)
@@ -660,27 +665,23 @@ Result<uint64_t> UnifiedStorage::GetNextObjectId(const ReadSnapshot& snapshot) c
     return GetRequiredUint64(snapshot, kNextObjectIdKey);
 }
 
-Result<std::optional<uint64_t>> UnifiedStorage::GetPrincipalForToken(const ReadSnapshot& snapshot,
-                                                                    const std::string& token) const
+Result<bool> UnifiedStorage::HasToken(const ReadSnapshot& snapshot, uint64_t principal,
+                                     const std::string& token) const
 {
     rocksdb::ReadOptions options;
     options.snapshot = snapshot.snapshot_;
     std::string value;
-    rocksdb::Status status = db_->Get(options, meta_, std::string(kTokenPrefix) + token, &value);
+    rocksdb::Status status = db_->Get(options, meta_, TokenKey(principal, token), &value);
     if (status.IsNotFound()) {
-        return std::optional<uint64_t>{};
+        return false;
     }
     if (!status.ok()) {
-        return RocksToStatus(status, "read token binding");
+        return RocksToStatus(status, "read credential");
     }
-    auto principal = DecodeRequiredUint64(value, "token principal");
-    if (!principal.ok()) {
-        return principal.status();
+    if (!value.empty()) {
+        return Status(grpc::StatusCode::DATA_LOSS, "invalid stored credential");
     }
-    if (principal.value() == 0) {
-        return Status(grpc::StatusCode::DATA_LOSS, "invalid stored token principal");
-    }
-    return std::optional<uint64_t>{principal.value()};
+    return true;
 }
 
 Result<std::optional<ChannelInfo>> UnifiedStorage::GetChannel(const ReadSnapshot& snapshot, uint64_t channel_id) const
@@ -935,15 +936,15 @@ Status UnifiedStorage::PutChannel(rocksdb::WriteBatch* batch, const ChannelInfo&
     return Status::Ok();
 }
 
-Status UnifiedStorage::PutToken(rocksdb::WriteBatch* batch, const std::string& token, uint64_t principal) const
+Status UnifiedStorage::PutToken(rocksdb::WriteBatch* batch, uint64_t principal, const std::string& token) const
 {
-    batch->Put(meta_, std::string(kTokenPrefix) + token, EncodeUint64(principal));
+    batch->Put(meta_, TokenKey(principal, token), rocksdb::Slice());
     return Status::Ok();
 }
 
-void UnifiedStorage::DeleteToken(rocksdb::WriteBatch* batch, const std::string& token) const
+void UnifiedStorage::DeleteToken(rocksdb::WriteBatch* batch, uint64_t principal, const std::string& token) const
 {
-    batch->Delete(meta_, std::string(kTokenPrefix) + token);
+    batch->Delete(meta_, TokenKey(principal, token));
 }
 
 Status UnifiedStorage::PutPreparingObject(rocksdb::WriteBatch* batch, const StoredObject& object) const

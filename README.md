@@ -2,241 +2,87 @@
 
 [中文版](README_cn.md)
 
-OpenEvent is infrastructure for AI Agent systems. Its core component is an
-ordered message queue. Modules in the system connect to this queue and share one
-globally consistent event stream.
-
-Around this queue, OpenEvent provides a set of ready-made, pluggable modules.
-You can quickly build a running, debuggable Agent, then replace the IM
-integration, model proxy, Agent strategy, or view panel according to your
-business needs.
+OpenEvent is infrastructure for AI Agent systems. Modules share one globally
+ordered event queue and collaborate through messages. Start with the available
+modules, then replace the IM integration, model proxy, Agent strategy, or view
+panel as needed.
 
 ## Pluggable Modules
 
 | Module | Project | Purpose |
 | --- | --- | --- |
-| IM module | [openevent-modules-im](https://github.com/openevent-official/openevent-modules-im) | Defines the IM payload protocol, provides an IM sync worker, and connects external conversations to OpenEvent. |
-| Model Proxy | [openevent-modules-model-proxy](https://github.com/openevent-official/openevent-modules-model-proxy) | Connects OpenAI-compatible model providers and writes model requests and results to the event queue. |
-| Cmd module | [openevent-modules-cmd](https://github.com/openevent-official/openevent-modules-cmd) | Defines the `cmd.v1` command execution protocol, provides a Linux local command execution worker, and writes command requests, execution results, and output queries to the event queue. |
-| OpenEvent View | [openevent-view](https://github.com/openevent-official/openevent-view) | Queries event records stored in OpenEvent. |
+| IM module | [openevent-modules-im](https://github.com/openevent-official/openevent-modules-im) | Connects external IM conversations. |
+| Model Proxy | [openevent-modules-model-proxy](https://github.com/openevent-official/openevent-modules-model-proxy) | Connects OpenAI-compatible model providers. |
+| Cmd module | [openevent-modules-cmd](https://github.com/openevent-official/openevent-modules-cmd) | Executes local Linux commands and queries their output. |
+| OpenEvent View | [openevent-view](https://github.com/openevent-official/openevent-view) | Queries event records. |
 
-## Build An Agent Demo Quickly
+## Agent Demo
 
 [openevent-agent-demo](https://github.com/openevent-official/openevent-agent-demo)
-combines OpenEvent, the IM module, model-proxy, an Agent process, and OpenEvent
-View into one local runtime. It is suitable for validating module boundaries,
-debugging event chains, and serving as the starting point for a business Agent.
-
-This demo shows OpenEvent's recommended module boundary: IM events, model
-requests, model results, Agent WAL records, and final replies are all written to
-the same OpenEvent event queue.
+combines OpenEvent, IM, model-proxy, an Agent process, and OpenEvent View into a
+local runtime for debugging event chains or starting a business Agent.
 
 ## Features
 
-- Globally ordered messages based on `seq`.
-- A permanent `system.v1` initialization message at `seq=0`; application
-  messages start at `seq=1`.
-- Server-allocated monotonic UUIDs for message deduplication and committed-sequence lookup.
-- Supports both client-assigned `seq` publishing and server-assigned `seq`.
-- Channels support `public`, `protected`, and `private` visibility.
-- Supports batch fetch and server-streaming subscription.
-- Stores immutable objects up to 4 MiB and attaches ordered ObjectKey capabilities
-  to messages.
-- Token-based authentication for business requests.
-- Includes a Python SDK submodule.
-
-## Repository Layout
-
-```text
-openevent/
-├── Makefile
-├── CMakeLists.txt
-├── openevent-server.yaml
-├── docs/
-│   ├── API.md
-│   └── CONFIG.md
-├── src/
-├── tests/
-└── openevent-sdk/
-    ├── docs/API.md
-    ├── docs/USAGE.md
-    └── proto/
-        ├── admin.proto
-        └── openevent.proto
-```
+- Globally ordered messages, server-allocated UUIDs, and message deduplication.
+- Publishing with client-assigned or server-assigned `seq`.
+- Channels with `public`, `protected`, and `private` visibility.
+- Batch fetch and streaming subscriptions.
+- Immutable object storage up to 4 MiB, with object read credentials attached to messages.
+- Business authentication by `(principal, token)` pair and a separate admin endpoint.
+- A Python SDK.
 
 ## Build
 
-Install the build dependencies for your Linux distribution first:
-
-- CMake 3.20+
-- C++20 compiler
-- Protobuf and `protoc`
-- gRPC and `grpc_cpp_plugin`
-- RocksDB
-- OpenSSL
-- yaml-cpp
-
-Initialize submodules:
+Install the dependencies for your Linux distribution: CMake 3.20+, a C++20
+compiler, Protobuf and `protoc`, gRPC and `grpc_cpp_plugin`, RocksDB, OpenSSL,
+and yaml-cpp.
 
 ```bash
 git submodule update --init --recursive
-```
-
-Configure a build directory:
-
-```bash
-make configure
-```
-
-Build:
-
-```bash
 make build
 ```
 
-Run tests:
+The binary is `build/openevent_server`. Set build options through `BUILD_TYPE`,
+`JOBS`, and `CMAKE_ARGS`, for example:
 
 ```bash
-make test
+make build BUILD_TYPE=Release JOBS=4
 ```
 
-`make test` includes core and storage fault-injection tests. Run server startup,
-restart, and shutdown regression tests with:
-
-```bash
-make test-runtime
-```
-
-This target requires `openevent-sdk>=0.8.0`, `pytest`, and `packaging` already installed
-in the current Python environment; it does not install the SDK. Select Python with
-`PYTHON`, and set build options with `BUILD_TYPE`, `JOBS`, and `CMAKE_ARGS`.
-Test data and logs stay under `build/`.
-After editing documentation, run `make check-docs` to check translation heading
-structure, current release references, and local links.
-
-The server binary is generated at:
-
-```text
-build/openevent_server
-```
-
-Common CMake options:
-
-- `CMAKE_BUILD_TYPE=Debug|Release`
-- `BUILD_TESTING=ON|OFF`
-- `CMAKE_INSTALL_BINDIR=bin|sbin|...`
+See [Contributing](CONTRIBUTING.md) for test commands.
 
 ## Install
 
-Build and install are separate steps. `cmake --build` compiles the project and
-generates artifacts under the build directory; `cmake --install` copies those
-artifacts to an installation prefix.
+```bash
+make install PREFIX=/opt/openevent BUILD_TYPE=Release
+```
 
-Install to a specific prefix:
+This builds the current source and installs it to
+`/opt/openevent/bin/openevent_server` only after a successful build.
+The default installation prefix is `/usr/local`; override it with `PREFIX`.
+
+## Run and Deploy
+
+Prepare a YAML file using the [configuration guide](docs/CONFIG.md), then run:
 
 ```bash
-cmake --install build --prefix /opt/openevent
+/opt/openevent/bin/openevent_server /etc/openevent/openevent-server.yaml
 ```
 
-The default installed executable path is:
+For local development, use `build/openevent_server /path/to/openevent-server.yaml`.
+Before deploying, read the filesystem, data directory, and backup requirements in
+the configuration guide and the endpoint and transport requirements in the
+[security policy](SECURITY.md).
 
-```text
-/opt/openevent/bin/openevent_server
-```
+## SDK and Documentation
 
-To change the executable subdirectory, pass `CMAKE_INSTALL_BINDIR` during
-configuration:
-
-```bash
-make build BUILD_TYPE=Release CMAKE_ARGS="-DCMAKE_INSTALL_BINDIR=sbin"
-cmake --install build --prefix /opt/openevent
-```
-
-The executable is then installed at:
-
-```text
-/opt/openevent/sbin/openevent_server
-```
-
-`cmake --install build` usually does not rebuild source files automatically, so
-run the build step before installing.
-
-You can also build and install in one step with the Makefile wrapper:
-
-```bash
-make install PREFIX=/opt/openevent
-```
-
-`make install` builds the current source and installs only after a successful build.
-A failed build stops installation. Its default prefix is `/usr/local`; override it
-with `PREFIX`.
-
-## Configuration
-
-The server must be started with a valid YAML configuration file path. The server
-rejects startup if the path is missing, does not exist, or is not a regular file.
-
-See [Configuration](docs/CONFIG.md) for configuration examples, field
-definitions, and deployment notes.
-
-## Run
-
-Run from the source build directory:
-
-```bash
-build/openevent_server /path/to/openevent-server.yaml
-```
-
-Run an installed binary:
-
-```bash
-/opt/openevent/bin/openevent_server /path/to/openevent-server.yaml
-```
-
-If `CMAKE_INSTALL_BINDIR` was set to `sbin`, adjust the path accordingly:
-
-```bash
-/opt/openevent/sbin/openevent_server /path/to/openevent-server.yaml
-```
-
-## Deployment
-
-Use the installed executable in deployments, and pass a deployment-specific
-configuration file. See [Configuration](docs/CONFIG.md) for config file
-placement, data directory permissions, and admin port security requirements.
-
-## SDK
-
-See the [openevent-sdk](https://github.com/openevent-official/openevent-sdk)
-repository for SDK build, installation, and test instructions.
-
-## Documentation
-
-- [OpenEvent Blog](https://openevent-official.github.io/openevent-blog/en/)
+- [Python SDK](https://github.com/openevent-official/openevent-sdk): build, installation, and usage.
+- [API and protocols](docs/API.md)
 - [Configuration](docs/CONFIG.md)
-- [API](docs/API.md)
-- [SDK repository](https://github.com/openevent-official/openevent-sdk)
-- [Business protocol definition](https://github.com/openevent-official/openevent-sdk/blob/main/proto/openevent.proto)
-- [Admin protocol definition](https://github.com/openevent-official/openevent-sdk/blob/main/proto/admin.proto)
-- [Python SDK](https://github.com/openevent-official/openevent-sdk/blob/main/README.md)
-- [Python SDK usage](https://github.com/openevent-official/openevent-sdk/blob/main/docs/USAGE.md)
-- [SDK API contract](https://github.com/openevent-official/openevent-sdk/blob/main/docs/API.md)
-- [System message protocol](https://github.com/openevent-official/openevent-sdk/blob/main/docs/SYSTEM_PROTOCOL.md)
-
-The documentation is written for GitHub's native Markdown renderer. No
-documentation build step is required.
-
-## Open Source Publishing Notes
-
-- The SDK submodule points to
-  `https://github.com/openevent-official/openevent-sdk.git`.
-- Confirm the copyright holder in [LICENSE](LICENSE).
-- Enable private vulnerability reporting in GitHub if the repository is public.
+- [Contributing](CONTRIBUTING.md)
+- [OpenEvent Blog](https://openevent-official.github.io/openevent-blog/en/)
 
 ## Project Status
 
-The server is at version `0.8.0` and the SDK at `0.8.1`. Deploy with a new data directory; old data directories and protocols are unsupported. Public API behavior is defined by the
-[SDK API contract](https://github.com/openevent-official/openevent-sdk/blob/main/docs/API.md);
-clients should rely on the documented gRPC contract, not server implementation
-details.
+Use matching `0.10.0` server and SDK versions, with a new data directory when upgrading.

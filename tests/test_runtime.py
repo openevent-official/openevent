@@ -11,8 +11,8 @@ import grpc
 from packaging.version import Version
 import pytest
 
-if Version(version("openevent-sdk")) < Version("0.8.0"):
-    raise RuntimeError("server runtime tests require installed openevent-sdk>=0.8.0")
+if Version(version("openevent-sdk")) < Version("0.10.0"):
+    raise RuntimeError("server runtime tests require installed openevent-sdk>=0.10.0")
 
 from openevent.sdk import AdminClient, OpenEventClient
 
@@ -80,7 +80,7 @@ def test_invalid_payload_configuration_exits_before_listening(tmp_path, limit):
 def test_lower_write_limit_preserves_large_history(tmp_path):
     payload = b"h" * (40 * 1024 * 1024)
     with running(tmp_path, 60 * 1024 * 1024) as (process, client, admin):
-        token = admin.add_token(1).binding.token
+        token = admin.add_token(1).token
         channel = client.create_channel(1, token, "history").channel.channel_id
         uuid = client.get_uuid()
         seq = client.publish_auto_seq(1, token, channel, payload, uuid).seq
@@ -105,10 +105,31 @@ def test_lower_write_limit_preserves_large_history(tmp_path):
     assert process.returncode == 0
 
 
+def test_token_deletion_is_scoped_to_principal_and_persists(tmp_path):
+    with running(tmp_path) as (process, client, admin):
+        token = admin.add_token(100).token
+        other_token = admin.add_token(200).token
+        admin.delete_token(300, token)
+        assert client.get_status(100, token).min_seq == 0
+        admin.delete_token(100, token)
+        admin.delete_token(100, token)
+        with pytest.raises(grpc.RpcError) as error:
+            client.get_status(100, token)
+        assert error.value.code() == grpc.StatusCode.UNAUTHENTICATED
+        assert client.get_status(200, other_token).min_seq == 0
+    assert process.returncode == 0
+    with running(tmp_path) as (process, client, admin):
+        with pytest.raises(grpc.RpcError) as error:
+            client.get_status(100, token)
+        assert error.value.code() == grpc.StatusCode.UNAUTHENTICATED
+        assert client.get_status(200, other_token).min_seq == 0
+    assert process.returncode == 0
+
+
 @pytest.mark.parametrize("damage", ["missing", "size", "directory", "fifo"])
 def test_committed_object_damage_exits_on_read(tmp_path, damage):
     with running(tmp_path) as (process, client, admin):
-        token = admin.add_token(1).binding.token
+        token = admin.add_token(1).token
         key = client.write_object(1, token, "file", "binary", b"contents")
     assert process.returncode == 0
     path = tmp_path / "data" / "objects" / str(key.object_id)
@@ -139,7 +160,7 @@ def test_committed_object_damage_exits_on_read(tmp_path, damage):
 
 def test_normal_shutdown_ends_idle_subscriptions(tmp_path):
     with running(tmp_path) as (process, client, admin):
-        token = admin.add_token(1).binding.token
+        token = admin.add_token(1).token
         stream = client.subscribe(1, token, only_my_recipient=True)
         stream.wait_started(5_000)
         ended = Event()

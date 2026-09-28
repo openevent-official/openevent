@@ -2,35 +2,27 @@
 
 [English version](CONTRIBUTING.md)
 
-感谢你关注 OpenEvent。
+## 开发与验证
 
-## 开发环境
-
-先安装 [README](README_cn.md) 中列出的依赖，然后运行：
+按 [README](README_cn.md#构建) 安装依赖并初始化子模块，然后运行：
 
 ```bash
 make test
+make test-runtime
+make check-docs
 ```
+
+`make test-runtime` 需要当前 Python 环境已安装 `openevent-sdk>=0.10.0`、`pytest` 和 `packaging`。
+使用 `PYTHON` 选择 Python 环境。测试数据与日志保存在 `build/`。
 
 ## 贡献准则
 
-- 公开行为应记录在 `openevent-sdk/docs/API_cn.md`，并同步更新对应的英文翻译。
-- 修改 gRPC 契约时，按 service 边界和共享 package 类型同步更新 `openevent-sdk/proto/openevent.proto` 或
-  `openevent-sdk/proto/admin.proto`。
-- Python SDK 的 Protobuf 文件由 `openevent-sdk` 的 `make build` 和 `make test` 生成，不进 Git。
-  这两个 target 必须生成这些文件，不能假定工作区已存在生成产物。
-- 修改 proto 或 SDK 相关文件后，还必须按照 `openevent-sdk/README_cn.md` 验证 SDK 子模块。
-- 优先提交小而可验证的变更；行为变更应增加或更新测试。
-- 行为、配置或公开契约变更时，同步更新文档。
-- 公开文档只描述使用方式、配置和 API 行为，避免记录内部设计和实现细节。
-- 不提交构建产物、RocksDB 数据、临时 token、日志或私人笔记。
-- Markdown 链接应适用于 GitHub 直接阅读。
+- 行为变更应增加或更新测试，并同步更新公开文档及其中英文翻译。
+- gRPC 协议和 API 契约在 [SDK 仓库](https://github.com/openevent-official/openevent-sdk) 中维护；
+  涉及 SDK 的修改按其贡献与验证说明进行。
+- 公开文档聚焦使用方式、配置和 API 行为，链接应支持 GitHub 直接阅读。
+- 不提交生成文件、运行数据、凭据或日志。
 
 ## Pull Request
 
-提交 PR 前请确认构建和测试已通过、文档已更新。PR 应包含：
-
-- 清晰的变更说明。
-- 构建和测试验证使用的命令。
-- 兼容性影响说明（如有）。
-- 公开行为变更对应的文档更新。
+保持变更小而可验证。PR 说明应包含改动目的、验证命令和结果，以及兼容性影响（如有）。

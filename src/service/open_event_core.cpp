@@ -284,11 +284,11 @@ Status OpenEventCore::Authenticate(const ReadSnapshot& snapshot,
     if (token.empty()) {
         return Status(grpc::StatusCode::UNAUTHENTICATED, "token is required");
     }
-    auto result = storage_->GetPrincipalForToken(snapshot, token);
+    auto result = storage_->HasToken(snapshot, principal, token);
     if (!result.ok()) {
         return result.status();
     }
-    if (!result.value().has_value() || result.value().value() != principal) {
+    if (!result.value()) {
         return Status(grpc::StatusCode::UNAUTHENTICATED, "invalid token");
     }
     return Status::Ok();
@@ -1245,38 +1245,18 @@ Status OpenEventCore::AddToken(const AddTokenRequest& request, AddTokenResponse*
     if (!available.ok()) {
         return available;
     }
-    if (request.target_principal() == 0) {
-        return Status(grpc::StatusCode::INVALID_ARGUMENT, "target_principal must be greater than 0");
+    if (request.principal() == 0) {
+        return Status(grpc::StatusCode::INVALID_ARGUMENT, "principal must be greater than 0");
     }
     std::lock_guard<std::mutex> lock(coordinator_mu_);
-    auto snapshot_result = storage_->CreateSnapshot();
-    if (!snapshot_result.ok()) {
-        return snapshot_result.status();
+    auto token_result = GenerateToken();
+    if (!token_result.ok()) {
+        return token_result.status();
     }
-    ReadSnapshot snapshot = std::move(snapshot_result.value());
-
-    std::string token;
-    for (int attempt = 0; attempt < 16; ++attempt) {
-        auto token_result = GenerateToken();
-        if (!token_result.ok()) {
-            return token_result.status();
-        }
-        token = token_result.value();
-        auto existing = storage_->GetPrincipalForToken(snapshot, token);
-        if (!existing.ok()) {
-            return existing.status();
-        }
-        if (!existing.value().has_value()) {
-            break;
-        }
-        token.clear();
-    }
-    if (token.empty()) {
-        return Status(grpc::StatusCode::INTERNAL, "failed to generate unique token");
-    }
+    const std::string& token = token_result.value();
 
     rocksdb::WriteBatch batch;
-    Status status = storage_->PutToken(&batch, token, request.target_principal());
+    Status status = storage_->PutToken(&batch, request.principal(), token);
     if (!status.ok()) {
         return status;
     }
@@ -1284,8 +1264,7 @@ Status OpenEventCore::AddToken(const AddTokenRequest& request, AddTokenResponse*
     if (!status.ok()) {
         return status;
     }
-    response->mutable_binding()->set_token(token);
-    response->mutable_binding()->set_principal(request.target_principal());
+    response->set_token(token);
     return Status::Ok();
 }
 
@@ -1295,12 +1274,13 @@ Status OpenEventCore::DeleteToken(const DeleteTokenRequest& request, DeleteToken
     if (!available.ok()) {
         return available;
     }
-    if (request.target_token().empty()) {
-        return Status(grpc::StatusCode::INVALID_ARGUMENT, "target_token must not be empty");
+    if (request.principal() == 0 || request.token().empty()) {
+        return Status(grpc::StatusCode::INVALID_ARGUMENT,
+                      "principal must be greater than 0 and token must not be empty");
     }
     std::lock_guard<std::mutex> lock(coordinator_mu_);
     rocksdb::WriteBatch batch;
-    storage_->DeleteToken(&batch, request.target_token());
+    storage_->DeleteToken(&batch, request.principal(), request.token());
     return CommitBatch(&batch);
 }
 
