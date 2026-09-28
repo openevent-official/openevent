@@ -314,7 +314,6 @@ Status OpenEventCore::GetStatus(const GetStatusRequest& request, GetStatusRespon
         return max_seq.status();
     }
     response->set_max_seq(max_seq.value());
-    response->set_min_seq(0);
     return Status::Ok();
 }
 

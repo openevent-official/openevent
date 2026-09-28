@@ -85,4 +85,4 @@ the configuration guide and the endpoint and transport requirements in the
 
 ## Project Status
 
-Use matching `0.10.0` server and SDK versions, with a new data directory when upgrading.
+Use matching `0.11.0` server and SDK versions, with a new data directory when upgrading.

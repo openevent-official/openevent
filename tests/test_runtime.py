@@ -11,8 +11,8 @@ import grpc
 from packaging.version import Version
 import pytest
 
-if Version(version("openevent-sdk")) < Version("0.10.0"):
-    raise RuntimeError("server runtime tests require installed openevent-sdk>=0.10.0")
+if Version(version("openevent-sdk")) < Version("0.11.0"):
+    raise RuntimeError("server runtime tests require installed openevent-sdk>=0.11.0")
 
 from openevent.sdk import AdminClient, OpenEventClient
 
@@ -89,7 +89,7 @@ def test_lower_write_limit_preserves_large_history(tmp_path):
     with running(tmp_path) as (process, client, admin):
         assert client.get_seq_by_uuid(uuid) == seq
         assert client.get_seq_by_uuid(0) == 0
-        assert client.get_status(1, token).min_seq == 0
+        assert client.get_status(1, token).max_seq == seq
         assert client.fetch(1, token, seq, 1000).messages[0].payload == payload
         assert admin.list_messages(seq, 1000).messages[0].payload == payload
         stream = client.subscribe(1, token, from_seq=seq)
@@ -110,19 +110,19 @@ def test_token_deletion_is_scoped_to_principal_and_persists(tmp_path):
         token = admin.add_token(100).token
         other_token = admin.add_token(200).token
         admin.delete_token(300, token)
-        assert client.get_status(100, token).min_seq == 0
+        assert client.get_status(100, token).max_seq == 0
         admin.delete_token(100, token)
         admin.delete_token(100, token)
         with pytest.raises(grpc.RpcError) as error:
             client.get_status(100, token)
         assert error.value.code() == grpc.StatusCode.UNAUTHENTICATED
-        assert client.get_status(200, other_token).min_seq == 0
+        assert client.get_status(200, other_token).max_seq == 0
     assert process.returncode == 0
     with running(tmp_path) as (process, client, admin):
         with pytest.raises(grpc.RpcError) as error:
             client.get_status(100, token)
         assert error.value.code() == grpc.StatusCode.UNAUTHENTICATED
-        assert client.get_status(200, other_token).min_seq == 0
+        assert client.get_status(200, other_token).max_seq == 0
     assert process.returncode == 0
 
 

@@ -2083,8 +2083,7 @@ void TestUnifiedStorageLayout()
     for (meta_it->SeekToFirst(); meta_it->Valid(); meta_it->Next()) {
         const std::string key = meta_it->key().ToString();
         Check(key.find("pend_") == std::string::npos && key.find("seq:") == std::string::npos &&
-                  key.find("offset:") == std::string::npos && key.find("ch_last:") == std::string::npos &&
-                  key != "meta:min_seq",
+                  key.find("offset:") == std::string::npos && key.find("ch_last:") == std::string::npos,
               "unified metadata must not contain legacy pending, offset, or derived keys");
     }
     Check(meta_it->status().ok(), meta_it->status().ToString());
@@ -2570,8 +2569,8 @@ void TestSystemMessagePersistenceAndValidation()
     request.set_principal(100);
     request.set_token(token);
     openevent::GetStatusResponse status;
-    Check(core->GetStatus(request, &status).ok() && status.min_seq() == 0 && status.max_seq() == 1,
-          "min_seq remains zero after business writes");
+    Check(core->GetStatus(request, &status).ok() && status.max_seq() == 1,
+          "status preserves the latest business message sequence after restart");
     core.reset();
 
     const auto db_path = root / "data" / "db";
