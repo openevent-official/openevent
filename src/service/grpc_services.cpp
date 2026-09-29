@@ -109,7 +109,7 @@ grpc::Status EventServiceImpl::RunSubscription(grpc::ServerContext* context,
     }
 
     // Send acceptance only after authentication, Channel and start validation.
-    // Keep it nonempty so SDKs can distinguish acceptance from trailers-only rejection.
+    // The API marker confirms acceptance independently of the stream's eventual status.
     context->AddInitialMetadata("openevent-subscription", "accepted");
     writer->SendInitialMetadata();
 

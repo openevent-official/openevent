@@ -36,7 +36,7 @@ local runtime for debugging event chains or starting a business Agent.
 
 Install the dependencies for your Linux distribution: CMake 3.20+, a C++20
 compiler, Protobuf and `protoc`, gRPC and `grpc_cpp_plugin`, RocksDB, OpenSSL,
-and yaml-cpp.
+yaml-cpp, and `pkg-config`.
 
 ```bash
 git submodule update --init --recursive
@@ -85,4 +85,4 @@ the configuration guide and the endpoint and transport requirements in the
 
 ## Project Status
 
-Use matching `0.11.0` server and SDK versions, with a new data directory when upgrading.
+Use matching `0.11.1` server and SDK versions.

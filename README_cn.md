@@ -33,7 +33,7 @@ OpenEvent 是面向 AI Agent 系统的基础设施。各模块连接到同一条
 ## 构建
 
 先安装当前 Linux 发行版对应的依赖：CMake 3.20+、C++20 编译器、Protobuf 和 `protoc`、
-gRPC 和 `grpc_cpp_plugin`、RocksDB、OpenSSL、yaml-cpp。
+gRPC 和 `grpc_cpp_plugin`、RocksDB、OpenSSL、yaml-cpp、`pkg-config`。
 
 ```bash
 git submodule update --init --recursive
@@ -78,4 +78,4 @@ make install PREFIX=/opt/openevent BUILD_TYPE=Release
 
 ## 项目状态
 
-服务端和 SDK 使用 `0.11.0` 配套版本，升级时使用新数据目录。
+服务端和 SDK 使用 `0.11.1` 配套版本。

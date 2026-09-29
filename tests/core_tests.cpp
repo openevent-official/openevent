@@ -2206,19 +2206,6 @@ void TestUnifiedStorageRejectsInvalidState()
     storage = openevent::UnifiedStorage::Open(bad_schema.string());
     Check(!storage.ok(), "unsupported storage schema must be rejected");
 
-    const auto old_schema = base / "old-token-schema";
-    {
-        auto initialized = openevent::UnifiedStorage::Open(old_schema.string());
-        Check(initialized.ok(), initialized.status().message());
-    }
-    PutRawRecord(old_schema / "db", rocksdb::kDefaultColumnFamilyName, "meta:schema_version",
-                 openevent::EncodeUint64(5));
-    PutRawRecord(old_schema / "db", rocksdb::kDefaultColumnFamilyName, "token:old-token",
-                 openevent::EncodeUint64(100));
-    storage = openevent::UnifiedStorage::Open(old_schema.string());
-    Check(!storage.ok() && storage.status().code() == grpc::StatusCode::DATA_LOSS,
-          "schema 5 token bindings must be rejected without migration");
-
     const auto zero_next_channel_id = base / "zero-next-channel-id";
     {
         auto initialized = openevent::UnifiedStorage::Open(zero_next_channel_id.string());

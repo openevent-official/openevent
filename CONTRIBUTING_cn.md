@@ -12,7 +12,7 @@ make test-runtime
 make check-docs
 ```
 
-`make test-runtime` 需要当前 Python 环境已安装 `openevent-sdk>=0.11.0`、`pytest` 和 `packaging`。
+`make test-runtime` 需要当前 Python 环境已安装 `openevent-sdk>=0.11.1`、`pytest` 和 `packaging`。
 使用 `PYTHON` 选择 Python 环境。测试数据与日志保存在 `build/`。
 
 ## 贡献准则
@@ -25,4 +25,4 @@ make check-docs
 
 ## Pull Request
 
-保持变更小而可验证。PR 说明应包含改动目的、验证命令和结果，以及兼容性影响（如有）。
+保持变更小而可验证。PR 说明应包含改动目的、验证命令和结果。

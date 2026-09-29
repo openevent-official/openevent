@@ -11,8 +11,8 @@ import grpc
 from packaging.version import Version
 import pytest
 
-if Version(version("openevent-sdk")) < Version("0.11.0"):
-    raise RuntimeError("server runtime tests require installed openevent-sdk>=0.11.0")
+if Version(version("openevent-sdk")) < Version("0.11.1"):
+    raise RuntimeError("server runtime tests require installed openevent-sdk>=0.11.1")
 
 from openevent.sdk import AdminClient, OpenEventClient
 
