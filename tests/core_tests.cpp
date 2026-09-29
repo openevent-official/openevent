@@ -2573,9 +2573,9 @@ void TestSystemMessagePersistenceAndValidation()
     PutRawRecord(db_path, "messages", message_key, "malformed protobuf");
     rejected();
     for (const auto& payload : {std::string("not JSON"), std::string("{}"),
-            std::string(R"({"kind":"system.initialization","data":{"schema_version":2},"timestamps":{"event_ms":0}})"),
-            std::string(R"({"kind":"system.initialization","data":{"schema_version":1},"timestamps":{"event_ms":"0"}})"),
-            std::string(R"({"kind":"system.initialization","data":{"schema_version":1},"timestamps":{"event_ms":-1}})")}) {
+            std::string(R"({"kind":"system.initialization","data":{"schema_version":2}})"),
+            std::string(R"({"kind":"system.initialization","data":{"schema_version":"1"}})"),
+            std::string(R"({"kind":"system.initialization","data":{}})")}) {
         auto invalid = original;
         invalid.set_payload(payload);
         PutRawRecord(db_path, "messages", message_key, invalid.SerializeAsString());
@@ -2583,10 +2583,6 @@ void TestSystemMessagePersistenceAndValidation()
     }
     auto invalid = original;
     invalid.set_principal(1);
-    PutRawRecord(db_path, "messages", message_key, invalid.SerializeAsString());
-    rejected();
-    invalid = original;
-    invalid.set_ts_ms(original.ts_ms() + 1);
     PutRawRecord(db_path, "messages", message_key, invalid.SerializeAsString());
     rejected();
     PutRawRecord(db_path, "messages", message_key, original.SerializeAsString());

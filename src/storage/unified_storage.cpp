@@ -2,7 +2,6 @@
 
 #include <algorithm>
 #include <chrono>
-#include <cmath>
 #include <cstring>
 #include <filesystem>
 #include <memory>
@@ -46,8 +45,7 @@ EventMessage InitializationMessage()
         std::chrono::system_clock::now().time_since_epoch()).count();
     EventMessage message;
     message.set_ts_ms(static_cast<uint64_t>(std::max<int64_t>(0, event_ms)));
-    message.set_payload("{\"kind\":\"system.initialization\",\"data\":{\"schema_version\":1},"
-                        "\"timestamps\":{\"event_ms\":" + std::to_string(message.ts_ms()) + "}}");
+    message.set_payload(R"({"kind":"system.initialization","data":{"schema_version":1}})");
     return message;
 }
 
@@ -64,24 +62,16 @@ bool ValidInitializationMessage(const EventMessage& message)
     const auto& fields = payload.fields();
     auto kind = fields.find("kind");
     auto data = fields.find("data");
-    auto timestamps = fields.find("timestamps");
     if (kind == fields.end() || kind->second.kind_case() != google::protobuf::Value::kStringValue ||
         kind->second.string_value() != "system.initialization" || data == fields.end() ||
-        data->second.kind_case() != google::protobuf::Value::kStructValue || timestamps == fields.end() ||
-        timestamps->second.kind_case() != google::protobuf::Value::kStructValue) {
+        data->second.kind_case() != google::protobuf::Value::kStructValue) {
         return false;
     }
     const auto& data_fields = data->second.struct_value().fields();
-    const auto& time_fields = timestamps->second.struct_value().fields();
     auto schema = data_fields.find("schema_version");
-    auto event_ms = time_fields.find("event_ms");
     return schema != data_fields.end() &&
            schema->second.kind_case() == google::protobuf::Value::kNumberValue &&
-           schema->second.number_value() == 1 && event_ms != time_fields.end() &&
-           event_ms->second.kind_case() == google::protobuf::Value::kNumberValue &&
-           event_ms->second.number_value() >= 0 &&
-           std::floor(event_ms->second.number_value()) == event_ms->second.number_value() &&
-           event_ms->second.number_value() == static_cast<double>(message.ts_ms()) &&
+           schema->second.number_value() == 1 &&
            !fields.contains("seq") && !fields.contains("channel_id") &&
            !fields.contains("principal") && !fields.contains("uuid");
 }
