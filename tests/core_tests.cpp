@@ -67,7 +67,6 @@ rocksdb::WriteOptions SyncWriteOptions()
 }
 
 void CreatePartialStorage(const std::filesystem::path& path,
-                          bool write_marker,
                           bool create_messages_cf,
                           bool create_objects_cf = false)
 {
@@ -84,10 +83,6 @@ void CreatePartialStorage(const std::filesystem::path& path,
     Check(status.ok(), status.ToString());
     std::unique_ptr<rocksdb::DB> db(raw_db);
 
-    if (write_marker) {
-        status = db->Put(SyncWriteOptions(), "meta:init_state", openevent::EncodeUint64(1));
-        Check(status.ok(), status.ToString());
-    }
     if (create_messages_cf) {
         rocksdb::ColumnFamilyHandle* messages = nullptr;
         status = db->CreateColumnFamily(rocksdb::ColumnFamilyOptions(), "messages", &messages);
@@ -2148,7 +2143,6 @@ void TestUnifiedStorageRejectsIncompleteInitialization()
                           ("openevent_init_stage_" + std::to_string(created_column_families));
         std::filesystem::remove_all(root);
         CreatePartialStorage(root,
-                             true,
                              created_column_families >= 1,
                              created_column_families >= 2);
 
@@ -2156,6 +2150,21 @@ void TestUnifiedStorageRejectsIncompleteInitialization()
         Check(!storage.ok(), "incomplete initialization must be rejected without online repair");
         std::filesystem::remove_all(root);
     }
+
+    const auto root = std::filesystem::temp_directory_path() / "openevent_missing_initial_metadata";
+    for (const auto* key : {"meta:schema_version", "meta:max_seq", "meta:next_uuid",
+                            "meta:next_channel_id", "meta:next_object_id"}) {
+        std::filesystem::remove_all(root);
+        {
+            auto storage = openevent::UnifiedStorage::Open(root.string());
+            Check(storage.ok(), storage.status().message());
+        }
+        PutRawRecord(root / "db", rocksdb::kDefaultColumnFamilyName, key, "", true);
+        auto storage = openevent::UnifiedStorage::Open(root.string());
+        Check(!storage.ok() && storage.status().code() == grpc::StatusCode::DATA_LOSS,
+              std::string("missing required metadata must reject startup without repair: ") + key);
+    }
+    std::filesystem::remove_all(root);
 }
 
 void TestUnifiedStorageRejectsExtraRootEntries()
@@ -2191,11 +2200,6 @@ void TestUnifiedStorageRejectsInvalidState()
     const auto base = std::filesystem::temp_directory_path() / "openevent_invalid_storage";
     std::filesystem::remove_all(base);
 
-    const auto missing_marker = base / "missing-marker";
-    CreatePartialStorage(missing_marker, false, false);
-    auto storage = openevent::UnifiedStorage::Open(missing_marker.string());
-    Check(!storage.ok(), "partial storage without initialization marker must be rejected");
-
     const auto bad_schema = base / "bad-schema";
     {
         auto initialized = openevent::UnifiedStorage::Open(bad_schema.string());
@@ -2203,7 +2207,7 @@ void TestUnifiedStorageRejectsInvalidState()
     }
     PutRawRecord(bad_schema / "db", rocksdb::kDefaultColumnFamilyName, "meta:schema_version",
                  openevent::EncodeUint64(999));
-    storage = openevent::UnifiedStorage::Open(bad_schema.string());
+    auto storage = openevent::UnifiedStorage::Open(bad_schema.string());
     Check(!storage.ok(), "unsupported storage schema must be rejected");
 
     const auto zero_next_channel_id = base / "zero-next-channel-id";
@@ -2447,8 +2451,7 @@ void TestSystemChannelShape()
 void TestInitializationCommitBoundary()
 {
     using Point = openevent::StorageFaultPoint;
-    for (const auto point : {Point::kAfterInitializationMarker, Point::kBeforeInitializationCommit,
-                            Point::kAfterInitializationCommit}) {
+    for (const auto point : {Point::kBeforeInitializationCommit, Point::kAfterInitializationCommit}) {
         const auto root = std::filesystem::temp_directory_path() /
                           ("openevent_initialization_crash_" + std::to_string(static_cast<int>(point)));
         std::filesystem::remove_all(root);
@@ -2466,10 +2469,34 @@ void TestInitializationCommitBoundary()
         int result = 0;
         Check(::waitpid(child, &result, 0) == child && WIFEXITED(result) && WEXITSTATUS(result) == 73,
               "process must crash at the requested initialization boundary");
-        auto storage = openevent::UnifiedStorage::Open(root.string());
-        Check(storage.ok() == (point == Point::kAfterInitializationCommit),
-              "only deletion of the initialization marker completes initialization");
-        storage.value().reset();
+        {
+            auto storage = openevent::UnifiedStorage::Open(root.string(), [](Point observed) {
+                Check(observed != Point::kBeforeInitializationCommit &&
+                          observed != Point::kAfterInitializationCommit,
+                      "reopening an interrupted initialization must not create new initial state");
+                return openevent::Status::Ok();
+            });
+            Check(storage.ok() == (point == Point::kAfterInitializationCommit),
+                  "only the synchronous initial-state batch completes initialization");
+            if (storage.ok()) {
+                auto snapshot = storage.value()->CreateSnapshot();
+                Check(snapshot.ok(), snapshot.status().message());
+                auto max_seq = storage.value()->GetMaxSeq(snapshot.value());
+                auto system_seq = storage.value()->GetUsedUuidSeq(snapshot.value(), 0);
+                Check(max_seq.ok() && max_seq.value() == 0 && system_seq.ok() &&
+                          system_seq.value().has_value() && system_seq.value().value() == 0,
+                      "committed initialization must preserve its message watermark and UUID zero index");
+                size_t messages = 0;
+                auto scan = storage.value()->ScanMessages(snapshot.value(), 0, 0, 1,
+                    [&](const openevent::EventMessage& message) -> openevent::Result<openevent::MessageScanAction> {
+                        Check(message.seq() == 0 && message.uuid() == 0,
+                              "committed initialization must preserve its system message");
+                        ++messages;
+                        return openevent::MessageScanAction::kContinue;
+                    });
+                Check(scan.ok() && messages == 1, "system message must remain readable after the crash");
+            }
+        }
         std::filesystem::remove_all(root);
     }
 }

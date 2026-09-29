@@ -23,11 +23,9 @@ namespace openevent {
 namespace {
 
 constexpr uint64_t kSchemaVersion = 6;
-constexpr uint64_t kInitializing = 1;
 constexpr const char* kMessagesColumnFamily = "messages";
 constexpr const char* kObjectsColumnFamily = "objects";
 constexpr const char* kSchemaVersionKey = "meta:schema_version";
-constexpr const char* kInitStateKey = "meta:init_state";
 constexpr const char* kMaxSeqKey = "meta:max_seq";
 constexpr const char* kNextUuidKey = "meta:next_uuid";
 constexpr const char* kNextChannelIdKey = "meta:next_channel_id";
@@ -468,15 +466,6 @@ Status UnifiedStorage::InitializeNew(const std::string& path, const StorageFault
     }
     std::unique_ptr<rocksdb::DB> db(raw_db);
 
-    rocksdb::Status marker_status = db->Put(SynchronousWriteOptions(), kInitStateKey, EncodeUint64(kInitializing));
-    if (!marker_status.ok()) {
-        return RocksToStatus(marker_status, "write storage initialization marker");
-    }
-    Status injected = InjectStorageFault(fault_injector, StorageFaultPoint::kAfterInitializationMarker);
-    if (!injected.ok()) {
-        return injected;
-    }
-
     rocksdb::ColumnFamilyHandle* messages = nullptr;
     rocksdb::Status status =
         db->CreateColumnFamily(rocksdb::ColumnFamilyOptions(), kMessagesColumnFamily, &messages);
@@ -498,14 +487,13 @@ Status UnifiedStorage::InitializeNew(const std::string& path, const StorageFault
     batch.Put(kNextObjectIdKey, EncodeUint64(uint64_t{1}));
     batch.Put(NumericKey(kUuidPrefix, 0), EncodeUint64(0));
     batch.Put(messages, NumericKey(kMessagePrefix, 0), InitializationMessage().SerializeAsString());
-    batch.Delete(kInitStateKey);
-    injected = InjectStorageFault(fault_injector, StorageFaultPoint::kBeforeInitializationCommit);
+    Status injected = InjectStorageFault(fault_injector, StorageFaultPoint::kBeforeInitializationCommit);
     Status init_status = injected.ok()
                              ? RocksToStatus(db->Write(SynchronousWriteOptions(), &batch),
                                              "finish storage initialization")
                              : injected;
     if (init_status.ok()) {
-        // The initialization marker is durably gone. Initialization is complete.
+        // The complete initial state is durably committed. Initialization is complete.
         init_status = InjectStorageFault(fault_injector, StorageFaultPoint::kAfterInitializationCommit);
     }
     rocksdb::Status objects_destroy = db->DestroyColumnFamilyHandle(objects);
@@ -1055,15 +1043,6 @@ Status UnifiedStorage::Validate() const
 
     rocksdb::ReadOptions options;
     options.snapshot = snapshot.snapshot_;
-    std::string init_state;
-    rocksdb::Status init_status = db_->Get(options, meta_, kInitStateKey, &init_state);
-    if (!init_status.IsNotFound()) {
-        if (!init_status.ok()) {
-            return RocksToStatus(init_status, "read storage initialization marker");
-        }
-        return Status(grpc::StatusCode::DATA_LOSS, "storage initialization is incomplete");
-    }
-
     auto schema = GetRequiredUint64(snapshot, kSchemaVersionKey);
     if (!schema.ok()) {
         return schema.status();
