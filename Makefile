@@ -21,7 +21,8 @@ test: build
 	TMPDIR="$(abspath $(BUILD_DIR))/tmp" ctest --test-dir $(BUILD_DIR) --output-on-failure
 
 test-runtime: build
-	PYTHONDONTWRITEBYTECODE=1 OPENEVENT_SERVER_BIN="$(abspath $(BUILD_DIR))/openevent_server" "$(PYTHON)" -m pytest tests/test_runtime.py -o cache_dir=$(BUILD_DIR)/pytest-cache --basetemp=$(BUILD_DIR)/runtime
+	$(MAKE) -C openevent-sdk test-env PYTHON="$(PYTHON)"
+	env -u PYTHONPATH -u PYTHONHOME PYTHONDONTWRITEBYTECODE=1 OPENEVENT_SERVER_BIN="$(abspath $(BUILD_DIR))/openevent_server" openevent-sdk/build/test-env/bin/python -m pytest tests/test_runtime.py -o cache_dir=$(BUILD_DIR)/pytest-cache --basetemp=$(BUILD_DIR)/runtime
 
 check-docs:
 	PYTHONDONTWRITEBYTECODE=1 "$(PYTHON)" tests/check_docs.py $(DOCS_ROOT)

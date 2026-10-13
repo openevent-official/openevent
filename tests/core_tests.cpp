@@ -12,12 +12,16 @@
 #include <limits>
 #include <memory>
 #include <mutex>
+#include <regex>
 #include <set>
+#include <sstream>
 #include <string>
 #include <thread>
 #include <vector>
 
 #include <grpcpp/grpcpp.h>
+#include <google/protobuf/struct.pb.h>
+#include <google/protobuf/util/json_util.h>
 #include <rocksdb/options.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -29,6 +33,7 @@
 #include "storage/encoding.h"
 #include "storage/io_error.h"
 #include "storage/object_file_store.h"
+#include "storage/rocksdb_status.h"
 #include "storage/unified_storage.h"
 
 namespace {
@@ -268,15 +273,16 @@ void TestPublishFetch()
     openevent::FetchResponse response;
     openevent::Status status = core->Fetch(fetch, &response);
     Check(status.ok(), status.message());
-    Check(response.messages_size() == 1, "expected one fetched message");
-    Check(response.messages(0).seq() == 1, "expected seq 1");
-    Check(response.messages(0).payload() == "hello", "expected payload");
-    Check(response.messages(0).ts_ms() >= before_publish_ms,
+    Check(response.messages_size() == 2, "expected channel initialization and business message");
+    Check(response.messages(0).seq() == 1 && response.messages(0).principal() == 0,
+          "channel initialization must precede the first business message");
+    Check(response.messages(1).payload() == "hello", "expected payload");
+    Check(response.messages(1).ts_ms() >= before_publish_ms,
           "expected server timestamp to be captured after request receipt");
-    Check(response.messages(0).ts_ms() <= after_publish_ms,
+    Check(response.messages(1).ts_ms() <= after_publish_ms,
           "expected server timestamp to be captured before publish returned");
-    Check(response.next_seq() == 2, "expected next_seq 2");
-    Check(response.last_seq() == 1, "expected last_seq 1");
+    Check(response.next_seq() == 3, "expected next_seq 3");
+    Check(response.last_seq() == 2, "expected last_seq 2");
     Check(response.next_seq() > response.last_seq(), "expected no more data");
 
     std::filesystem::remove_all(root);
@@ -295,7 +301,7 @@ void TestCasAbort()
     publish.set_principal(100);
     publish.set_token(token);
     publish.set_channel_id(channel_id);
-    publish.set_seq(2);
+    publish.set_seq(3);
     publish.set_payload("bad");
     publish.set_uuid(AllocateUuid(*core));
     openevent::PublishResponse response;
@@ -326,8 +332,8 @@ void TestUuidAllocationAndDeduplication()
     openevent::AllocateUuidsRequest allocation;
     allocation.set_count(3);
     status = core->AllocateUuids(allocation, &allocated);
-    Check(status.ok() && allocated.uuids_size() == 3 && allocated.uuids(0) == 1 &&
-              allocated.uuids(1) == 2 && allocated.uuids(2) == 3,
+    Check(status.ok() && allocated.uuids_size() == 3 && allocated.uuids(0) == 2 &&
+              allocated.uuids(1) == 3 && allocated.uuids(2) == 4,
           "UUID allocation must return a globally monotonic contiguous batch");
 
     openevent::GetSeqByUuidRequest get_seq;
@@ -361,7 +367,7 @@ void TestUuidAllocationAndDeduplication()
 
     publish.set_uuid(allocated.uuids(0));
     status = core->PublishAutoSeq(publish, &published);
-    Check(status.ok() && published.seq() == 1, status.message());
+    Check(status.ok() && published.seq() == 2, status.message());
     get_seq.set_uuid(allocated.uuids(0));
     status = core->GetSeqByUuid(get_seq, &get_seq_response);
     Check(status.ok() && get_seq_response.seq() == published.seq(),
@@ -372,18 +378,18 @@ void TestUuidAllocationAndDeduplication()
     Check(!status.ok() && status.code() == grpc::StatusCode::ALREADY_EXISTS,
           "a used UUID must reject later writes without comparing content");
     auto max_seq = core->MaxSeq();
-    Check(max_seq.ok() && max_seq.value() == 1,
+    Check(max_seq.ok() && max_seq.value() == 2,
           "a duplicate UUID must not advance the message watermark");
 
     publish.set_uuid(allocated.uuids(1));
     status = core->PublishAutoSeq(publish, &published);
-    Check(status.ok() && published.seq() == 2, status.message());
+    Check(status.ok() && published.seq() == 3, status.message());
     core.reset();
     core = MakeCore(root);
 
     get_seq.set_uuid(allocated.uuids(1));
     status = core->GetSeqByUuid(get_seq, &get_seq_response);
-    Check(status.ok() && get_seq_response.seq() == 2,
+    Check(status.ok() && get_seq_response.seq() == 3,
           "UUID lookup must survive storage reopen");
     publish.set_uuid(allocated.uuids(1));
     status = core->PublishAutoSeq(publish, &published);
@@ -391,25 +397,25 @@ void TestUuidAllocationAndDeduplication()
           "UUID consumption must survive storage reopen");
     publish.set_uuid(allocated.uuids(2));
     status = core->PublishAutoSeq(publish, &published);
-    Check(status.ok() && published.seq() == 3, status.message());
+    Check(status.ok() && published.seq() == 4, status.message());
 
     openevent::AllocateUuidsRequest continued_allocation;
     continued_allocation.set_count(2);
     openevent::AllocateUuidsResponse continued;
     status = core->AllocateUuids(continued_allocation, &continued);
-    Check(status.ok() && continued.uuids_size() == 2 && continued.uuids(0) == 4 &&
-              continued.uuids(1) == 5,
+    Check(status.ok() && continued.uuids_size() == 2 && continued.uuids(0) == 5 &&
+              continued.uuids(1) == 6,
           "UUID allocator watermark must survive storage reopen");
 
     publish.set_uuid(continued.uuids(0));
     status = core->PublishAutoSeq(publish, &published);
-    Check(status.ok() && published.seq() == 4, status.message());
+    Check(status.ok() && published.seq() == 5, status.message());
 
     openevent::PublishRequest cas_publish;
     cas_publish.set_principal(100);
     cas_publish.set_token(token);
     cas_publish.set_channel_id(channel_id);
-    cas_publish.set_seq(5);
+    cas_publish.set_seq(6);
     cas_publish.set_payload("manual-cas");
     cas_publish.set_uuid(continued.uuids(1));
     openevent::PublishResponse cas_response;
@@ -424,13 +430,13 @@ void TestUuidAllocationAndDeduplication()
     openevent::FetchRequest fetch;
     fetch.set_principal(100);
     fetch.set_token(token);
-    fetch.set_from_seq(1);
+    fetch.set_from_seq(2);
     fetch.set_limit(10);
     openevent::FetchResponse fetched;
     status = core->Fetch(fetch, &fetched);
-    Check(status.ok() && fetched.messages_size() == 5 && fetched.messages(0).uuid() == 1 &&
-              fetched.messages(1).uuid() == 2 && fetched.messages(2).uuid() == 3 &&
-              fetched.messages(3).uuid() == 4 && fetched.messages(4).uuid() == 5,
+    Check(status.ok() && fetched.messages_size() == 5 && fetched.messages(0).uuid() == 2 &&
+              fetched.messages(1).uuid() == 3 && fetched.messages(2).uuid() == 4 &&
+              fetched.messages(3).uuid() == 5 && fetched.messages(4).uuid() == 6,
           "stored EventMessage values must expose their allocated UUIDs");
 
     std::filesystem::remove_all(root);
@@ -456,8 +462,8 @@ void TestPrivateAcl()
     openevent::Status status = core->Fetch(fetch, &response);
     Check(status.ok(), status.message());
     Check(response.messages_size() == 0, "private message must be filtered");
-    Check(response.next_seq() == 2, "next_seq should still advance globally");
-    Check(response.last_seq() == 1, "last_seq should report committed tail");
+    Check(response.next_seq() == 3, "next_seq should still advance globally");
+    Check(response.last_seq() == 2, "last_seq should report committed tail");
 
     fetch.add_channels(channel_id);
     response.Clear();
@@ -489,7 +495,9 @@ void TestPrivateAcl()
     response.Clear();
     status = core->Fetch(fetch, &response);
     Check(status.ok(), status.message());
-    Check(response.messages_size() == 1, "member should see private message");
+    Check(response.messages_size() == 3 && response.messages(0).principal() == 0 &&
+              response.messages(1).payload() == "secret" && response.messages(2).principal() == 0,
+          "member should see channel initialization, private message, and member addition");
 
     fetch.clear_channels();
 
@@ -518,11 +526,11 @@ void TestFetchChannelFilter()
     openevent::FetchResponse response;
     openevent::Status status = core->Fetch(fetch, &response);
     Check(status.ok(), status.message());
-    Check(response.messages_size() == 1, "channel filter should return one message");
+    Check(response.messages_size() == 2, "channel filter should return initialization and business message");
     Check(response.messages(0).channel_id() == first_channel_id, "channel filter should keep first channel");
-    Check(response.messages(0).payload() == "first-channel", "channel filter should keep first payload");
-    Check(response.next_seq() == 3, "channel filter should still advance globally");
-    Check(response.last_seq() == 2, "last_seq should report committed tail");
+    Check(response.messages(1).payload() == "first-channel", "channel filter should keep first payload");
+    Check(response.next_seq() == 5, "channel filter should still advance globally");
+    Check(response.last_seq() == 4, "last_seq should report committed tail");
 
     google::protobuf::RepeatedField<uint64_t> subscription_channels;
     subscription_channels.Add(second_channel_id);
@@ -530,23 +538,23 @@ void TestFetchChannelFilter()
     status = core->FetchSubscriptionBatch(
         100, token, 1, 10, false, subscription_channels, &response);
     Check(status.ok(), status.message());
-    Check(response.messages_size() == 1,
-          "subscription channel filter should return one message");
+    Check(response.messages_size() == 2,
+          "subscription channel filter should return initialization and business message");
     Check(response.messages(0).channel_id() == second_channel_id,
           "subscription channel filter should keep the selected channel");
-    Check(response.messages(0).payload() == "second-channel",
+    Check(response.messages(1).payload() == "second-channel",
           "subscription channel filter should keep the selected payload");
-    Check(response.next_seq() == 3,
+    Check(response.next_seq() == 5,
           "subscription channel filter should advance past filtered messages");
-    Check(response.last_seq() == 2,
+    Check(response.last_seq() == 4,
           "subscription channel filter should report the committed tail");
 
     fetch.clear_channels();
     response.Clear();
     status = core->Fetch(fetch, &response);
     Check(status.ok(), status.message());
-    Check(response.messages_size() == 2, "empty channel filter should return all visible messages");
-    Check(response.last_seq() == 2, "empty channel filter last_seq");
+    Check(response.messages_size() == 4, "empty channel filter should return all visible messages");
+    Check(response.last_seq() == 4, "empty channel filter last_seq");
 
     fetch.clear_channels();
     fetch.add_channels(std::numeric_limits<uint64_t>::max());
@@ -571,7 +579,7 @@ void TestSharedSubscriptionSnapshotRefresh()
     uint64_t max_seq = 0;
     google::protobuf::RepeatedField<uint64_t> no_channels;
     openevent::Status status = core->GetSubscriptionMaxSeq(100, token, no_channels, &max_seq);
-    Check(status.ok() && max_seq == 0,
+    Check(status.ok() && max_seq == 1,
           "subscription startup must wait for the shared snapshot to cover prior commits");
     const uint64_t settled_version = core->SubscriptionSnapshotVersion();
     Check(!core->WaitForSubscriptionSnapshot(settled_version, std::chrono::milliseconds(150)),
@@ -585,7 +593,7 @@ void TestSharedSubscriptionSnapshotRefresh()
     openevent::FetchResponse response;
     uint64_t used_version = 0;
     status = core->FetchSubscriptionBatch(
-        100, token, 1, 10, false, channels, &response, &used_version);
+        100, token, 2, 10, false, channels, &response, &used_version);
     Check(status.ok() && response.messages_size() == 1 &&
               response.messages(0).payload() == "shared-snapshot" &&
               used_version != settled_version,
@@ -662,7 +670,7 @@ void TestRecipientMustBeChannelMember()
     publish.set_principal(100);
     publish.set_token(token);
     publish.set_channel_id(channel_id);
-    publish.set_seq(1);
+    publish.set_seq(2);
     publish.add_recipients(200);
     publish.set_payload("direct");
     publish.set_uuid(AllocateUuid(*core));
@@ -673,7 +681,7 @@ void TestRecipientMustBeChannelMember()
 
     auto max_seq = core->MaxSeq();
     Check(max_seq.ok(), max_seq.status().message());
-    Check(max_seq.value() == 0, "invalid recipient must not advance max_seq");
+    Check(max_seq.value() == 1, "invalid recipient must not advance max_seq");
 
     std::filesystem::remove_all(root);
 }
@@ -696,7 +704,7 @@ void TestPayloadLimit()
     openevent::PublishAutoSeqResponse auto_response;
     openevent::Status status = core->PublishAutoSeq(auto_request, &auto_response);
     Check(status.ok(), status.message());
-    Check(auto_response.seq() == 1, "payload at max limit should publish");
+    Check(auto_response.seq() == 2, "payload at max limit should publish");
 
     auto_request.set_payload("12345");
     auto_request.set_uuid(AllocateUuid(*core));
@@ -709,7 +717,7 @@ void TestPayloadLimit()
     publish.set_principal(100);
     publish.set_token(token);
     publish.set_channel_id(channel_id);
-    publish.set_seq(2);
+    publish.set_seq(3);
     publish.set_payload("12345");
     publish.set_uuid(AllocateUuid(*core));
     openevent::PublishResponse publish_response;
@@ -719,7 +727,7 @@ void TestPayloadLimit()
 
     auto max_seq = core->MaxSeq();
     Check(max_seq.ok(), max_seq.status().message());
-    Check(max_seq.value() == 1, "oversized payload must not advance max_seq");
+    Check(max_seq.value() == 2, "oversized payload must not advance max_seq");
 
     std::filesystem::remove_all(root);
 }
@@ -774,7 +782,7 @@ void TestGuaranteedNonCommitStatuses()
     cas.set_principal(100);
     cas.set_token(owner_token);
     cas.set_channel_id(channel_id);
-    cas.set_seq(2);
+    cas.set_seq(3);
     cas.set_payload("ok");
     cas.set_uuid(AllocateUuid(*core));
     openevent::PublishResponse cas_response;
@@ -783,7 +791,7 @@ void TestGuaranteedNonCommitStatuses()
           "CAS conflict should guarantee non-commit");
 
     auto max_seq = core->MaxSeq();
-    Check(max_seq.ok() && max_seq.value() == 0,
+    Check(max_seq.ok() && max_seq.value() == 1,
           "guaranteed non-commit statuses must not create a message or advance max_seq");
 
     std::filesystem::remove_all(root);
@@ -802,7 +810,7 @@ void TestListMessagesPagination()
     PublishAuto(*core, 100, token, private_channel, "private-message");
 
     std::vector<std::string> payloads;
-    uint64_t next_seq = 1;
+    uint64_t next_seq = 3;
     for (;;) {
         openevent::ListMessagesRequest request;
         request.set_from_seq(next_seq);
@@ -850,22 +858,23 @@ void TestFetchScanBudgetAdvancesCursor()
     openevent::FetchRequest request;
     request.set_principal(200);
     request.set_token(outsider_token);
-    request.set_from_seq(1);
+    request.set_from_seq(2);
     request.set_limit(10);
     openevent::FetchResponse response;
     openevent::Status status = core->Fetch(request, &response);
     Check(status.ok(), status.message());
     Check(response.messages_size() == 0, "scan-budget page may be empty when all records are hidden");
-    Check(response.next_seq() == 3, "empty scan-budget page must advance past checked records");
-    Check(response.last_seq() == 3, "scan-budget page should keep the snapshot tail");
+    Check(response.next_seq() == 4, "empty scan-budget page must advance past checked records");
+    Check(response.last_seq() == 5, "scan-budget page should keep the snapshot tail");
 
     request.set_from_seq(response.next_seq());
     response.Clear();
     status = core->Fetch(request, &response);
     Check(status.ok(), status.message());
-    Check(response.messages_size() == 1 && response.messages(0).payload() == "third-visible",
+    Check(response.messages_size() == 2 && response.messages(0).principal() == 0 &&
+              response.messages(1).payload() == "third-visible",
           "continuing an empty nonterminal page must find the later visible message");
-    Check(response.next_seq() == 4, "second scan-budget page should reach the tail");
+    Check(response.next_seq() == 6, "second scan-budget page should reach the tail");
 
     std::filesystem::remove_all(root);
 }
@@ -884,41 +893,41 @@ void TestResponseSoftBudgetPagination()
     openevent::FetchRequest fetch;
     fetch.set_principal(100);
     fetch.set_token(token);
-    fetch.set_from_seq(1);
+    fetch.set_from_seq(2);
     fetch.set_limit(10);
     openevent::FetchResponse fetch_response;
     openevent::Status status = core->Fetch(fetch, &fetch_response);
     Check(status.ok(), status.message());
-    Check(fetch_response.messages_size() == 1 && fetch_response.messages(0).seq() == 1,
+    Check(fetch_response.messages_size() == 1 && fetch_response.messages(0).seq() == 2,
           "Fetch should allow one message to exceed the soft response budget");
-    Check(fetch_response.next_seq() == 2, "Fetch must not consume a message deferred by byte budget");
+    Check(fetch_response.next_seq() == 3, "Fetch must not consume a message deferred by byte budget");
 
     fetch.set_from_seq(fetch_response.next_seq());
     fetch_response.Clear();
     status = core->Fetch(fetch, &fetch_response);
     Check(status.ok(), status.message());
-    Check(fetch_response.messages_size() == 1 && fetch_response.messages(0).seq() == 2,
+    Check(fetch_response.messages_size() == 1 && fetch_response.messages(0).seq() == 3,
           "Fetch should return the deferred message on the next page");
-    Check(fetch_response.next_seq() == 3, "Fetch response-budget pagination should reach the tail");
+    Check(fetch_response.next_seq() == 4, "Fetch response-budget pagination should reach the tail");
 
     openevent::ListMessagesRequest list;
-    list.set_from_seq(1);
+    list.set_from_seq(2);
     list.set_limit(10);
     openevent::ListMessagesResponse list_response;
     status = core->ListMessages(list, &list_response);
     Check(status.ok(), status.message());
-    Check(list_response.messages_size() == 1 && list_response.messages(0).seq() == 1,
+    Check(list_response.messages_size() == 1 && list_response.messages(0).seq() == 2,
           "ListMessages should allow one message to exceed the soft response budget");
-    Check(list_response.next_seq() == 2,
+    Check(list_response.next_seq() == 3,
           "ListMessages must not consume a message deferred by byte budget");
 
     list.set_from_seq(list_response.next_seq());
     list_response.Clear();
     status = core->ListMessages(list, &list_response);
     Check(status.ok(), status.message());
-    Check(list_response.messages_size() == 1 && list_response.messages(0).seq() == 2,
+    Check(list_response.messages_size() == 1 && list_response.messages(0).seq() == 3,
           "ListMessages should return the deferred message on the next page");
-    Check(list_response.next_seq() == 3,
+    Check(list_response.next_seq() == 4,
           "ListMessages response-budget pagination should reach the tail");
 
     std::filesystem::remove_all(root);
@@ -1055,7 +1064,7 @@ void TestDeleteTokenOrdersBeforePublish()
     Check(!status.ok() && status.code() == grpc::StatusCode::UNAUTHENTICATED,
           "publish ordered after token deletion must be unauthenticated");
     auto max_seq = core->MaxSeq();
-    Check(max_seq.ok() && max_seq.value() == 0, "unauthenticated publish must not advance max_seq");
+    Check(max_seq.ok() && max_seq.value() == 1, "unauthenticated publish must not advance max_seq");
 
     std::filesystem::remove_all(root);
 }
@@ -1462,6 +1471,58 @@ void TestRpcStorageFailureTriggersFatalShutdown()
                                       "injected RocksDB availability failure"));
 }
 
+void TestFatalStorageDiagnostics()
+{
+    const std::string secrets = "credential-secret object-token-secret payload-secret\nforged log line";
+    const auto corruption = openevent::RocksToStatus(
+        rocksdb::Status::Corruption(secrets), "read credential");
+    const auto io_error = openevent::RocksToStatus(
+        rocksdb::Status::IOError(secrets), "commit storage batch");
+    Check(corruption.code() == grpc::StatusCode::DATA_LOSS &&
+              io_error.code() == grpc::StatusCode::UNAVAILABLE,
+          "safe diagnostics must preserve storage error codes");
+    Check(corruption.FatalLogMessage().find("operation=read credential; error=Corruption") !=
+              std::string::npos &&
+              io_error.FatalLogMessage().find("operation=commit storage batch; error=IO error") !=
+              std::string::npos,
+          "RocksDB diagnostics must retain the operation and underlying error category");
+    for (const auto& status : {corruption, io_error,
+                               openevent::Status::Fatal(grpc::StatusCode::UNAVAILABLE, secrets)}) {
+        const std::string line = status.FatalLogMessage();
+        Check(line.find("secret") == std::string::npos && line.find('\n') == std::string::npos,
+              "free-form storage errors must not leak credentials, payload or injected log lines");
+    }
+
+    const auto root = std::filesystem::temp_directory_path() / "openevent_fatal_diagnostics";
+    std::filesystem::remove_all(root);
+    std::atomic<int> fatal_calls{0};
+    std::ostringstream log;
+    auto core = MakeCore(root, 1024, 10000, 0, [&](const openevent::Status& status) {
+        ++fatal_calls;
+        log << status.FatalLogMessage() << '\n';
+    });
+    std::atomic<bool> start{false};
+    std::vector<std::thread> threads;
+    for (int index = 0; index < 16; ++index) {
+        threads.emplace_back([&]() {
+            while (!start.load(std::memory_order_acquire)) {
+                std::this_thread::yield();
+            }
+            Check(core->HandleRpcStatus(corruption).code() == grpc::StatusCode::DATA_LOSS,
+                  "concurrent fatal errors must retain their RPC result");
+        });
+    }
+    start.store(true, std::memory_order_release);
+    for (auto& thread : threads) {
+        thread.join();
+    }
+    core->HandleRpcStatus(io_error);
+    Check(fatal_calls == 1 && log.str() == corruption.FatalLogMessage() + '\n',
+          "only the first fatal error may produce a diagnostic, even under concurrency");
+    core.reset();
+    std::filesystem::remove_all(root);
+}
+
 void TestObjectWriteCrashRecoveryBoundaries()
 {
     struct CrashCase {
@@ -1804,13 +1865,13 @@ void TestTimedOutPublishDoesNotCommitAfterCoordinatorWait()
     }
     state->cv.notify_all();
     first.join();
-    Check(first_status.ok() && first_response.seq() == 1,
+    Check(first_status.ok() && first_response.seq() == 2,
           "the publish holding the coordinator must commit first");
 
     server->Shutdown();
     server->Wait();
     auto max_seq = core->MaxSeq();
-    Check(max_seq.ok() && max_seq.value() == 1,
+    Check(max_seq.ok() && max_seq.value() == 2,
           "a publish whose deadline expired while waiting for the coordinator must not commit");
     {
         std::lock_guard<std::mutex> lock(state->mutex);
@@ -2424,6 +2485,474 @@ void TestLoadServerConfigReadsRequiredPaths()
     std::filesystem::remove_all(root);
 }
 
+google::protobuf::Struct CheckChannelSystemMessage(
+    const openevent::EventMessage& message, const std::string& kind, uint64_t channel_id)
+{
+    Check(message.seq() > 0 && message.uuid() > 0 && message.principal() == 0 &&
+              message.channel_id() == channel_id && message.recipients().empty() &&
+              message.object_keys().empty(),
+          "channel system messages use ordinary seq/UUID and reserved sender with no recipients or objects");
+    google::protobuf::Struct envelope;
+    const auto parsed = google::protobuf::util::JsonStringToMessage(message.payload(), &envelope);
+    Check(parsed.ok(), "system payload must be valid JSON: " + parsed.ToString());
+    Check(envelope.fields().size() == 2 && envelope.fields().contains("kind") &&
+              envelope.fields().at("kind").string_value() == kind &&
+              envelope.fields().contains("data") &&
+              envelope.fields().at("data").kind_case() == google::protobuf::Value::kStructValue,
+          "system envelope must contain only kind and data");
+    const auto data = envelope.fields().at("data").struct_value();
+    Check(data.fields().contains("schema_version") &&
+              data.fields().at("schema_version").number_value() == 1,
+          "system schema_version must be numeric one");
+    return data;
+}
+
+void CheckJsonUint64(const std::string& json, const std::string& field, uint64_t value)
+{
+    Check(std::regex_search(json, std::regex("\"" + field + "\"\\s*:\\s*" +
+                                               std::to_string(value) + "\\s*[,}]")),
+          "system JSON must preserve the exact uint64 integer for " + field);
+}
+
+void TestChannelSystemMessages()
+{
+    const auto root = std::filesystem::temp_directory_path() / "openevent_channel_system_messages";
+    std::filesystem::remove_all(root);
+    // System metadata is not constrained by the business Publish payload limit.
+    auto core = MakeCore(root, 4);
+    const uint64_t owner = UINT64_C(9007199254740993);
+    const uint64_t member = std::numeric_limits<uint64_t>::max();
+    const auto token = AddToken(*core, owner);
+    const auto outsider_token = AddToken(*core, 200);
+    const auto before_uuid = AllocateUuid(*core);
+    Check(before_uuid == 1, "first client UUID allocation");
+
+    openevent::CreateChannelRequest create;
+    create.set_principal(owner);
+    create.set_token(token);
+    create.set_name("会话\"\\\n\t");
+    create.set_protocol("chat.\"v1\\");
+    create.set_description(std::string("详情\r\b\f\t\n\"\\") + char(0) + char(1));
+    create.set_visibility(openevent::VISIBILITY_PRIVATE);
+    create.add_members(member);
+    create.add_members(member);
+    create.add_members(owner);
+    const uint64_t before_ms = NowMs();
+    openevent::CreateChannelResponse created;
+    Check(core->CreateChannel(create, &created).ok(), "create channel with escaped metadata and uint64 members");
+    const uint64_t after_ms = NowMs();
+    const uint64_t channel = created.channel().channel_id();
+
+    openevent::FetchRequest fetch;
+    fetch.set_principal(owner);
+    fetch.set_token(token);
+    fetch.set_from_seq(1);
+    fetch.set_limit(100);
+    openevent::FetchResponse fetched;
+    Check(core->Fetch(fetch, &fetched).ok() && fetched.messages_size() == 1,
+          "creation writes exactly one event, without separate initial-member events");
+    const auto initialized = fetched.messages(0);
+    const auto data = CheckChannelSystemMessage(initialized, "system.channel_initialized", channel);
+    Check(initialized.seq() == 1 && initialized.uuid() == before_uuid + 1 &&
+              initialized.ts_ms() >= before_ms && initialized.ts_ms() <= after_ms,
+          "channel initialization has the next global seq/UUID and commit timestamp");
+    Check(data.fields().size() == 7 && data.fields().at("name").string_value() == create.name() &&
+              data.fields().at("protocol").string_value() == create.protocol() &&
+              data.fields().at("description").string_value() == create.description() &&
+              data.fields().at("visibility").string_value() == "private" &&
+              data.fields().at("members").list_value().values_size() == 2,
+          "initialization preserves every Channel attribute, escapes control characters, and deduplicates members");
+    CheckJsonUint64(initialized.payload(), "creator", owner);
+    for (const auto principal : {owner, member}) {
+        Check(std::regex_search(initialized.payload(), std::regex("[\\[,]\\s*" +
+                               std::to_string(principal) + "\\s*[,\\]]")),
+              "members remain exact JSON integers even above the double-precision range");
+    }
+    Check(AllocateUuid(*core) == initialized.uuid() + 1,
+          "client allocation after a system event must not reuse its UUID");
+    PublishAuto(*core, owner, token, channel, "chat");
+
+    openevent::AddMemberRequest add;
+    add.set_principal(owner);
+    add.set_token(token);
+    add.set_channel_id(channel);
+    add.set_target_principal(200);
+    openevent::AddMemberResponse added;
+    Check(core->AddMember(add, &added).ok(), "add member with an event");
+    openevent::RemoveMemberRequest remove;
+    remove.set_principal(owner);
+    remove.set_token(token);
+    remove.set_channel_id(channel);
+    remove.set_target_principal(member);
+    openevent::RemoveMemberResponse removed;
+    Check(core->RemoveMember(remove, &removed).ok(), "remove member with an event");
+    Check(core->Fetch(fetch, &fetched).ok() && fetched.messages_size() == 4 &&
+              fetched.messages(1).principal() == owner && fetched.messages(1).payload() == "chat",
+          "channel initialization is first, followed by business and membership events in commit order");
+    const auto added_data = CheckChannelSystemMessage(fetched.messages(2), "system.member_added", channel);
+    const auto removed_data = CheckChannelSystemMessage(fetched.messages(3), "system.member_removed", channel);
+    Check(added_data.fields().size() == 2 && removed_data.fields().size() == 2,
+          "member events contain only schema_version and member");
+    CheckJsonUint64(fetched.messages(2).payload(), "member", 200);
+    CheckJsonUint64(fetched.messages(3).payload(), "member", member);
+    Check(fetched.messages(2).uuid() == 5 && fetched.messages(3).uuid() == 6 &&
+              AllocateUuid(*core) == 7,
+          "client allocations, business messages, and member events share one UUID space");
+    for (const auto& message : fetched.messages()) {
+        openevent::GetSeqByUuidRequest lookup;
+        lookup.set_uuid(message.uuid());
+        openevent::GetSeqByUuidResponse found;
+        Check(core->GetSeqByUuid(lookup, &found).ok() && found.seq() == message.seq(),
+              "UUID lookup includes channel and membership system messages");
+    }
+
+    // Public/protected initialization is readable without membership and keeps its visibility name.
+    for (const auto visibility : {openevent::VISIBILITY_PUBLIC, openevent::VISIBILITY_PROTECTED}) {
+        const auto id = CreateChannel(*core, owner, token, visibility);
+        fetch.set_principal(200);
+        fetch.set_token(outsider_token);
+        fetch.clear_channels();
+        fetch.add_channels(id);
+        Check(core->Fetch(fetch, &fetched).ok() && fetched.messages_size() == 1,
+              "system events in readable public/protected channels do not require membership");
+        const auto visible_data = CheckChannelSystemMessage(fetched.messages(0), "system.channel_initialized", id);
+        Check(visible_data.fields().at("visibility").string_value() ==
+                  (visibility == openevent::VISIBILITY_PUBLIC ? "public" : "protected"),
+              "initialization encodes visibility as the documented string");
+    }
+    core.reset();
+    std::filesystem::remove_all(root);
+}
+
+void TestChannelSystemMessageAclAndNoOps()
+{
+    const auto root = std::filesystem::temp_directory_path() / "openevent_channel_system_acl";
+    std::filesystem::remove_all(root);
+    bool count_commits = false;
+    int commits = 0;
+    auto core = MakeCore(root, 1024, 10000, 0, {}, [&](openevent::StorageFaultPoint point) {
+        if (count_commits && point == openevent::StorageFaultPoint::kBeforeCommit) ++commits;
+        return openevent::Status::Ok();
+    });
+    const auto token = AddToken(*core, 100);
+    const auto member_token = AddToken(*core, 200);
+    const auto channel = CreateChannel(*core, 100, token, openevent::VISIBILITY_PRIVATE);
+    google::protobuf::RepeatedField<uint64_t> all_channels;
+    openevent::FetchResponse batch;
+    Check(core->FetchSubscriptionBatch(200, member_token, 1, 100, false, all_channels, &batch).ok() &&
+              batch.messages().empty() && batch.next_seq() == 2,
+          "all-channel subscription filters unreadable initialization while advancing its cursor");
+    openevent::AddMemberRequest add;
+    add.set_principal(100);
+    add.set_token(token);
+    add.set_channel_id(channel);
+    add.set_target_principal(200);
+    openevent::AddMemberResponse added;
+    Check(core->AddMember(add, &added).ok(), "add subscribing member");
+    Check(core->FetchSubscriptionBatch(200, member_token, 2, 100, false, all_channels, &batch).ok() &&
+              batch.messages_size() == 1 && batch.messages(0).seq() == 2,
+          "all-channel subscription discovers newly readable channels through their member event");
+    CheckChannelSystemMessage(batch.messages(0), "system.member_added", channel);
+    Check(core->FetchSubscriptionBatch(200, member_token, 1, 100, true, all_channels, &batch).ok() &&
+              batch.messages().empty() && batch.next_seq() == 3,
+          "recipient-only subscription filters channel and membership system events");
+
+    count_commits = true;
+    Check(core->AddMember(add, &added).code() == grpc::StatusCode::ALREADY_EXISTS,
+          "duplicate member addition is rejected");
+    add.set_target_principal(0);
+    Check(core->AddMember(add, &added).code() == grpc::StatusCode::INVALID_ARGUMENT,
+          "invalid member addition is rejected");
+    openevent::CreateChannelRequest invalid_create;
+    invalid_create.set_principal(100);
+    invalid_create.set_token(token);
+    openevent::CreateChannelResponse invalid_created;
+    Check(core->CreateChannel(invalid_create, &invalid_created).code() == grpc::StatusCode::INVALID_ARGUMENT,
+          "invalid channel creation is rejected");
+    openevent::RemoveMemberRequest remove;
+    remove.set_principal(100);
+    remove.set_token(token);
+    remove.set_channel_id(channel);
+    remove.set_target_principal(300);
+    openevent::RemoveMemberResponse removed;
+    Check(core->RemoveMember(remove, &removed).ok(), "removing an absent member is an idempotent success");
+    remove.set_target_principal(100);
+    Check(core->RemoveMember(remove, &removed).code() == grpc::StatusCode::PERMISSION_DENIED,
+          "removing the creator is rejected");
+    Check(commits == 0, "no-op and invalid channel mutations must not attempt a storage commit");
+    count_commits = false;
+    auto max_seq = core->MaxSeq();
+    Check(max_seq.ok() && max_seq.value() == 2 && AllocateUuid(*core) == 3,
+          "no-op and rejected channel mutations preserve message and UUID watermarks");
+
+    remove.set_target_principal(200);
+    Check(core->RemoveMember(remove, &removed).ok(), "remove subscribed private member");
+    Check(core->FetchSubscriptionBatch(200, member_token, 3, 100, false, all_channels, &batch).ok() &&
+              batch.messages().empty() && batch.next_seq() == 4,
+          "removed private member cannot read its own removal event through an all-channel subscription");
+    google::protobuf::RepeatedField<uint64_t> explicit_channels;
+    explicit_channels.Add(channel);
+    Check(core->FetchSubscriptionBatch(200, member_token, 3, 100, false, explicit_channels, &batch).code() ==
+              grpc::StatusCode::PERMISSION_DENIED,
+          "system removal does not bypass explicit private-channel ACL checks");
+    openevent::ListMessagesRequest list;
+    list.set_from_seq(1);
+    list.set_limit(100);
+    openevent::ListMessagesResponse listed;
+    Check(core->ListMessages(list, &listed).ok() && listed.messages_size() == 3,
+          "administrative listing includes private initialization and both real member events");
+    CheckChannelSystemMessage(listed.messages(2), "system.member_removed", channel);
+    openevent::CreateChannelRequest next_channel;
+    next_channel.set_principal(100);
+    next_channel.set_token(token);
+    next_channel.set_name("new-conversation");
+    next_channel.set_protocol("chat.v1");
+    next_channel.set_visibility(openevent::VISIBILITY_PRIVATE);
+    next_channel.add_members(200);
+    openevent::CreateChannelResponse next_created;
+    Check(core->CreateChannel(next_channel, &next_created).ok() && next_created.channel().channel_id() == 2,
+          "rejected creation must not consume a channel ID");
+    Check(core->FetchSubscriptionBatch(200, member_token, 4, 100, false, all_channels, &batch).ok() &&
+              batch.messages_size() == 1 && batch.messages(0).channel_id() == 2,
+          "existing all-channel subscription discovers a newly created private channel with initial membership");
+    CheckChannelSystemMessage(batch.messages(0), "system.channel_initialized", 2);
+    core.reset();
+    std::filesystem::remove_all(root);
+}
+
+void TestChannelMemberLimits()
+{
+    const auto root = std::filesystem::temp_directory_path() / "openevent_channel_member_limits";
+    std::filesystem::remove_all(root);
+    bool count_commits = false;
+    int commits = 0;
+    auto core = MakeCore(root, 1024, 10000, 0, {}, [&](openevent::StorageFaultPoint point) {
+        if (count_commits && point == openevent::StorageFaultPoint::kBeforeCommit) ++commits;
+        return openevent::Status::Ok();
+    });
+    const auto token = AddToken(*core, 100);
+    openevent::CreateChannelRequest create;
+    create.set_principal(100);
+    create.set_token(token);
+    create.set_name("bounded-members");
+    create.set_visibility(openevent::VISIBILITY_PRIVATE);
+    for (uint64_t member = 2000; member < 3024; ++member) create.add_members(member);
+    openevent::CreateChannelResponse created;
+
+    count_commits = true;
+    Check(core->CreateChannel(create, &created).code() == grpc::StatusCode::RESOURCE_EXHAUSTED,
+          "1024 distinct requested members plus an absent creator exceed the total member limit");
+    create.clear_members();
+    for (int index = 0; index < 1025; ++index) create.add_members(100);
+    Check(core->CreateChannel(create, &created).code() == grpc::StatusCode::INVALID_ARGUMENT,
+          "the 1024-item request shape limit applies before deduplicating members");
+    const auto empty_seq = core->MaxSeq();
+    Check(commits == 0 && empty_seq.ok() && empty_seq.value() == 0,
+          "rejected creations must not commit metadata or system events");
+    count_commits = false;
+
+    create.clear_members();
+    for (uint64_t member = 2000; member < 3023; ++member) create.add_members(member);
+    Check(core->CreateChannel(create, &created).ok() &&
+              created.channel().channel_id() == 1 && created.channel().members_size() == 1024 &&
+              std::count(created.channel().members().begin(), created.channel().members().end(), 100) == 1,
+          "1023 requested members plus the creator fill a channel without consuming rejected channel IDs");
+
+    create.add_members(100);
+    Check(core->CreateChannel(create, &created).ok() &&
+              created.channel().channel_id() == 2 && created.channel().members_size() == 1024 &&
+              std::count(created.channel().members().begin(), created.channel().members().end(), 100) == 1,
+          "1024 requested members including the creator fit without counting the creator twice");
+
+    create.clear_members();
+    for (uint64_t member = 2000; member < 3022; ++member) create.add_members(member);
+    create.add_members(2000);
+    create.add_members(2000);
+    Check(core->CreateChannel(create, &created).ok() &&
+              created.channel().channel_id() == 3 && created.channel().members_size() == 1023,
+          "deduplicating a 1024-item request leaves room for one additional member");
+    const auto channel_id = created.channel().channel_id();
+
+    openevent::AddMemberRequest add;
+    add.set_principal(100);
+    add.set_token(token);
+    add.set_channel_id(channel_id);
+    add.set_target_principal(4000);
+    openevent::AddMemberResponse added;
+    Check(core->AddMember(add, &added).ok(), "adding the 1024th total member succeeds");
+
+    openevent::GetChannelRequest get;
+    get.set_principal(100);
+    get.set_token(token);
+    get.set_channel_id(channel_id);
+    openevent::GetChannelResponse channel;
+    Check(core->GetChannel(get, &channel).ok() && channel.channel().members_size() == 1024,
+          "the full channel remains readable with all 1024 members");
+    const auto full_channel = channel.channel().SerializeAsString();
+    Check(AllocateUuid(*core) == 5, "only three creations and the successful addition consumed system UUIDs");
+
+    count_commits = true;
+    add.set_target_principal(4001);
+    Check(core->AddMember(add, &added).code() == grpc::StatusCode::RESOURCE_EXHAUSTED,
+          "adding the 1025th total member is rejected");
+    add.set_target_principal(4000);
+    Check(core->AddMember(add, &added).code() == grpc::StatusCode::ALREADY_EXISTS,
+          "an existing member takes precedence over the full-channel error");
+    add.set_target_principal(100);
+    Check(core->AddMember(add, &added).code() == grpc::StatusCode::ALREADY_EXISTS,
+          "the creator is also an existing member when the channel is full");
+    const auto unchanged_seq = core->MaxSeq();
+    Check(commits == 0 && unchanged_seq.ok() && unchanged_seq.value() == 4 &&
+              core->GetChannel(get, &channel).ok() && channel.channel().SerializeAsString() == full_channel,
+          "rejected additions preserve channel state and do not attempt any event or watermark commit");
+    count_commits = false;
+    Check(AllocateUuid(*core) == 6, "rejected additions do not consume UUIDs");
+
+    openevent::RemoveMemberRequest remove;
+    remove.set_principal(100);
+    remove.set_token(token);
+    remove.set_channel_id(channel_id);
+    remove.set_target_principal(2000);
+    openevent::RemoveMemberResponse removed;
+    Check(core->RemoveMember(remove, &removed).ok(), "removing a member frees a slot");
+    add.set_target_principal(4001);
+    Check(core->AddMember(add, &added).ok(), "a previously rejected member can use the freed slot");
+    Check(core->GetChannel(get, &channel).ok() && channel.channel().members_size() == 1024 &&
+              std::count(channel.channel().members().begin(), channel.channel().members().end(), 2000) == 0 &&
+              std::count(channel.channel().members().begin(), channel.channel().members().end(), 4001) == 1,
+          "the replacement leaves exactly 1024 distinct members");
+    create.clear_members();
+    Check(core->CreateChannel(create, &created).ok() && created.channel().channel_id() == 4,
+          "rejected member mutations do not advance the channel ID watermark");
+
+    openevent::ListMessagesRequest list;
+    list.set_from_seq(1);
+    list.set_limit(100);
+    openevent::ListMessagesResponse listed;
+    Check(core->ListMessages(list, &listed).ok() && listed.messages_size() == 7 && listed.last_seq() == 7,
+          "only successful channel mutations write system events and advance max_seq");
+    const std::vector<uint64_t> expected_uuids{1, 2, 3, 4, 7, 8, 9};
+    for (int index = 0; index < listed.messages_size(); ++index) {
+        Check(listed.messages(index).seq() == static_cast<uint64_t>(index + 1) &&
+                  listed.messages(index).uuid() == expected_uuids[index],
+              "rejected member changes leave no message or UUID allocation gaps");
+    }
+    CheckChannelSystemMessage(listed.messages(3), "system.member_added", channel_id);
+    CheckChannelSystemMessage(listed.messages(4), "system.member_removed", channel_id);
+    CheckChannelSystemMessage(listed.messages(5), "system.member_added", channel_id);
+    core.reset();
+    std::filesystem::remove_all(root);
+}
+
+void TestChannelSystemMessageCrashRecovery()
+{
+    using Point = openevent::StorageFaultPoint;
+    for (const auto operation : {std::string("create"), std::string("add"), std::string("remove")}) {
+        for (const auto point : {Point::kBeforeCommit, Point::kAfterCommit}) {
+            const auto root = std::filesystem::temp_directory_path() /
+                ("openevent_channel_crash_" + operation + "_" + std::to_string(static_cast<int>(point)));
+            std::filesystem::remove_all(root);
+            std::string token;
+            uint64_t last_client_uuid = 0;
+            {
+                auto core = MakeCore(root);
+                token = AddToken(*core, 100);
+                if (operation != "create") {
+                    openevent::CreateChannelRequest create;
+                    create.set_principal(100);
+                    create.set_token(token);
+                    create.set_name("existing");
+                    create.set_visibility(openevent::VISIBILITY_PRIVATE);
+                    if (operation == "remove") create.add_members(200);
+                    openevent::CreateChannelResponse response;
+                    Check(core->CreateChannel(create, &response).ok(), "prepare channel crash test");
+                }
+                last_client_uuid = AllocateUuid(*core);
+            }
+            const auto child = ::fork();
+            Check(child >= 0, "fork channel mutation crash test");
+            if (child == 0) {
+                auto core = MakeCore(root, 1024, 10000, 0, {}, [point](Point observed) {
+                    if (observed == point) ::_exit(73);
+                    return openevent::Status::Ok();
+                });
+                if (operation == "create") {
+                    CreateChannel(*core, 100, token, openevent::VISIBILITY_PRIVATE);
+                } else if (operation == "add") {
+                    openevent::AddMemberRequest request;
+                    request.set_principal(100);
+                    request.set_token(token);
+                    request.set_channel_id(1);
+                    request.set_target_principal(200);
+                    openevent::AddMemberResponse response;
+                    core->AddMember(request, &response);
+                } else {
+                    openevent::RemoveMemberRequest request;
+                    request.set_principal(100);
+                    request.set_token(token);
+                    request.set_channel_id(1);
+                    request.set_target_principal(200);
+                    openevent::RemoveMemberResponse response;
+                    core->RemoveMember(request, &response);
+                }
+                ::_exit(74);
+            }
+            int result = 0;
+            Check(::waitpid(child, &result, 0) == child && WIFEXITED(result) && WEXITSTATUS(result) == 73,
+                  "channel mutation must crash at the requested commit boundary");
+            const bool committed = point == Point::kAfterCommit;
+            const uint64_t old_seq = operation == "create" ? 0 : 1;
+            std::string persisted_event;
+            for (int reopen = 0; reopen < 2; ++reopen) {
+                auto storage = openevent::UnifiedStorage::Open((root / "data").string());
+                Check(storage.ok(), storage.status().message());
+                auto snapshot = storage.value()->CreateSnapshot();
+                Check(snapshot.ok(), snapshot.status().message());
+                const auto max_seq = storage.value()->GetMaxSeq(snapshot.value());
+                const auto next_uuid = storage.value()->GetNextUuid(snapshot.value());
+                const auto next_channel = storage.value()->GetNextChannelId(snapshot.value());
+                const auto used_uuid = storage.value()->GetUsedUuidSeq(snapshot.value(), last_client_uuid + 1);
+                const auto channel = storage.value()->GetChannel(snapshot.value(), 1);
+                Check(max_seq.ok() && max_seq.value() == old_seq + committed &&
+                          next_uuid.ok() && next_uuid.value() == last_client_uuid + 1 + committed &&
+                          next_channel.ok() && next_channel.value() ==
+                              (operation == "create" && !committed ? 1 : 2),
+                      "channel, message, and UUID allocation watermarks recover as one atomic batch");
+                Check(used_uuid.ok() && used_uuid.value().has_value() == committed &&
+                          (!committed || used_uuid.value().value() == old_seq + 1),
+                      "system message UUID index commits with channel state");
+                const bool exists = operation != "create" || committed;
+                Check(channel.ok() && channel.value().has_value() == exists,
+                      "channel creation must recover together with its initialization event");
+                if (exists) {
+                    const auto& members = channel.value()->members();
+                    const bool has_member = std::find(members.begin(), members.end(), 200) != members.end();
+                    const bool expected_member = operation == "add" ? committed :
+                                                 operation == "remove" ? !committed : false;
+                    Check(has_member == expected_member, "membership recovers on the same side of the commit as its event");
+                }
+                uint64_t messages = 0;
+                auto scan = storage.value()->ScanMessages(snapshot.value(), 0, max_seq.value(), 100,
+                    [&](const openevent::EventMessage& message) -> openevent::Result<openevent::MessageScanAction> {
+                        ++messages;
+                        if (committed && message.seq() == old_seq + 1) {
+                            CheckChannelSystemMessage(message, operation == "create" ? "system.channel_initialized" :
+                                operation == "add" ? "system.member_added" : "system.member_removed", 1);
+                            Check(message.uuid() == last_client_uuid + 1, "recovered event uses its committed UUID");
+                            if (reopen == 0) persisted_event = message.SerializeAsString();
+                            else Check(message.SerializeAsString() == persisted_event,
+                                       "restart must not regenerate the event or its timestamp");
+                        }
+                        return openevent::MessageScanAction::kContinue;
+                    });
+                Check(scan.ok() && messages == max_seq.value() + 1,
+                      "recovered log has every committed event exactly once and no partial mutation event");
+            }
+            std::filesystem::remove_all(root);
+        }
+    }
+}
+
 void TestSystemChannelShape()
 {
     const auto root = std::filesystem::temp_directory_path() / "openevent_core_system_channel";
@@ -2536,7 +3065,7 @@ void TestMessageCommitFailureAndRestart()
         core.reset();
         core = MakeCore(root);
         auto max_seq = core->MaxSeq();
-        Check(max_seq.ok() && max_seq.value() == (point == Point::kAfterCommit ? 1 : 0),
+        Check(max_seq.ok() && max_seq.value() == (point == Point::kAfterCommit ? 2 : 1),
               "restored state decides whether the failed write persisted");
         status = core->PublishAutoSeq(request, &response);
         Check(point == Point::kAfterCommit ? status.code() == grpc::StatusCode::ALREADY_EXISTS : status.ok(),
@@ -2544,7 +3073,7 @@ void TestMessageCommitFailureAndRestart()
         openevent::GetSeqByUuidRequest lookup;
         lookup.set_uuid(uuid);
         openevent::GetSeqByUuidResponse found;
-        Check(core->GetSeqByUuid(lookup, &found).ok() && found.seq() == 1,
+        Check(core->GetSeqByUuid(lookup, &found).ok() && found.seq() == 2,
               "the retried logical message must have one committed seq");
         core.reset();
         std::filesystem::remove_all(root);
@@ -2583,7 +3112,7 @@ void TestSystemMessagePersistenceAndValidation()
     request.set_principal(100);
     request.set_token(token);
     openevent::GetStatusResponse status;
-    Check(core->GetStatus(request, &status).ok() && status.max_seq() == 1,
+    Check(core->GetStatus(request, &status).ok() && status.max_seq() == 2,
           "status preserves the latest business message sequence after restart");
     core.reset();
 
@@ -2645,6 +3174,7 @@ int main()
     TestMessageObjectReferences();
     TestObjectWriteInjectedFailures();
     TestRpcStorageFailureTriggersFatalShutdown();
+    TestFatalStorageDiagnostics();
     TestObjectWriteCrashRecoveryBoundaries();
     TestConcurrentObjectWritesCanCommitOutOfIdOrder();
     TestObjectWriteReauthenticatesBeforeCommit();
@@ -2667,6 +3197,10 @@ int main()
     TestLoadServerConfigRequiresExistingFile();
     TestLoadServerConfigReadsRequiredPaths();
     TestSystemChannelShape();
+    TestChannelSystemMessages();
+    TestChannelSystemMessageAclAndNoOps();
+    TestChannelMemberLimits();
+    TestChannelSystemMessageCrashRecovery();
     TestInitializationCommitBoundary();
     TestMessageCommitFailureAndRestart();
     TestSystemMessagePersistenceAndValidation();

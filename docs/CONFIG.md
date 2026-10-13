@@ -92,3 +92,5 @@ are defined in the [security policy](../SECURITY.md#deployment-security-notes).
   `fsync`, and non-overwriting atomic `renameat2(RENAME_NOREPLACE)`.
 - Before backup or restore, wait for the server process to exit completely.
   Keep it stopped throughout the operation and handle the entire data directory as one unit.
+  When restoring an older backup, follow the
+  [API's data history boundary](https://github.com/openevent-official/openevent-sdk/blob/main/docs/API.md#12-data-history-and-backup-restoration).

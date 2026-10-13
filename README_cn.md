@@ -78,4 +78,4 @@ make install PREFIX=/opt/openevent BUILD_TYPE=Release
 
 ## 项目状态
 
-服务端和 SDK 使用 `0.11.1` 配套版本。
+服务端和 SDK 使用 `0.12.0` 配套版本。

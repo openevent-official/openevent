@@ -2,8 +2,10 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstring>
 #include <filesystem>
+#include <limits>
 #include <memory>
 #include <set>
 #include <utility>
@@ -18,6 +20,7 @@
 #include "object_record.pb.h"
 #include "common/object_limits.h"
 #include "storage/encoding.h"
+#include "storage/rocksdb_status.h"
 
 namespace openevent {
 namespace {
@@ -74,6 +77,67 @@ bool ValidInitializationMessage(const EventMessage& message)
            !fields.contains("principal") && !fields.contains("uuid");
 }
 
+bool ValidChannelSystemMessage(const EventMessage& message)
+{
+    if (!message.recipients().empty() || !message.object_keys().empty()) {
+        return false;
+    }
+    google::protobuf::Struct payload;
+    if (!google::protobuf::util::JsonStringToMessage(message.payload(), &payload).ok()) {
+        return false;
+    }
+    const auto& fields = payload.fields();
+    const auto kind = fields.find("kind");
+    const auto data = fields.find("data");
+    if (kind == fields.end() || kind->second.kind_case() != google::protobuf::Value::kStringValue ||
+        data == fields.end() || data->second.kind_case() != google::protobuf::Value::kStructValue ||
+        fields.contains("seq") || fields.contains("channel_id") || fields.contains("principal") ||
+        fields.contains("uuid") || fields.contains("ts_ms")) {
+        return false;
+    }
+    const auto& data_fields = data->second.struct_value().fields();
+    const auto schema = data_fields.find("schema_version");
+    if (schema == data_fields.end() ||
+        schema->second.kind_case() != google::protobuf::Value::kNumberValue ||
+        schema->second.number_value() != 1) {
+        return false;
+    }
+    // Struct is used only to validate the JSON shape; the original payload is
+    // returned unchanged, preserving uint64 principals above double precision.
+    const auto is_principal = [](const google::protobuf::Value& value) {
+        return value.kind_case() == google::protobuf::Value::kNumberValue &&
+               value.number_value() > 0 && std::floor(value.number_value()) == value.number_value() &&
+               value.number_value() <= static_cast<double>(std::numeric_limits<uint64_t>::max());
+    };
+    if (kind->second.string_value() == "system.member_added" ||
+        kind->second.string_value() == "system.member_removed") {
+        const auto member = data_fields.find("member");
+        return member != data_fields.end() && is_principal(member->second);
+    }
+    if (kind->second.string_value() != "system.channel_initialized") {
+        return false;
+    }
+    for (const char* field : {"name", "protocol", "description", "visibility"}) {
+        const auto value = data_fields.find(field);
+        if (value == data_fields.end() ||
+            value->second.kind_case() != google::protobuf::Value::kStringValue) {
+            return false;
+        }
+    }
+    const auto& visibility = data_fields.at("visibility").string_value();
+    if (visibility != "public" && visibility != "protected" && visibility != "private") {
+        return false;
+    }
+    const auto creator = data_fields.find("creator");
+    const auto members = data_fields.find("members");
+    return creator != data_fields.end() && is_principal(creator->second) &&
+           members != data_fields.end() &&
+           members->second.kind_case() == google::protobuf::Value::kListValue &&
+           !members->second.list_value().values().empty() &&
+           std::all_of(members->second.list_value().values().begin(),
+                       members->second.list_value().values().end(), is_principal);
+}
+
 std::filesystem::path DatabasePath(const std::string& root_path)
 {
     return std::filesystem::path(root_path) / "db";
@@ -82,17 +146,6 @@ std::filesystem::path DatabasePath(const std::string& root_path)
 std::filesystem::path ObjectsPath(const std::string& root_path)
 {
     return std::filesystem::path(root_path) / "objects";
-}
-
-Status RocksToStatus(const rocksdb::Status& status, const std::string& prefix)
-{
-    if (status.ok()) {
-        return Status::Ok();
-    }
-    if (status.IsCorruption()) {
-        return Status::Fatal(grpc::StatusCode::DATA_LOSS, prefix + ": " + status.ToString());
-    }
-    return Status::Fatal(grpc::StatusCode::UNAVAILABLE, prefix + ": " + status.ToString());
 }
 
 rocksdb::WriteOptions SynchronousWriteOptions()
@@ -116,7 +169,7 @@ std::string TokenKey(uint64_t principal, const std::string& token)
 Result<uint64_t> DecodeRequiredUint64(const std::string& value, const std::string& description)
 {
     if (value.size() != sizeof(uint64_t)) {
-        return Status(grpc::StatusCode::DATA_LOSS, "invalid " + description + " encoding");
+        return Status::StorageCorruption("decode " + description, "invalid " + description + " encoding");
     }
     return DecodeUint64(value);
 }
@@ -126,7 +179,7 @@ Result<uint64_t> DecodeNumericKey(const rocksdb::Slice& key, const char* prefix,
     const size_t prefix_size = std::strlen(prefix);
     if (key.size() != prefix_size + sizeof(uint64_t) ||
         std::memcmp(key.data(), prefix, prefix_size) != 0) {
-        return Status(grpc::StatusCode::DATA_LOSS, "invalid " + description + " key");
+        return Status::StorageCorruption("decode " + description, "invalid " + description + " key");
     }
     return DecodeUint64(std::string(key.data() + prefix_size, sizeof(uint64_t)));
 }
@@ -321,7 +374,7 @@ Result<StoredObject> ParseObject(const std::string& payload, uint64_t expected_i
         record.type().size() > kMaxObjectTypeBytes ||
         record.description().size() > kMaxObjectDescriptionBytes || record.nbytes() == 0 ||
         record.nbytes() > kMaxObjectBytes) {
-        return Status(grpc::StatusCode::DATA_LOSS, "invalid stored object metadata");
+        return Status::StorageCorruption("decode object metadata", "invalid stored object metadata");
     }
     StoredObject object;
     object.object_id = record.object_id();
@@ -561,7 +614,8 @@ Result<ReadSnapshot> UnifiedStorage::CreateSnapshot() const
 {
     const rocksdb::Snapshot* snapshot = db_->GetSnapshot();
     if (snapshot == nullptr) {
-        return Status::Fatal(grpc::StatusCode::UNAVAILABLE, "create storage snapshot failed");
+        return Status::Fatal(grpc::StatusCode::UNAVAILABLE, "create storage snapshot failed")
+            .WithStorageDiagnostic("create storage snapshot", "RocksDB returned no snapshot");
     }
     return ReadSnapshot(this, snapshot);
 }
@@ -575,14 +629,16 @@ Status UnifiedStorage::Commit(rocksdb::WriteBatch* batch)
 {
     Status injected = InjectStorageFault(fault_injector_, StorageFaultPoint::kBeforeCommit);
     if (!injected.ok()) {
-        return Status::Fatal(injected.code(), injected.message());
+        return Status::Fatal(injected.code(), injected.message())
+            .WithStorageDiagnostic("commit storage batch", "injected failure before write");
     }
     Status status = RocksToStatus(db_->Write(SynchronousWriteOptions(), batch), "commit storage batch");
     if (!status.ok()) {
         return status;
     }
     injected = InjectStorageFault(fault_injector_, StorageFaultPoint::kAfterCommit);
-    return injected.ok() ? injected : Status::Fatal(injected.code(), injected.message());
+    return injected.ok() ? injected : Status::Fatal(injected.code(), injected.message())
+        .WithStorageDiagnostic("commit storage batch", "injected failure after write");
 }
 
 Result<uint64_t> UnifiedStorage::GetRequiredUint64(const ReadSnapshot& snapshot, const std::string& key) const
@@ -592,7 +648,7 @@ Result<uint64_t> UnifiedStorage::GetRequiredUint64(const ReadSnapshot& snapshot,
     std::string value;
     rocksdb::Status status = db_->Get(options, meta_, key, &value);
     if (status.IsNotFound()) {
-        return Status(grpc::StatusCode::DATA_LOSS, "missing required storage key: " + key);
+        return Status::StorageCorruption("read " + key, "missing required storage key: " + key);
     }
     if (!status.ok()) {
         return RocksToStatus(status, "read " + key);
@@ -628,7 +684,7 @@ Result<std::optional<uint64_t>> UnifiedStorage::GetUsedUuidSeq(const ReadSnapsho
         return seq.status();
     }
     if ((uuid == 0) != (seq.value() == 0)) {
-        return Status(grpc::StatusCode::DATA_LOSS, "invalid stored UUID mapping");
+        return Status::StorageCorruption("read used uuid", "invalid stored UUID mapping");
     }
     return std::optional<uint64_t>{seq.value()};
 }
@@ -657,7 +713,7 @@ Result<bool> UnifiedStorage::HasToken(const ReadSnapshot& snapshot, uint64_t pri
         return RocksToStatus(status, "read credential");
     }
     if (!value.empty()) {
-        return Status(grpc::StatusCode::DATA_LOSS, "invalid stored credential");
+        return Status::StorageCorruption("read credential", "invalid stored credential");
     }
     return true;
 }
@@ -676,7 +732,7 @@ Result<std::optional<ChannelInfo>> UnifiedStorage::GetChannel(const ReadSnapshot
     }
     ChannelInfo channel;
     if (!channel.ParseFromString(value) || channel.channel_id() != channel_id || !ValidStoredChannel(channel)) {
-        return Status(grpc::StatusCode::DATA_LOSS, "invalid stored channel");
+        return Status::StorageCorruption("read channel", "invalid stored channel");
     }
     return std::optional<ChannelInfo>{std::move(channel)};
 }
@@ -695,7 +751,7 @@ Result<std::vector<ChannelInfo>> UnifiedStorage::ListChannels(const ReadSnapshot
         ChannelInfo channel;
         if (!channel.ParseFromString(it->value().ToString()) || channel.channel_id() != channel_id.value() ||
             !ValidStoredChannel(channel)) {
-            return Status(grpc::StatusCode::DATA_LOSS, "invalid stored channel");
+            return Status::StorageCorruption("list channels", "invalid stored channel");
         }
         channels.push_back(std::move(channel));
     }
@@ -727,7 +783,7 @@ Result<uint64_t> UnifiedStorage::ScanMessages(const ReadSnapshot& snapshot,
             break;
         }
         if (seq.value() != next_seq) {
-            return Status(grpc::StatusCode::DATA_LOSS,
+            return Status::StorageCorruption("scan messages",
                           "missing stored message at seq " + std::to_string(next_seq));
         }
         if (scanned >= max_records) {
@@ -736,14 +792,15 @@ Result<uint64_t> UnifiedStorage::ScanMessages(const ReadSnapshot& snapshot,
 
         EventMessage message;
         if (!message.ParseFromString(it->value().ToString()) || message.seq() != seq.value()) {
-            return Status(grpc::StatusCode::DATA_LOSS, "invalid stored message");
+            return Status::StorageCorruption("scan messages", "invalid stored message");
         }
         if (seq.value() == 0 ? !ValidInitializationMessage(message)
-                             : (message.uuid() == 0 || message.principal() == 0 ||
+                             : (message.uuid() == 0 ||
                                 message.channel_id() == 0 ||
+                                (message.principal() == 0 && !ValidChannelSystemMessage(message)) ||
                                 std::find(message.recipients().begin(), message.recipients().end(), 0) !=
                                     message.recipients().end())) {
-            return Status(grpc::StatusCode::DATA_LOSS, "invalid stored message reserved fields");
+            return Status::StorageCorruption("scan messages", "invalid stored message reserved fields");
         }
         if (message.object_keys_size() > static_cast<int>(kMaxObjectKeys) ||
             std::any_of(message.object_keys().begin(),
@@ -752,7 +809,7 @@ Result<uint64_t> UnifiedStorage::ScanMessages(const ReadSnapshot& snapshot,
                             return object_key.object_id() == 0 ||
                                    !IsBase64UrlToken(object_key.object_token());
                         })) {
-            return Status(grpc::StatusCode::DATA_LOSS, "invalid stored message object reference");
+            return Status::StorageCorruption("scan messages", "invalid stored message object reference");
         }
         auto action = visitor(message);
         if (!action.ok()) {
@@ -773,7 +830,7 @@ Result<uint64_t> UnifiedStorage::ScanMessages(const ReadSnapshot& snapshot,
     if (scanned < max_records && next_seq <= last_seq &&
         (!it->Valid() || !it->key().starts_with(kMessagePrefix) ||
          DecodeUint64(it->key().ToString().substr(std::strlen(kMessagePrefix))) > last_seq)) {
-        return Status(grpc::StatusCode::DATA_LOSS,
+        return Status::StorageCorruption("scan messages",
                       "missing stored message at seq " + std::to_string(next_seq));
     }
     return next_seq;
@@ -1012,7 +1069,7 @@ Status UnifiedStorage::RecoverPreparingObjects()
                 return committed.status();
             }
             if (committed.value().has_value()) {
-                return Status(grpc::StatusCode::DATA_LOSS,
+                return Status::StorageCorruption("recover preparing objects",
                               "object ID has both PREPARING and COMMITTED metadata");
             }
         }
@@ -1048,7 +1105,7 @@ Status UnifiedStorage::Validate() const
         return schema.status();
     }
     if (schema.value() != kSchemaVersion) {
-        return Status(grpc::StatusCode::DATA_LOSS, "unsupported storage schema version");
+        return Status::StorageCorruption("validate storage", "unsupported storage schema version");
     }
     auto max_seq = GetMaxSeq(snapshot);
     if (!max_seq.ok()) {
@@ -1057,40 +1114,40 @@ Status UnifiedStorage::Validate() const
     auto next_uuid = GetNextUuid(snapshot);
     if (!next_uuid.ok() || next_uuid.value() == 0) {
         return next_uuid.ok()
-                   ? Status(grpc::StatusCode::DATA_LOSS, "invalid next uuid")
+                   ? Status::StorageCorruption("validate storage", "invalid next uuid")
                    : next_uuid.status();
     }
     auto next_channel_id = GetNextChannelId(snapshot);
     if (!next_channel_id.ok() || next_channel_id.value() == 0) {
         return next_channel_id.ok()
-                   ? Status(grpc::StatusCode::DATA_LOSS, "invalid next channel ID")
+                   ? Status::StorageCorruption("validate storage", "invalid next channel ID")
                    : next_channel_id.status();
     }
     auto next_object_id = GetNextObjectId(snapshot);
     if (!next_object_id.ok() || next_object_id.value() == 0) {
         return next_object_id.ok()
-                   ? Status(grpc::StatusCode::DATA_LOSS, "invalid next object ID")
+                   ? Status::StorageCorruption("validate storage", "invalid next object ID")
                    : next_object_id.status();
     }
 
     std::string encoded_message;
     const auto message_status = db_->Get(options, messages_, NumericKey(kMessagePrefix, 0), &encoded_message);
     if (message_status.IsNotFound()) {
-        return Status(grpc::StatusCode::DATA_LOSS, "missing system initialization message");
+        return Status::StorageCorruption("validate storage", "missing system initialization message");
     }
     if (!message_status.ok()) {
         return RocksToStatus(message_status, "read system initialization message");
     }
     EventMessage message;
     if (!message.ParseFromString(encoded_message) || !ValidInitializationMessage(message)) {
-        return Status(grpc::StatusCode::DATA_LOSS, "invalid system initialization message");
+        return Status::StorageCorruption("validate storage", "invalid system initialization message");
     }
     auto system_seq = GetUsedUuidSeq(snapshot, 0);
     if (!system_seq.ok()) {
         return system_seq.status();
     }
     if (!system_seq.value().has_value() || system_seq.value().value() != 0) {
-        return Status(grpc::StatusCode::DATA_LOSS, "missing or conflicting system UUID mapping");
+        return Status::StorageCorruption("validate storage", "missing or conflicting system UUID mapping");
     }
 
     return Status::Ok();

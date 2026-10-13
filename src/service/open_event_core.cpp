@@ -21,6 +21,7 @@ namespace openevent {
 namespace {
 
 constexpr uint32_t kMaxUuidBatch = 1024;
+constexpr int kMaxChannelMembers = 1024;
 
 uint64_t NowMs()
 {
@@ -112,6 +113,51 @@ template <typename Repeated>
 bool Contains(const Repeated& values, uint64_t value)
 {
     return std::find(values.begin(), values.end(), value) != values.end();
+}
+
+std::string JsonString(const std::string& value)
+{
+    constexpr char kHex[] = "0123456789abcdef";
+    std::string encoded = "\"";
+    for (unsigned char ch : value) {
+        if (ch == '"' || ch == '\\') {
+            encoded.push_back('\\');
+            encoded.push_back(static_cast<char>(ch));
+        } else if (ch < 0x20) {
+            encoded += "\\u00";
+            encoded.push_back(kHex[ch >> 4]);
+            encoded.push_back(kHex[ch & 0x0f]);
+        } else {
+            encoded.push_back(static_cast<char>(ch));
+        }
+    }
+    encoded.push_back('"');
+    return encoded;
+}
+
+std::string ChannelInitializedPayload(const ChannelInfo& channel)
+{
+    const char* visibility = channel.visibility() == VISIBILITY_PRIVATE ? "private" :
+                             channel.visibility() == VISIBILITY_PROTECTED ? "protected" : "public";
+    std::string payload =
+        R"({"kind":"system.channel_initialized","data":{"schema_version":1,"name":)" +
+        JsonString(channel.name()) + R"(,"protocol":)" + JsonString(channel.protocol()) +
+        R"(,"description":)" + JsonString(channel.description()) + R"(,"visibility":")" +
+        visibility + R"(","creator":)" + std::to_string(channel.creator()) + R"(,"members":[)";
+    for (int index = 0; index < channel.members_size(); ++index) {
+        if (index != 0) {
+            payload.push_back(',');
+        }
+        payload += std::to_string(channel.members(index));
+    }
+    payload += "]}}";
+    return payload;
+}
+
+std::string MemberChangedPayload(const char* kind, uint64_t member)
+{
+    return std::string(R"({"kind":")") + kind +
+           R"(","data":{"schema_version":1,"member":)" + std::to_string(member) + "}}";
 }
 
 }  // namespace
@@ -496,6 +542,47 @@ Status OpenEventCore::CommitBatch(rocksdb::WriteBatch* batch)
     return status;
 }
 
+Status OpenEventCore::BuildChannelMutationBatch(const ReadSnapshot& snapshot,
+                                                 const ChannelInfo& channel,
+                                                 const std::string& payload,
+                                                 rocksdb::WriteBatch* batch) const
+{
+    auto max_seq = storage_->GetMaxSeq(snapshot);
+    if (!max_seq.ok()) {
+        return max_seq.status();
+    }
+    auto next_uuid = storage_->GetNextUuid(snapshot);
+    if (!next_uuid.ok()) {
+        return next_uuid.status();
+    }
+
+    EventMessage message;
+    message.set_seq(max_seq.value() + 1);
+    message.set_channel_id(channel.channel_id());
+    message.set_principal(0);
+    message.set_uuid(next_uuid.value());
+    message.set_payload(payload);
+    message.set_ts_ms(NowMs());
+
+    Status status = storage_->PutChannel(batch, channel);
+    if (!status.ok()) {
+        return status;
+    }
+    status = storage_->PutMessage(batch, message);
+    if (!status.ok()) {
+        return status;
+    }
+    status = storage_->PutUsedUuid(batch, message.uuid(), message.seq());
+    if (!status.ok()) {
+        return status;
+    }
+    status = storage_->SetMaxSeq(batch, message.seq());
+    if (!status.ok()) {
+        return status;
+    }
+    return storage_->SetNextUuid(batch, message.uuid() + 1);
+}
+
 Status OpenEventCore::Publish(const PublishRequest& request,
                               PublishResponse*,
                               const grpc::ServerContext* context)
@@ -811,8 +898,8 @@ Status OpenEventCore::WriteObject(const WriteObjectRequest& request, WriteObject
                     final_status = preparing.status();
                 } else if (!preparing.value().has_value() ||
                            !SameObject(preparing.value().value(), object)) {
-                    return FatalStorageError(Status(
-                        grpc::StatusCode::DATA_LOSS,
+                    return FatalStorageError(Status::StorageCorruption(
+                        "commit object metadata",
                         "preparing object metadata changed unexpectedly"));
                 } else {
                     rocksdb::WriteBatch batch;
@@ -955,6 +1042,10 @@ Status OpenEventCore::FetchVisible(const ReadSnapshot& snapshot,
 
     const std::unordered_set<uint64_t> requested_channels(channels.begin(), channels.end());
     std::unordered_map<uint64_t, bool> readable_channels;
+    // Both callers already validated every explicit Channel in this snapshot.
+    for (uint64_t channel_id : requested_channels) {
+        readable_channels.emplace(channel_id, true);
+    }
     size_t response_bytes = 0;
     auto next_seq = storage_->ScanMessages(
         snapshot,
@@ -962,6 +1053,9 @@ Status OpenEventCore::FetchVisible(const ReadSnapshot& snapshot,
         max_seq,
         max_scan_records_,
         [&](const EventMessage& message) -> Result<MessageScanAction> {
+            if (!requested_channels.empty() && !requested_channels.contains(message.channel_id())) {
+                return MessageScanAction::kContinue;
+            }
             auto readable = readable_channels.find(message.channel_id());
             if (readable == readable_channels.end()) {
                 auto channel_result = LoadChannel(snapshot, message.channel_id());
@@ -969,14 +1063,11 @@ Status OpenEventCore::FetchVisible(const ReadSnapshot& snapshot,
                     return channel_result.status();
                 }
                 if (!channel_result.value().has_value()) {
-                    return Status(grpc::StatusCode::DATA_LOSS,
+                    return Status::StorageCorruption("scan visible messages",
                                   "message references a missing channel");
                 }
                 const bool can_read = CanRead(channel_result.value().value(), principal);
                 readable = readable_channels.emplace(message.channel_id(), can_read).first;
-            }
-            if (!requested_channels.empty() && !requested_channels.contains(message.channel_id())) {
-                return MessageScanAction::kContinue;
             }
             if (!readable->second || (only_my_recipient && !HasRecipient(message, principal))) {
                 return MessageScanAction::kContinue;
@@ -1010,7 +1101,7 @@ Status OpenEventCore::CreateChannel(const CreateChannelRequest& request, CreateC
     if (request.principal() == 0 || Contains(request.members(), uint64_t{0}) ||
         request.name().empty() || request.name().size() > 255 ||
         request.protocol().size() > 255 || request.description().size() > 4096 ||
-        request.members_size() > 1024) {
+        request.members_size() > kMaxChannelMembers) {
         return Status(grpc::StatusCode::INVALID_ARGUMENT, "invalid Channel parameters");
     }
     Status visibility_status = ValidateVisibility(request.visibility());
@@ -1028,13 +1119,7 @@ Status OpenEventCore::CreateChannel(const CreateChannelRequest& request, CreateC
     if (!auth.ok()) {
         return auth;
     }
-    auto next_channel_id = storage_->GetNextChannelId(snapshot);
-    if (!next_channel_id.ok()) {
-        return next_channel_id.status();
-    }
-
     ChannelInfo channel;
-    channel.set_channel_id(next_channel_id.value());
     channel.set_name(request.name());
     channel.set_visibility(request.visibility());
     channel.set_protocol(request.protocol());
@@ -1049,9 +1134,19 @@ Status OpenEventCore::CreateChannel(const CreateChannelRequest& request, CreateC
             channel.add_members(member);
         }
     }
+    if (channel.members_size() > kMaxChannelMembers) {
+        return Status(grpc::StatusCode::RESOURCE_EXHAUSTED,
+                      "Channel can contain at most 1024 members including its creator");
+    }
+
+    auto next_channel_id = storage_->GetNextChannelId(snapshot);
+    if (!next_channel_id.ok()) {
+        return next_channel_id.status();
+    }
+    channel.set_channel_id(next_channel_id.value());
 
     rocksdb::WriteBatch batch;
-    Status status = storage_->PutChannel(&batch, channel);
+    Status status = BuildChannelMutationBatch(snapshot, channel, ChannelInitializedPayload(channel), &batch);
     if (!status.ok()) {
         return status;
     }
@@ -1177,10 +1272,15 @@ Status OpenEventCore::AddMember(const AddMemberRequest& request, AddMemberRespon
     if (IsMember(channel, request.target_principal())) {
         return Status(grpc::StatusCode::ALREADY_EXISTS, "member already exists");
     }
+    if (channel.members_size() >= kMaxChannelMembers) {
+        return Status(grpc::StatusCode::RESOURCE_EXHAUSTED,
+                      "Channel can contain at most 1024 members including its creator");
+    }
     channel.add_members(request.target_principal());
 
     rocksdb::WriteBatch batch;
-    Status status = storage_->PutChannel(&batch, channel);
+    Status status = BuildChannelMutationBatch(
+        snapshot, channel, MemberChangedPayload("system.member_added", request.target_principal()), &batch);
     if (!status.ok()) {
         return status;
     }
@@ -1226,12 +1326,14 @@ Status OpenEventCore::RemoveMember(const RemoveMemberRequest& request, RemoveMem
     }
     auto* members = channel.mutable_members();
     auto it = std::find(members->begin(), members->end(), request.target_principal());
-    if (it != members->end()) {
-        members->erase(it);
+    if (it == members->end()) {
+        return Status::Ok();
     }
+    members->erase(it);
 
     rocksdb::WriteBatch batch;
-    Status status = storage_->PutChannel(&batch, channel);
+    Status status = BuildChannelMutationBatch(
+        snapshot, channel, MemberChangedPayload("system.member_removed", request.target_principal()), &batch);
     if (!status.ok()) {
         return status;
     }
@@ -1332,7 +1434,7 @@ Status OpenEventCore::ListAllMessages(const ReadSnapshot& snapshot,
                     return channel.status();
                 }
                 if (!channel.value().has_value()) {
-                    return Status(grpc::StatusCode::DATA_LOSS,
+                    return Status::StorageCorruption("scan subscription messages",
                                   "message references a missing channel");
                 }
                 known_channels.insert(message.channel_id());

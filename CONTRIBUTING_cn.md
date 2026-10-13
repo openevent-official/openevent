@@ -12,8 +12,9 @@ make test-runtime
 make check-docs
 ```
 
-`make test-runtime` 需要当前 Python 环境已安装 `openevent-sdk>=0.11.1`、`pytest` 和 `packaging`。
-使用 `PYTHON` 选择 Python 环境。测试数据与日志保存在 `build/`。
+`make test-runtime` 先构建当前服务端，并通过 SDK 的 `make test-env` 从本地源码构建、安装本次 SDK wheel，
+再使用该测试环境运行；SDK 测试环境和依赖规则见 [SDK README](openevent-sdk/README_cn.md#构建和测试)。
+使用 `PYTHON` 选择创建测试环境的 Python。服务端测试数据与日志保存在 `build/`。
 
 ## 贡献准则
 

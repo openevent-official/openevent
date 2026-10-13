@@ -80,3 +80,4 @@ Subscribe stream；普通在途调用按 API 契约完成或返回错误。
 - 必须使用支持持久文件 `fsync`、目录 `fsync` 和不覆盖原子
   `renameat2(RENAME_NOREPLACE)` 的本地 Linux 文件系统。
 - 备份或恢复前等待服务进程完全退出，全程保持停服，并将整个数据目录作为一个整体处理。
+  恢复旧备份时遵循 [API 的数据历史边界](https://github.com/openevent-official/openevent-sdk/blob/main/docs/API_cn.md#12-数据历史与备份恢复)。

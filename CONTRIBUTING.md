@@ -13,9 +13,11 @@ make test-runtime
 make check-docs
 ```
 
-`make test-runtime` requires `openevent-sdk>=0.11.1`, `pytest`, and `packaging`
-already installed in the current Python environment.
-Select Python with `PYTHON`. Test data and logs stay under `build/`.
+`make test-runtime` builds the current server, then uses the SDK's `make test-env`
+to build and install a fresh SDK wheel from local sources before running in that
+test environment. See the [SDK README](openevent-sdk/README.md#build-and-test)
+for test environment and dependency rules. Select the Python used to create the
+test environment with `PYTHON`. Server test data and logs stay under `build/`.
 
 ## Contribution Guidelines
 

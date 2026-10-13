@@ -18,11 +18,6 @@
 namespace openevent {
 namespace {
 
-Status CorruptionStatus(const std::string& message)
-{
-    return Status(grpc::StatusCode::DATA_LOSS, message);
-}
-
 std::string FinalName(uint64_t object_id)
 {
     return std::to_string(object_id);
@@ -48,7 +43,7 @@ Status UnlinkKnownPath(int directory_fd, const std::string& name)
     }
     const int error = errno;
     if (error == EISDIR || error == EPERM) {
-        return CorruptionStatus("object path is not a removable file: " + name);
+        return Status::StorageCorruption("remove object path", "object path is not a removable file: " + name);
     }
     return ObjectIoStatus("remove object path " + name, error);
 }
@@ -97,7 +92,8 @@ Status ObjectFileStore::Write(uint64_t object_id, const std::string& data) const
     if (fd < 0) {
         const int error = errno;
         if (error == EEXIST) {
-            return CorruptionStatus("unexpected existing temporary object file: " + temporary);
+            return Status::StorageCorruption("create temporary object file",
+                                             "unexpected existing temporary object file: " + temporary);
         }
         return ObjectIoStatus("create temporary object file", error);
     }
@@ -171,7 +167,8 @@ Status ObjectFileStore::Write(uint64_t object_id, const std::string& data) const
                   RENAME_NOREPLACE) != 0) {
         const int error = errno;
         if (error == EEXIST) {
-            return CorruptionStatus("unexpected existing final object file: " + final);
+            return Status::StorageCorruption("rename temporary object file",
+                                             "unexpected existing final object file: " + final);
         }
         return ObjectIoStatus("rename temporary object file", error);
     }
@@ -221,7 +218,7 @@ Result<std::string> ObjectFileStore::ReadRange(uint64_t object_id,
                                                uint64_t nbytes) const
 {
     if (object_id == 0 || expected_size == 0 || expected_size > kMaxObjectBytes) {
-        return CorruptionStatus("invalid committed object metadata");
+        return Status::StorageCorruption("read committed object file", "invalid committed object metadata");
     }
     if (nbytes == 0) {
         return Status(grpc::StatusCode::INVALID_ARGUMENT, "nbytes must be greater than 0");
@@ -238,7 +235,8 @@ Result<std::string> ObjectFileStore::ReadRange(uint64_t object_id,
     if (fd < 0) {
         const int error = errno;
         if (error == ENOENT || error == ELOOP) {
-            return CorruptionStatus(ErrnoMessage("open committed object file " + final, error));
+            return Status::StorageCorruption("open committed object file " + final,
+                                             ErrnoMessage("open committed object file " + final, error));
         }
         return ObjectIoStatus("open committed object file " + final, error);
     }
@@ -252,7 +250,8 @@ Result<std::string> ObjectFileStore::ReadRange(uint64_t object_id,
     if (!S_ISREG(file_stat.st_mode) || file_stat.st_size < 0 ||
         static_cast<uint64_t>(file_stat.st_size) != expected_size) {
         ::close(fd);
-        return CorruptionStatus("committed object file type or size mismatch: " + final);
+        return Status::StorageCorruption("stat committed object file",
+                                         "committed object file type or size mismatch: " + final);
     }
 
     const uint64_t remaining = expected_size - offset;
@@ -274,7 +273,8 @@ Result<std::string> ObjectFileStore::ReadRange(uint64_t object_id,
         }
         if (result == 0) {
             ::close(fd);
-            return CorruptionStatus("committed object file is truncated: " + final);
+            return Status::StorageCorruption("read committed object file",
+                                             "committed object file is truncated: " + final);
         }
         read_bytes += static_cast<size_t>(result);
     }

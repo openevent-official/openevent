@@ -27,6 +27,7 @@ void ConfigurePublicServerKeepalive(grpc::ServerBuilder* builder)
 {
     builder->AddChannelArgument("grpc.keepalive_time_ms", kSubscribeKeepaliveTimeMs);
     builder->AddChannelArgument("grpc.keepalive_timeout_ms", kSubscribeKeepaliveTimeoutMs);
+    builder->AddChannelArgument("grpc.http2.ping_timeout_ms", kSubscribeKeepaliveTimeoutMs);
     builder->AddChannelArgument("grpc.keepalive_permit_without_calls", 1);
     builder->AddChannelArgument("grpc.http2.min_ping_interval_without_data_ms",
                                 kMinimumClientPingIntervalMs);
@@ -84,8 +85,7 @@ int main(int argc, char** argv)
                                                                    fatal_storage_error.store(
                                                                        true, std::memory_order_release);
                                                                }
-                                                               std::cerr << "fatal storage error: "
-                                                                         << status.message() << "\n";
+                                                               std::cerr << status.FatalLogMessage() << "\n";
                                                                fatal_storage_error_cv.notify_all();
                                                            });
     if (fatal_storage_error.load(std::memory_order_acquire)) {

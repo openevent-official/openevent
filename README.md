@@ -85,4 +85,4 @@ the configuration guide and the endpoint and transport requirements in the
 
 ## Project Status
 
-Use matching `0.11.1` server and SDK versions.
+Use matching `0.12.0` server and SDK versions.

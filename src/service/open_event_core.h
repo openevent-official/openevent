@@ -103,6 +103,10 @@ private:
                              uint64_t ts_ms,
                              rocksdb::WriteBatch* batch) const;
     Status CommitBatch(rocksdb::WriteBatch* batch);
+    Status BuildChannelMutationBatch(const ReadSnapshot& snapshot,
+                                     const ChannelInfo& channel,
+                                     const std::string& payload,
+                                     rocksdb::WriteBatch* batch) const;
     Status ValidatePayloadSize(const std::string& payload) const;
     Status ValidateObjectKeysShape(const google::protobuf::RepeatedPtrField<ObjectKey>& object_keys) const;
     Result<StoredObject> LoadAuthorizedObject(const ReadSnapshot& snapshot,
@@ -110,6 +114,7 @@ private:
                                               const std::string& object_token) const;
     Status CleanupPreparingObject(uint64_t object_id, const Status& result);
     Status FatalStorageError(const Status& status) const;
+    // Explicit channels must have passed ValidateReadableChannels in the same snapshot.
     Status FetchVisible(const ReadSnapshot& snapshot,
                         uint64_t principal,
                         uint64_t from_seq,
