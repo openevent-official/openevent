@@ -1218,6 +1218,229 @@ void TestObjectWriteMetadataReadAndReopen()
     std::filesystem::remove_all(root);
 }
 
+void TestBatchObjectMetadata()
+{
+    const auto root = std::filesystem::temp_directory_path() / "openevent_batch_object_metadata";
+    std::filesystem::remove_all(root);
+    auto core = std::shared_ptr<openevent::OpenEventCore>(MakeCore(root));
+    const std::string token = AddToken(*core, 100);
+    auto first = WriteObject(*core, 100, token, "first");
+    auto write = MakeWriteObjectRequest(100, token, "second object");
+    write.set_name("second.txt");
+    write.set_type("text/plain");
+    write.set_description("second description");
+    openevent::WriteObjectResponse second;
+    Check(core->WriteObject(write, &second).ok(), "write second batch metadata fixture");
+
+    openevent::BatchGetObjectMetadataRequest request;
+    std::vector<openevent::GetObjectMetadataResponse> expected;
+    for (const auto* object : {&second, &first, &second}) {
+        auto* key = request.add_object_keys();
+        key->set_object_id(object->object_id());
+        key->set_object_token(object->object_token());
+        openevent::GetObjectMetadataRequest single;
+        single.set_object_id(object->object_id());
+        single.set_object_token(object->object_token());
+        openevent::GetObjectMetadataResponse metadata;
+        Check(core->GetObjectMetadata(single, &metadata).ok(), "read expected single metadata");
+        expected.push_back(metadata);
+    }
+    openevent::BatchGetObjectMetadataResponse response;
+    auto check_ordered_response = [&]() {
+        Check(response.metadata_size() == 3, "batch metadata must preserve duplicate entries");
+        for (int index = 0; index < response.metadata_size(); ++index) {
+            Check(response.metadata(index).SerializeAsString() == expected[index].SerializeAsString(),
+                  "batch metadata must preserve request order and match single metadata exactly");
+        }
+    };
+    Check(core->BatchGetObjectMetadata(request, &response).ok(), "read ordered metadata batch");
+    check_ordered_response();
+
+    auto expect_failure = [&](const openevent::BatchGetObjectMetadataRequest& invalid,
+                              grpc::StatusCode code) {
+        response.add_metadata()->set_name("stale result");
+        const auto status = core->BatchGetObjectMetadata(invalid, &response);
+        Check(status.code() == code, "unexpected batch metadata error: " + status.message());
+        Check(response.metadata().empty(), "failed batch metadata must expose no partial or stale results");
+        return status;
+    };
+    openevent::BatchGetObjectMetadataRequest empty;
+    expect_failure(empty, grpc::StatusCode::INVALID_ARGUMENT);
+    auto invalid = request;
+    // A repeated object still needs its own capability check.
+    invalid.mutable_object_keys(2)->set_object_token("wrong-token");
+    const auto wrong_token = expect_failure(invalid, grpc::StatusCode::NOT_FOUND);
+    invalid = request;
+    invalid.mutable_object_keys(1)->set_object_id(9999);
+    const auto missing = expect_failure(invalid, grpc::StatusCode::NOT_FOUND);
+    Check(wrong_token.message() == missing.message(),
+          "batch metadata must not distinguish a wrong token from a missing object");
+    // All key shapes must be checked before the earlier missing object is looked up.
+    invalid.mutable_object_keys(2)->set_object_id(0);
+    expect_failure(invalid, grpc::StatusCode::INVALID_ARGUMENT);
+    invalid = request;
+    invalid.mutable_object_keys(0)->set_object_token("wrong-token");
+    invalid.mutable_object_keys(2)->clear_object_token();
+    expect_failure(invalid, grpc::StatusCode::INVALID_ARGUMENT);
+
+    openevent::BatchGetObjectMetadataRequest boundary;
+    *boundary.add_object_keys() = request.object_keys(0);
+    Check(core->BatchGetObjectMetadata(boundary, &response).ok() && response.metadata_size() == 1,
+          "a one-object metadata batch must be accepted");
+    for (int index = 1; index < 1024; ++index) {
+        *boundary.add_object_keys() = request.object_keys(0);
+    }
+    Check(core->BatchGetObjectMetadata(boundary, &response).ok() && response.metadata_size() == 1024 &&
+              response.metadata(1023).SerializeAsString() == expected[0].SerializeAsString(),
+          "the inclusive 1024-item metadata limit must preserve the final duplicate");
+    *boundary.add_object_keys() = request.object_keys(0);
+    expect_failure(boundary, grpc::StatusCode::INVALID_ARGUMENT);
+
+    Check(std::filesystem::remove(root / "data" / "objects" / std::to_string(first.object_id())),
+          "remove first object data for metadata-only lookup");
+    {
+        std::ofstream truncated(root / "data" / "objects" / std::to_string(second.object_id()),
+                                std::ios::binary | std::ios::trunc);
+        truncated << "x";
+        Check(truncated.good(), "truncate second object data for metadata-only lookup");
+    }
+    Check(core->BatchGetObjectMetadata(request, &response).ok(),
+          "batch metadata must not open or validate missing or truncated object data");
+    check_ordered_response();
+    {
+        openevent::ObjectStorageServiceImpl service(core);
+        grpc::ServerBuilder builder;
+        int port = 0;
+        builder.AddListeningPort("127.0.0.1:0", grpc::InsecureServerCredentials(), &port);
+        builder.RegisterService(&service);
+        auto server = builder.BuildAndStart();
+        Check(server != nullptr && port > 0, "start batch metadata gRPC server");
+        auto channel = grpc::CreateChannel("127.0.0.1:" + std::to_string(port),
+                                           grpc::InsecureChannelCredentials());
+        auto stub = openevent::ObjectStorageService::NewStub(channel);
+        grpc::ClientContext context;
+        context.set_deadline(std::chrono::system_clock::now() + std::chrono::seconds(5));
+        response.Clear();
+        Check(stub->BatchGetObjectMetadata(&context, request, &response).ok(),
+              "BatchGetObjectMetadata must be available through the generated gRPC service");
+        check_ordered_response();
+        server->Shutdown();
+        server->Wait();
+    }
+    core.reset();
+    std::filesystem::remove_all(root);
+}
+
+void TestBatchObjectMetadataWhilePreparing()
+{
+    const auto root = std::filesystem::temp_directory_path() / "openevent_batch_metadata_preparing";
+    std::filesystem::remove_all(root);
+    struct State {
+        std::mutex mutex;
+        std::condition_variable cv;
+        bool active = false;
+        bool blocked = false;
+        bool release = false;
+    };
+    auto state = std::make_shared<State>();
+    auto injector = [state](openevent::StorageFaultPoint point) {
+        if (point != openevent::StorageFaultPoint::kAfterTemporaryFileCreate) {
+            return openevent::Status::Ok();
+        }
+        std::unique_lock<std::mutex> lock(state->mutex);
+        if (state->active) {
+            state->blocked = true;
+            state->cv.notify_all();
+            state->cv.wait(lock, [&]() { return state->release; });
+        }
+        return openevent::Status::Ok();
+    };
+    auto storage = openevent::UnifiedStorage::Open((root / "data").string(), injector);
+    Check(storage.ok(), storage.status().message());
+    auto* storage_ptr = storage.value().get();
+    auto core = std::make_unique<openevent::OpenEventCore>(std::move(storage.value()), 1024);
+    const std::string token = AddToken(*core, 100);
+    const auto committed = WriteObject(*core, 100, token, "first");
+    state->active = true;
+    openevent::WriteObjectResponse written;
+    openevent::Status write_status;
+    std::thread writer([&]() {
+        write_status = core->WriteObject(MakeWriteObjectRequest(100, token, "pending"), &written);
+    });
+    {
+        std::unique_lock<std::mutex> lock(state->mutex);
+        Check(state->cv.wait_for(lock, std::chrono::seconds(5), [&]() { return state->blocked; }),
+              "object write must reach PREPARING before the batch metadata query");
+    }
+    openevent::BatchGetObjectMetadataRequest request;
+    auto* key = request.add_object_keys();
+    key->set_object_id(committed.object_id());
+    key->set_object_token(committed.object_token());
+    {
+        auto snapshot = storage_ptr->CreateSnapshot();
+        Check(snapshot.ok(), snapshot.status().message());
+        auto preparing = storage_ptr->GetPreparingObject(snapshot.value(), committed.object_id() + 1);
+        Check(preparing.ok() && preparing.value().has_value(), "blocked write must be PREPARING");
+        key = request.add_object_keys();
+        key->set_object_id(preparing.value()->object_id);
+        key->set_object_token(preparing.value()->object_token);
+    }
+    openevent::BatchGetObjectMetadataResponse response;
+    const auto status = core->BatchGetObjectMetadata(request, &response);
+    Check(status.code() == grpc::StatusCode::NOT_FOUND && response.metadata().empty(),
+          "a PREPARING object must fail the whole metadata batch even with its correct token");
+    {
+        std::lock_guard<std::mutex> lock(state->mutex);
+        state->release = true;
+    }
+    state->cv.notify_all();
+    writer.join();
+    Check(write_status.ok(), write_status.message());
+    Check(core->BatchGetObjectMetadata(request, &response).ok() && response.metadata_size() == 2 &&
+              response.metadata(0).nbytes() == 5 && response.metadata(1).nbytes() == 7,
+          "a new metadata batch must observe the object after its final commit");
+    core.reset();
+    std::filesystem::remove_all(root);
+}
+
+void TestBatchObjectMetadataCorruptionIsFatal()
+{
+    const auto root = std::filesystem::temp_directory_path() / "openevent_batch_metadata_corruption";
+    std::filesystem::remove_all(root);
+    openevent::BatchGetObjectMetadataRequest request;
+    {
+        auto core = MakeCore(root);
+        const std::string token = AddToken(*core, 100);
+        for (const auto* data : {"good", "corrupt"}) {
+            const auto object = WriteObject(*core, 100, token, data);
+            auto* key = request.add_object_keys();
+            key->set_object_id(object.object_id());
+            key->set_object_token(object.object_token());
+        }
+    }
+    PutRawRecord(root / "data" / "db", "objects",
+                 std::string("object/") + openevent::EncodeUint64(request.object_keys(1).object_id()),
+                 "invalid object metadata");
+    int fatal_calls = 0;
+    auto unique_core = MakeCore(root, 1024, 10000, 0, [&](const openevent::Status&) { ++fatal_calls; });
+    auto core = std::shared_ptr<openevent::OpenEventCore>(std::move(unique_core));
+    {
+        openevent::ObjectStorageServiceImpl service(core);
+        openevent::BatchGetObjectMetadataResponse response;
+        auto status = service.BatchGetObjectMetadata(nullptr, &request, &response);
+        Check(status.error_code() == grpc::StatusCode::DATA_LOSS && fatal_calls == 1 &&
+                  response.metadata().empty(),
+              "batch metadata corruption must fail atomically and trigger the shared fatal path");
+        request.mutable_object_keys()->RemoveLast();
+        status = service.BatchGetObjectMetadata(nullptr, &request, &response);
+        Check(status.error_code() == grpc::StatusCode::UNAVAILABLE && fatal_calls == 1 &&
+                  response.metadata().empty(),
+              "a healthy key must still be rejected after the server enters FAILED");
+    }
+    core.reset();
+    std::filesystem::remove_all(root);
+}
+
 void TestMessageObjectReferences()
 {
     const auto root = std::filesystem::temp_directory_path() / "openevent_core_object_references";
@@ -1459,6 +1682,17 @@ void TestRpcStorageFailureTriggersFatalShutdown()
         Check(!status.ok() && status.error_code() == grpc::StatusCode::UNAVAILABLE &&
                   fatal_calls == 1,
               "RPCs after a fatal storage failure must be rejected without another storage access");
+
+        openevent::ObjectStorageServiceImpl object_service(core);
+        openevent::BatchGetObjectMetadataRequest metadata_request;
+        auto* key = metadata_request.add_object_keys();
+        key->set_object_id(1);
+        key->set_object_token("unused-after-failure");
+        openevent::BatchGetObjectMetadataResponse metadata_response;
+        status = object_service.BatchGetObjectMetadata(nullptr, &metadata_request, &metadata_response);
+        Check(status.error_code() == grpc::StatusCode::UNAVAILABLE && fatal_calls == 1 &&
+                  metadata_response.metadata().empty(),
+              "batch metadata RPC must obey the shared FAILED gate");
 
         core.reset();
         std::filesystem::remove_all(root);
@@ -3171,6 +3405,9 @@ int main()
     TestCorruptCredentialRecordIsFatal();
     TestDeleteTokenOrdersBeforePublish();
     TestObjectWriteMetadataReadAndReopen();
+    TestBatchObjectMetadata();
+    TestBatchObjectMetadataWhilePreparing();
+    TestBatchObjectMetadataCorruptionIsFatal();
     TestMessageObjectReferences();
     TestObjectWriteInjectedFailures();
     TestRpcStorageFailureTriggersFatalShutdown();

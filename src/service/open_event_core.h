@@ -47,6 +47,8 @@ public:
 
     Status WriteObject(const WriteObjectRequest& request, WriteObjectResponse* response);
     Status GetObjectMetadata(const GetObjectMetadataRequest& request, GetObjectMetadataResponse* response);
+    Status BatchGetObjectMetadata(const BatchGetObjectMetadataRequest& request,
+                                  BatchGetObjectMetadataResponse* response);
     Status ReadObject(const ReadObjectRequest& request, ReadObjectResponse* response);
 
     Status CreateChannel(const CreateChannelRequest& request, CreateChannelResponse* response);

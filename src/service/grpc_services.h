@@ -64,6 +64,9 @@ public:
     grpc::Status GetObjectMetadata(grpc::ServerContext* context,
                                    const GetObjectMetadataRequest* request,
                                    GetObjectMetadataResponse* response) override;
+    grpc::Status BatchGetObjectMetadata(grpc::ServerContext* context,
+                                        const BatchGetObjectMetadataRequest* request,
+                                        BatchGetObjectMetadataResponse* response) override;
     grpc::Status ReadObject(grpc::ServerContext* context,
                             const ReadObjectRequest* request,
                             ReadObjectResponse* response) override;

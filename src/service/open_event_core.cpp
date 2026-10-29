@@ -950,6 +950,42 @@ Status OpenEventCore::GetObjectMetadata(const GetObjectMetadataRequest& request,
     return Status::Ok();
 }
 
+Status OpenEventCore::BatchGetObjectMetadata(const BatchGetObjectMetadataRequest& request,
+                                             BatchGetObjectMetadataResponse* response)
+{
+    response->Clear();
+    Status available = EnsureAvailable();
+    if (!available.ok()) {
+        return available;
+    }
+    if (request.object_keys().empty()) {
+        return Status(grpc::StatusCode::INVALID_ARGUMENT, "object_keys must not be empty");
+    }
+    Status shape = ValidateObjectKeysShape(request.object_keys());
+    if (!shape.ok()) {
+        return shape;
+    }
+    auto snapshot_result = CreateLinearizedSnapshot();
+    if (!snapshot_result.ok()) {
+        return snapshot_result.status();
+    }
+    ReadSnapshot snapshot = std::move(snapshot_result.value());
+    BatchGetObjectMetadataResponse staged;
+    for (const auto& key : request.object_keys()) {
+        auto object = LoadAuthorizedObject(snapshot, key.object_id(), key.object_token());
+        if (!object.ok()) {
+            return object.status();
+        }
+        auto* metadata = staged.add_metadata();
+        metadata->set_name(object.value().name);
+        metadata->set_type(object.value().type);
+        metadata->set_description(object.value().description);
+        metadata->set_nbytes(object.value().nbytes);
+    }
+    response->Swap(&staged);
+    return Status::Ok();
+}
+
 Status OpenEventCore::ReadObject(const ReadObjectRequest& request, ReadObjectResponse* response)
 {
     Status available = EnsureAvailable();

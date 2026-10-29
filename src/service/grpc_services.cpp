@@ -168,6 +168,14 @@ grpc::Status ObjectStorageServiceImpl::GetObjectMetadata(
     return ToGrpcStatus(core_, core_->GetObjectMetadata(*request, response));
 }
 
+grpc::Status ObjectStorageServiceImpl::BatchGetObjectMetadata(
+    grpc::ServerContext*,
+    const BatchGetObjectMetadataRequest* request,
+    BatchGetObjectMetadataResponse* response)
+{
+    return ToGrpcStatus(core_, core_->BatchGetObjectMetadata(*request, response));
+}
+
 grpc::Status ObjectStorageServiceImpl::ReadObject(grpc::ServerContext*,
                                                   const ReadObjectRequest* request,
                                                   ReadObjectResponse* response)
