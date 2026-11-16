@@ -3,13 +3,13 @@
 [English version](README.md)
 
 OpenEvent 是面向 AI Agent 系统的基础设施。各模块连接到同一条全局有序事件队列，通过消息协作。
-开发者可以使用现成模块搭建 Agent，再按业务需要替换 IM 接入、模型代理、Agent 策略或查看面板。
+开发者可以使用现成模块搭建 Agent，再按业务需要替换聊天入口、模型代理、命令执行、Agent 策略或查看面板。
 
 ## 可插拔模块
 
 | 模块 | 项目 | 作用 |
 | --- | --- | --- |
-| IM 模块 | [openevent-modules-im](https://github.com/openevent-official/openevent-modules-im) | 接入外部 IM 会话。 |
+| Chat 模块 | [openevent-modules-chat](https://github.com/openevent-official/openevent-modules-chat) | 提供聊天页面，支持会话、附件、流式回复和取消回答。 |
 | Model Proxy | [openevent-modules-model-proxy](https://github.com/openevent-official/openevent-modules-model-proxy) | 对接 OpenAI 兼容模型 provider。 |
 | Cmd 模块 | [openevent-modules-cmd](https://github.com/openevent-official/openevent-modules-cmd) | 执行 Linux 本地命令并查询输出。 |
 | OpenEvent View | [openevent-view](https://github.com/openevent-official/openevent-view) | 查询事件记录。 |
@@ -17,8 +17,9 @@ OpenEvent 是面向 AI Agent 系统的基础设施。各模块连接到同一条
 ## Agent Demo
 
 [openevent-agent-demo](https://github.com/openevent-official/openevent-agent-demo)
-把 OpenEvent、IM、model-proxy、Agent 进程和 OpenEvent View 组合成一套本地运行环境，可用来调试事件链路，
-也可作为业务 Agent 的起点。
+把 OpenEvent、Chat、Model Proxy、Cmd 和 OpenEvent View 组合成可运行的 Chat Agent。
+用户通过 Chat 提问或发送附件，Agent 调用模型、按需执行命令并流式回复；OpenEvent View 用于查看事件记录。
+部署时使用已安装的 Python SDK 和各模块发行包，环境准备与运行步骤见 Demo 文档。
 
 ## 特性
 

@@ -4,14 +4,14 @@
 
 OpenEvent is infrastructure for AI Agent systems. Modules share one globally
 ordered event queue and collaborate through messages. Start with the available
-modules, then replace the IM integration, model proxy, Agent strategy, or view
-panel as needed.
+modules, then replace the chat interface, model proxy, command execution, Agent
+strategy, or view panel as needed.
 
 ## Pluggable Modules
 
 | Module | Project | Purpose |
 | --- | --- | --- |
-| IM module | [openevent-modules-im](https://github.com/openevent-official/openevent-modules-im) | Connects external IM conversations. |
+| Chat module | [openevent-modules-chat](https://github.com/openevent-official/openevent-modules-chat) | Provides a chat interface with conversations, attachments, streaming replies, and reply cancellation. |
 | Model Proxy | [openevent-modules-model-proxy](https://github.com/openevent-official/openevent-modules-model-proxy) | Connects OpenAI-compatible model providers. |
 | Cmd module | [openevent-modules-cmd](https://github.com/openevent-official/openevent-modules-cmd) | Executes local Linux commands and queries their output. |
 | OpenEvent View | [openevent-view](https://github.com/openevent-official/openevent-view) | Queries event records. |
@@ -19,8 +19,11 @@ panel as needed.
 ## Agent Demo
 
 [openevent-agent-demo](https://github.com/openevent-official/openevent-agent-demo)
-combines OpenEvent, IM, model-proxy, an Agent process, and OpenEvent View into a
-local runtime for debugging event chains or starting a business Agent.
+combines OpenEvent, Chat, Model Proxy, Cmd, and OpenEvent View into a runnable Chat
+Agent. Users ask questions or send attachments through Chat; the Agent calls the
+model, executes commands as needed, and streams replies. OpenEvent View displays
+event records. Deployment uses the installed Python SDK and module packages; see
+the Demo documentation for environment setup and runtime instructions.
 
 ## Features
 
