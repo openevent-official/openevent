@@ -9,7 +9,7 @@ default branch.
 
 ## Reporting a Vulnerability
 
-Use GitHub private vulnerability reporting if it is enabled for the public
+Prefer GitHub private vulnerability reporting if it is enabled for the public
 repository. If it is not enabled yet, open a public issue without exploit
 details and ask for a private reporting channel.
 

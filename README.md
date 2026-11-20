@@ -31,7 +31,7 @@ the Demo documentation for environment setup and runtime instructions.
 - Publishing with client-assigned or server-assigned `seq`.
 - Channels with `public`, `protected`, and `private` visibility.
 - Batch fetch and streaming subscriptions.
-- Immutable object storage up to 4 MiB, with object read credentials attached to messages.
+- Immutable objects of up to 4 MiB each. Messages can carry object read credentials.
 - Business authentication by `(principal, token)` pair and a separate admin endpoint.
 - A Python SDK.
 
@@ -39,14 +39,16 @@ the Demo documentation for environment setup and runtime instructions.
 
 Install the dependencies for your Linux distribution: CMake 3.20+, a C++20
 compiler, Protobuf and `protoc`, gRPC and `grpc_cpp_plugin`, RocksDB, OpenSSL,
-yaml-cpp, and `pkg-config`.
+yaml-cpp, and `pkg-config`. The build requires static archives for these libraries,
+their dependencies (including the compression libraries used by RocksDB), and
+the C and C++ runtimes.
 
 ```bash
 git submodule update --init --recursive
 make build
 ```
 
-The binary is `build/openevent_server`. Set build options through `BUILD_TYPE`,
+The fully statically linked binary is `build/openevent_server`. Set build options through `BUILD_TYPE`,
 `JOBS`, and `CMAKE_ARGS`, for example:
 
 ```bash

@@ -11,15 +11,8 @@ enum class StorageFaultPoint {
     kAfterInitializationCommit,
     kBeforeCommit,
     kAfterCommit,
-    kAfterTemporaryFileCreate,
-    kBeforeTemporaryFileWrite,
-    kAfterTemporaryFileWrite,
-    kBeforeFileFsync,
-    kAfterFileFsync,
-    kBeforeRename,
-    kAfterRename,
-    kBeforeDirectoryFsync,
-    kAfterDirectoryFsync,
+    kAfterObjectFileCreate,
+    kAfterObjectFileWrite,
 };
 
 using StorageFaultInjector = std::function<Status(StorageFaultPoint)>;

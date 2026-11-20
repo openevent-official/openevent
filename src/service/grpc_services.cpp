@@ -114,34 +114,36 @@ grpc::Status EventServiceImpl::RunSubscription(grpc::ServerContext* context,
     writer->SendInitialMetadata();
 
     while (!context->IsCancelled()) {
-        FetchResponse batch;
         uint64_t snapshot_version = 0;
-        Status status = core_->FetchSubscriptionBatch(request->principal(),
-                                                      request->token(),
-                                                      next_seq,
-                                                      100,
-                                                      request->only_my_recipient(),
-                                                      request->channels(),
-                                                      &batch,
-                                                      &snapshot_version);
-        if (!status.ok()) {
-            return ToGrpcStatus(core_, status);
-        }
+        {
+            FetchResponse batch;
+            Status status = core_->FetchSubscriptionBatch(request->principal(),
+                                                          request->token(),
+                                                          next_seq,
+                                                          100,
+                                                          request->only_my_recipient(),
+                                                          request->channels(),
+                                                          &batch,
+                                                          &snapshot_version);
+            if (!status.ok()) {
+                return ToGrpcStatus(core_, status);
+            }
 
-        for (const auto& message : batch.messages()) {
-            SubscribeResponse response;
-            *response.mutable_message() = message;
-            if (!writer->Write(response)) {
-                return grpc::Status::OK;
+            for (auto& message : *batch.mutable_messages()) {
+                SubscribeResponse response;
+                response.mutable_message()->Swap(&message);
+                if (!writer->Write(response)) {
+                    return grpc::Status::OK;
+                }
+            }
+            next_seq = batch.next_seq();
+            if (next_seq <= batch.last_seq()) {
+                continue;
             }
         }
 
-        next_seq = batch.next_seq();
-        if (batch.next_seq() > batch.last_seq()) {
-            while (!context->IsCancelled() &&
-                   !core_->WaitForSubscriptionSnapshot(snapshot_version,
-                                                       std::chrono::milliseconds(100))) {
-            }
+        while (!context->IsCancelled() &&
+               !core_->WaitForSubscriptionSnapshot(snapshot_version, std::chrono::milliseconds(100))) {
         }
     }
 

@@ -6,27 +6,14 @@
 #include <utility>
 
 #include <fcntl.h>
-#include <linux/fs.h>
 #include <openssl/crypto.h>
 #include <sys/stat.h>
-#include <sys/syscall.h>
 #include <unistd.h>
 
-#include "common/object_limits.h"
 #include "storage/io_error.h"
 
 namespace openevent {
 namespace {
-
-std::string FinalName(uint64_t object_id)
-{
-    return std::to_string(object_id);
-}
-
-std::string TemporaryName(uint64_t object_id)
-{
-    return ".tmp." + std::to_string(object_id);
-}
 
 Status CloseFile(int fd, const std::string& description)
 {
@@ -83,27 +70,18 @@ bool ObjectFileStore::ConstantTimeEquals(const std::string& left, const std::str
 
 Status ObjectFileStore::Write(uint64_t object_id, const std::string& data) const
 {
-    const std::string temporary = TemporaryName(object_id);
-    const std::string final = FinalName(object_id);
-    int fd = ::openat(directory_fd_,
-                      temporary.c_str(),
-                      O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW,
-                      0600);
+    const std::string name = std::to_string(object_id);
+    const int fd = ::openat(directory_fd_, name.c_str(),
+                            O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0600);
     if (fd < 0) {
         const int error = errno;
         if (error == EEXIST) {
-            return Status::StorageCorruption("create temporary object file",
-                                             "unexpected existing temporary object file: " + temporary);
+            return Status::StorageCorruption("create object file", "unexpected existing object file: " + name);
         }
-        return ObjectIoStatus("create temporary object file", error);
+        return ObjectIoStatus("create object file", error);
     }
 
-    Status injected = InjectStorageFault(fault_injector_, StorageFaultPoint::kAfterTemporaryFileCreate);
-    if (!injected.ok()) {
-        ::close(fd);
-        return injected;
-    }
-    injected = InjectStorageFault(fault_injector_, StorageFaultPoint::kBeforeTemporaryFileWrite);
+    Status injected = InjectStorageFault(fault_injector_, StorageFaultPoint::kAfterObjectFileCreate);
     if (!injected.ok()) {
         ::close(fd);
         return injected;
@@ -120,22 +98,16 @@ Status ObjectFileStore::Write(uint64_t object_id, const std::string& data) const
                 continue;
             }
             ::close(fd);
-            return ObjectIoStatus("write temporary object file", error);
+            return ObjectIoStatus("write object file", error);
         }
         if (result == 0) {
             ::close(fd);
-            return Status(grpc::StatusCode::UNAVAILABLE, "write temporary object file returned zero");
+            return Status(grpc::StatusCode::UNAVAILABLE, "write object file returned zero");
         }
         written += static_cast<size_t>(result);
     }
 
-    injected = InjectStorageFault(fault_injector_, StorageFaultPoint::kAfterTemporaryFileWrite);
-    if (!injected.ok()) {
-        ::close(fd);
-        return injected;
-    }
-
-    injected = InjectStorageFault(fault_injector_, StorageFaultPoint::kBeforeFileFsync);
+    injected = InjectStorageFault(fault_injector_, StorageFaultPoint::kAfterObjectFileWrite);
     if (!injected.ok()) {
         ::close(fd);
         return injected;
@@ -143,47 +115,17 @@ Status ObjectFileStore::Write(uint64_t object_id, const std::string& data) const
     if (::fsync(fd) != 0) {
         const int error = errno;
         ::close(fd);
-        return ObjectIoStatus("fsync temporary object file", error);
+        return ObjectIoStatus("fsync object file", error);
     }
-    injected = InjectStorageFault(fault_injector_, StorageFaultPoint::kAfterFileFsync);
-    if (!injected.ok()) {
-        ::close(fd);
-        return injected;
-    }
-    Status close_status = CloseFile(fd, "temporary object file");
+    Status close_status = CloseFile(fd, "object file");
     if (!close_status.ok()) {
         return close_status;
     }
 
-    injected = InjectStorageFault(fault_injector_, StorageFaultPoint::kBeforeRename);
-    if (!injected.ok()) {
-        return injected;
-    }
-    if (::syscall(SYS_renameat2,
-                  directory_fd_,
-                  temporary.c_str(),
-                  directory_fd_,
-                  final.c_str(),
-                  RENAME_NOREPLACE) != 0) {
-        const int error = errno;
-        if (error == EEXIST) {
-            return Status::StorageCorruption("rename temporary object file",
-                                             "unexpected existing final object file: " + final);
-        }
-        return ObjectIoStatus("rename temporary object file", error);
-    }
-    injected = InjectStorageFault(fault_injector_, StorageFaultPoint::kAfterRename);
-    if (!injected.ok()) {
-        return injected;
-    }
-    injected = InjectStorageFault(fault_injector_, StorageFaultPoint::kBeforeDirectoryFsync);
-    if (!injected.ok()) {
-        return injected;
-    }
     if (::fsync(directory_fd_) != 0) {
         return ObjectIoStatus("fsync object directory", errno);
     }
-    return InjectStorageFault(fault_injector_, StorageFaultPoint::kAfterDirectoryFsync);
+    return Status::Ok();
 }
 
 Status ObjectFileStore::Cleanup(uint64_t object_id) const
@@ -194,13 +136,9 @@ Status ObjectFileStore::Cleanup(uint64_t object_id) const
 Status ObjectFileStore::Cleanup(const std::vector<uint64_t>& object_ids) const
 {
     for (uint64_t object_id : object_ids) {
-        Status temporary_status = UnlinkKnownPath(directory_fd_, TemporaryName(object_id));
-        if (!temporary_status.ok()) {
-            return temporary_status;
-        }
-        Status final_status = UnlinkKnownPath(directory_fd_, FinalName(object_id));
-        if (!final_status.ok()) {
-            return final_status;
+        Status status = UnlinkKnownPath(directory_fd_, std::to_string(object_id));
+        if (!status.ok()) {
+            return status;
         }
     }
     if (object_ids.empty()) {
@@ -217,17 +155,8 @@ Result<std::string> ObjectFileStore::ReadRange(uint64_t object_id,
                                                uint64_t offset,
                                                uint64_t nbytes) const
 {
-    if (object_id == 0 || expected_size == 0 || expected_size > kMaxObjectBytes) {
-        return Status::StorageCorruption("read committed object file", "invalid committed object metadata");
-    }
-    if (nbytes == 0) {
-        return Status(grpc::StatusCode::INVALID_ARGUMENT, "nbytes must be greater than 0");
-    }
-    if (offset > expected_size) {
-        return Status(grpc::StatusCode::OUT_OF_RANGE, "offset exceeds object size");
-    }
-
-    const std::string final = FinalName(object_id);
+    const std::string final = std::to_string(object_id);
+    struct stat file_stat {};
     int fd = -1;
     do {
         fd = ::openat(directory_fd_, final.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
@@ -238,10 +167,14 @@ Result<std::string> ObjectFileStore::ReadRange(uint64_t object_id,
             return Status::StorageCorruption("open committed object file " + final,
                                              ErrnoMessage("open committed object file " + final, error));
         }
+        if (::fstatat(directory_fd_, final.c_str(), &file_stat, AT_SYMLINK_NOFOLLOW) == 0 &&
+            !S_ISREG(file_stat.st_mode)) {
+            return Status::StorageCorruption("stat committed object file",
+                                             "committed object file is not a regular file: " + final);
+        }
         return ObjectIoStatus("open committed object file " + final, error);
     }
 
-    struct stat file_stat {};
     if (::fstat(fd, &file_stat) != 0) {
         const int error = errno;
         ::close(fd);

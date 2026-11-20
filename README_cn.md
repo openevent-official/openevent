@@ -10,7 +10,7 @@ OpenEvent 是面向 AI Agent 系统的基础设施。各模块连接到同一条
 | 模块 | 项目 | 作用 |
 | --- | --- | --- |
 | Chat 模块 | [openevent-modules-chat](https://github.com/openevent-official/openevent-modules-chat) | 提供聊天页面，支持会话、附件、流式回复和取消回答。 |
-| Model Proxy | [openevent-modules-model-proxy](https://github.com/openevent-official/openevent-modules-model-proxy) | 对接 OpenAI 兼容模型 provider。 |
+| Model Proxy | [openevent-modules-model-proxy](https://github.com/openevent-official/openevent-modules-model-proxy) | 连接提供 OpenAI 兼容接口的模型服务。 |
 | Cmd 模块 | [openevent-modules-cmd](https://github.com/openevent-official/openevent-modules-cmd) | 执行 Linux 本地命令并查询输出。 |
 | OpenEvent View | [openevent-view](https://github.com/openevent-official/openevent-view) | 查询事件记录。 |
 
@@ -24,24 +24,25 @@ OpenEvent 是面向 AI Agent 系统的基础设施。各模块连接到同一条
 ## 特性
 
 - 全局有序消息、服务端 UUID 分配和消息去重。
-- 支持客户端指定 `seq` 发布和服务端自动分配 `seq`。
-- Channel 支持 public、protected、private 三种可见性。
+- 发布消息时，可以由客户端指定序号 `seq`，也可以由服务端分配。
+- 频道（Channel）支持三种可见性：公开、受保护和私有。
 - 批量拉取和流式订阅。
-- 最大 4 MiB 的不可变对象存储，消息可携带对象读取凭据。
+- 每个不可变对象最大为 4 MiB，消息可携带对象读取凭据。
 - 基于 `(principal, token)` 组合的业务认证，以及独立管理端口。
 - 提供 Python SDK。
 
 ## 构建
 
 先安装当前 Linux 发行版对应的依赖：CMake 3.20+、C++20 编译器、Protobuf 和 `protoc`、
-gRPC 和 `grpc_cpp_plugin`、RocksDB、OpenSSL、yaml-cpp、`pkg-config`。
+gRPC 和 `grpc_cpp_plugin`、RocksDB、OpenSSL、yaml-cpp、`pkg-config`。构建需要这些库及其依赖的
+静态库文件，包括 RocksDB 使用的压缩库，以及 C 和 C++ 运行库。
 
 ```bash
 git submodule update --init --recursive
 make build
 ```
 
-产物为 `build/openevent_server`。可通过 `BUILD_TYPE`、`JOBS` 和 `CMAKE_ARGS` 设置构建参数，例如：
+产物 `build/openevent_server` 是全静态链接的可执行文件。可通过 `BUILD_TYPE`、`JOBS` 和 `CMAKE_ARGS` 设置构建参数，例如：
 
 ```bash
 make build BUILD_TYPE=Release JOBS=4

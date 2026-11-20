@@ -6,8 +6,8 @@
 
 #include <grpcpp/grpcpp.h>
 
-#include "admin.grpc.pb.h"
-#include "openevent.grpc.pb.h"
+#include "openevent/sdk/proto/admin.grpc.pb.h"
+#include "openevent/sdk/proto/openevent.grpc.pb.h"
 #include "service/open_event_core.h"
 
 namespace openevent {

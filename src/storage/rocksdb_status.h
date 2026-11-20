@@ -15,11 +15,11 @@ inline Status RocksToStatus(const rocksdb::Status& status, const std::string& op
     }
     const auto code = status.IsCorruption() ? grpc::StatusCode::DATA_LOSS
                                            : grpc::StatusCode::UNAVAILABLE;
-    // Reconstruct from error enums only: RocksDB's free-form state can contain
-    // database keys, credentials or payload and must not enter the diagnostic.
-    const rocksdb::Status diagnostic(status.code(), status.subcode(), status.severity(), rocksdb::Slice());
-    return Status::Fatal(code, operation + ": " + status.ToString())
-        .WithStorageDiagnostic(operation, diagnostic.ToString());
+    // RocksDB's free-form error text can include database keys or values.
+    const rocksdb::Status classification(status.code(), status.subcode(), status.severity(), rocksdb::Slice());
+    const std::string category = classification.ToString();
+    return Status::Fatal(code, operation + ": " + category)
+        .WithStorageDiagnostic(operation, category);
 }
 
 }  // namespace openevent

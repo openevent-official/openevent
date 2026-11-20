@@ -11,10 +11,11 @@
 #include <optional>
 #include <string>
 #include <thread>
+#include <unordered_set>
 
-#include "admin.pb.h"
 #include "common/status.h"
-#include "openevent.pb.h"
+#include "openevent/sdk/proto/admin.pb.h"
+#include "openevent/sdk/proto/openevent.pb.h"
 #include "storage/unified_storage.h"
 
 namespace grpc {
@@ -75,11 +76,8 @@ public:
                                   const google::protobuf::RepeatedField<uint64_t>& channels,
                                   FetchResponse* response,
                                   uint64_t* snapshot_version = nullptr) const;
-    uint64_t SubscriptionSnapshotVersion() const;
     bool WaitForSubscriptionSnapshot(uint64_t observed_version,
                                      std::chrono::milliseconds timeout) const;
-
-    Result<uint64_t> MaxSeq() const;
 
 private:
     struct SubscriptionSnapshot {
@@ -111,12 +109,10 @@ private:
                                      rocksdb::WriteBatch* batch) const;
     Status ValidatePayloadSize(const std::string& payload) const;
     Status ValidateObjectKeysShape(const google::protobuf::RepeatedPtrField<ObjectKey>& object_keys) const;
-    Result<StoredObject> LoadAuthorizedObject(const ReadSnapshot& snapshot,
-                                              uint64_t object_id,
-                                              const std::string& object_token) const;
+    Result<storage::internal::ObjectRecord> LoadAuthorizedObject(
+        const ReadSnapshot& snapshot, uint64_t object_id, const std::string& object_token) const;
     Status CleanupPreparingObject(uint64_t object_id, const Status& result);
     Status FatalStorageError(const Status& status) const;
-    // Explicit channels must have passed ValidateReadableChannels in the same snapshot.
     Status FetchVisible(const ReadSnapshot& snapshot,
                         uint64_t principal,
                         uint64_t from_seq,
@@ -124,7 +120,7 @@ private:
                         bool only_my_recipient,
                         const google::protobuf::RepeatedField<uint64_t>& channels,
                         FetchResponse* response) const;
-    Status ValidateReadableChannels(
+    Result<std::unordered_set<uint64_t>> ValidateReadableChannels(
         const ReadSnapshot& snapshot,
         uint64_t principal,
         const google::protobuf::RepeatedField<uint64_t>& channels) const;
@@ -137,8 +133,6 @@ private:
     bool CanRead(const ChannelInfo& channel, uint64_t principal) const;
     bool CanWrite(const ChannelInfo& channel, uint64_t principal) const;
     bool IsMember(const ChannelInfo& channel, uint64_t principal) const;
-    Status ValidateRecipients(const ChannelInfo& channel,
-                              const google::protobuf::RepeatedField<uint64_t>& recipients) const;
     bool HasRecipient(const EventMessage& message, uint64_t principal) const;
     ChannelInfo SystemChannel() const;
     Status ValidateVisibility(Visibility visibility) const;

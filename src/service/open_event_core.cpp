@@ -5,6 +5,7 @@
 #include <chrono>
 #include <cstring>
 #include <iomanip>
+#include <span>
 #include <sstream>
 #include <unordered_map>
 #include <unordered_set>
@@ -12,16 +13,98 @@
 
 #include <sys/random.h>
 
+#include <google/protobuf/util/message_differencer.h>
 #include <grpcpp/server_context.h>
 
 #include "common/object_limits.h"
 #include "common/message_limits.h"
 
 namespace openevent {
+
+using storage::internal::ObjectRecord;
+
 namespace {
 
 constexpr uint32_t kMaxUuidBatch = 1024;
 constexpr int kMaxChannelMembers = 1024;
+
+struct IndexedObjectKeys {
+    explicit IndexedObjectKeys(const google::protobuf::RepeatedPtrField<ObjectKey>& keys)
+    {
+        std::unordered_map<uint64_t, size_t> index_by_id;
+        ids.reserve(keys.size());
+        positions.reserve(keys.size());
+        for (const auto& key : keys) {
+            const auto [position, inserted] = index_by_id.emplace(key.object_id(), ids.size());
+            if (inserted) {
+                ids.push_back(key.object_id());
+            }
+            positions.push_back(position->second);
+        }
+    }
+
+    std::vector<uint64_t> ids;
+    std::vector<size_t> positions;
+};
+
+Status CheckObjectToken(const std::optional<ObjectRecord>& object, const std::string& token)
+{
+    if (!object || !ObjectFileStore::ConstantTimeEquals(object->object_token(), token)) {
+        return Status(grpc::StatusCode::NOT_FOUND, "object capability not found");
+    }
+    return Status::Ok();
+}
+
+template <typename Metadata>
+void FillObjectMetadata(const ObjectRecord& record, Metadata* output)
+{
+    output->set_name(record.name());
+    output->set_type(record.type());
+    output->set_description(record.description());
+    output->set_nbytes(record.nbytes());
+}
+
+Status SetMessageRecipients(const ChannelInfo& channel,
+                            const google::protobuf::RepeatedField<uint64_t>& recipients,
+                            EventMessage* message)
+{
+    if (recipients.empty()) {
+        return Status::Ok();
+    }
+    std::unordered_map<uint64_t, bool> selected;
+    for (uint64_t member : channel.members()) {
+        selected.emplace(member, false);
+    }
+    for (uint64_t recipient : recipients) {
+        auto member = selected.find(recipient);
+        if (member == selected.end()) {
+            return Status(grpc::StatusCode::INVALID_ARGUMENT, "recipient must be channel member");
+        }
+        if (!member->second) {
+            message->add_recipients(recipient);
+            member->second = true;
+        }
+    }
+    return Status::Ok();
+}
+
+MessageScanAction AppendPageMessage(EventMessage&& message,
+                                    google::protobuf::RepeatedPtrField<EventMessage>* messages,
+                                    uint32_t limit,
+                                    size_t byte_limit,
+                                    size_t& page_bytes)
+{
+    const size_t message_bytes = message.ByteSizeLong();
+    if (!messages->empty() && message_bytes > byte_limit - page_bytes) {
+        return MessageScanAction::kStopBefore;
+    }
+    *messages->Add() = std::move(message);
+    page_bytes += message_bytes;
+    if (page_bytes >= byte_limit || messages->size() >= static_cast<int>(limit)) {
+        return MessageScanAction::kStopAfter;
+    }
+    return MessageScanAction::kContinue;
+}
 
 uint64_t NowMs()
 {
@@ -29,12 +112,11 @@ uint64_t NowMs()
     return duration_cast<milliseconds>(system_clock::now().time_since_epoch()).count();
 }
 
-Result<std::string> GenerateToken()
+Status FillRandomBytes(std::span<unsigned char> bytes)
 {
-    unsigned char bytes[16];
     size_t filled = 0;
-    while (filled < sizeof(bytes)) {
-        ssize_t count = getrandom(bytes + filled, sizeof(bytes) - filled, 0);
+    while (filled < bytes.size()) {
+        const ssize_t count = getrandom(bytes.data() + filled, bytes.size() - filled, 0);
         if (count < 0) {
             if (errno == EINTR) {
                 continue;
@@ -42,6 +124,16 @@ Result<std::string> GenerateToken()
             return Status(grpc::StatusCode::INTERNAL, std::string("getrandom failed: ") + std::strerror(errno));
         }
         filled += static_cast<size_t>(count);
+    }
+    return Status::Ok();
+}
+
+Result<std::string> GenerateToken()
+{
+    unsigned char bytes[16];
+    const Status status = FillRandomBytes(bytes);
+    if (!status.ok()) {
+        return status;
     }
 
     std::ostringstream oss;
@@ -58,17 +150,9 @@ Result<std::string> GenerateToken()
 Result<std::string> GenerateObjectToken()
 {
     unsigned char bytes[kObjectTokenRandomBytes];
-    size_t filled = 0;
-    while (filled < sizeof(bytes)) {
-        const ssize_t count = getrandom(bytes + filled, sizeof(bytes) - filled, 0);
-        if (count < 0) {
-            if (errno == EINTR) {
-                continue;
-            }
-            return Status(grpc::StatusCode::INTERNAL,
-                          std::string("getrandom failed: ") + std::strerror(errno));
-        }
-        filled += static_cast<size_t>(count);
+    const Status status = FillRandomBytes(bytes);
+    if (!status.ok()) {
+        return status;
     }
 
     constexpr char kBase64Url[] =
@@ -99,14 +183,6 @@ Result<std::string> GenerateObjectToken()
         token.push_back(kBase64Url[(value >> 6) & 0x3f]);
     }
     return token;
-}
-
-bool SameObject(const StoredObject& left, const StoredObject& right)
-{
-    return left.object_id == right.object_id && left.object_token == right.object_token &&
-           left.creator_principal == right.creator_principal && left.name == right.name &&
-           left.type == right.type && left.description == right.description &&
-           left.nbytes == right.nbytes;
 }
 
 template <typename Repeated>
@@ -258,11 +334,10 @@ Result<OpenEventCore::SubscriptionSnapshot> OpenEventCore::AcquireSubscriptionSn
         subscription_snapshot_attempt_generation_ >= required_generation) {
         return subscription_snapshot_status_;
     }
-    if (!subscription_snapshot_) {
-        if (fatal_error_triggered_.load(std::memory_order_acquire)) {
-            return Status(grpc::StatusCode::UNAVAILABLE,
-                          "subscription snapshot is unavailable after fatal storage error");
-        }
+    if (stop_subscription_snapshot_thread_ || fatal_error_triggered_.load(std::memory_order_acquire)) {
+        return Status(grpc::StatusCode::UNAVAILABLE, "subscription snapshot refresh is stopping");
+    }
+    if (!subscription_snapshot_ || subscription_snapshot_generation_ < required_generation) {
         return Status(grpc::StatusCode::UNAVAILABLE, "subscription snapshot is unavailable");
     }
     return SubscriptionSnapshot{subscription_snapshot_, subscription_snapshot_version_};
@@ -475,43 +550,30 @@ Status OpenEventCore::BuildPublishBatch(const ReadSnapshot& snapshot,
     if (!CanWrite(channel, principal)) {
         return Status(grpc::StatusCode::PERMISSION_DENIED, "write permission denied");
     }
-    Status recipients_status = ValidateRecipients(channel, recipients);
+    EventMessage message;
+    Status recipients_status = SetMessageRecipients(channel, recipients, &message);
     if (!recipients_status.ok()) {
         return recipients_status;
     }
-    std::vector<uint64_t> object_ids;
-    object_ids.reserve(object_keys.size());
-    std::unordered_map<uint64_t, size_t> object_indexes;
-    object_indexes.reserve(object_keys.size());
-    for (const auto& object_key : object_keys) {
-        const bool inserted =
-            object_indexes.emplace(object_key.object_id(), object_ids.size()).second;
-        if (inserted) {
-            object_ids.push_back(object_key.object_id());
+    const IndexedObjectKeys indexed(object_keys);
+    const auto objects = storage_->GetCommittedObjects(snapshot, indexed.ids);
+    // Publish checks all referenced records for storage errors before authorizing tokens.
+    for (const auto& object : objects) {
+        if (!object.ok()) {
+            return HandleRpcStatus(object.status());
         }
     }
-    auto objects = storage_->GetCommittedObjects(snapshot, object_ids);
-    if (!objects.ok()) {
-        return objects.status().requires_server_exit() ||
-                       objects.status().code() == grpc::StatusCode::DATA_LOSS
-                   ? FatalStorageError(objects.status())
-                   : objects.status();
-    }
-    for (const auto& object_key : object_keys) {
-        const auto& object = objects.value()[object_indexes.at(object_key.object_id())];
-        if (!object.has_value() ||
-            !ObjectFileStore::ConstantTimeEquals(object->object_token, object_key.object_token())) {
-            return Status(grpc::StatusCode::NOT_FOUND, "object capability not found");
+    for (int i = 0; i < object_keys.size(); ++i) {
+        const auto& object = objects[indexed.positions[i]].value();
+        Status authorized = CheckObjectToken(object, object_keys.Get(i).object_token());
+        if (!authorized.ok()) {
+            return authorized;
         }
     }
 
-    EventMessage message;
     message.set_seq(seq);
     message.set_channel_id(channel_id);
     message.set_principal(principal);
-    for (uint64_t recipient : recipients) {
-        message.add_recipients(recipient);
-    }
     message.set_payload(payload);
     message.set_ts_ms(ts_ms);
     message.set_uuid(uuid);
@@ -746,7 +808,7 @@ Status OpenEventCore::ValidateObjectKeysShape(
     return Status::Ok();
 }
 
-Result<StoredObject> OpenEventCore::LoadAuthorizedObject(const ReadSnapshot& snapshot,
+Result<ObjectRecord> OpenEventCore::LoadAuthorizedObject(const ReadSnapshot& snapshot,
                                                         uint64_t object_id,
                                                         const std::string& object_token) const
 {
@@ -756,16 +818,13 @@ Result<StoredObject> OpenEventCore::LoadAuthorizedObject(const ReadSnapshot& sna
     }
     auto object = storage_->GetCommittedObject(snapshot, object_id);
     if (!object.ok()) {
-        return object.status().requires_server_exit() ||
-                       object.status().code() == grpc::StatusCode::DATA_LOSS
-                   ? FatalStorageError(object.status())
-                   : object.status();
+        return HandleRpcStatus(object.status());
     }
-    if (!object.value().has_value() ||
-        !ObjectFileStore::ConstantTimeEquals(object.value()->object_token, object_token)) {
-        return Status(grpc::StatusCode::NOT_FOUND, "object capability not found");
+    Status authorized = CheckObjectToken(object.value(), object_token);
+    if (!authorized.ok()) {
+        return authorized;
     }
-    return object.value().value();
+    return std::move(*object.value());
 }
 
 Status OpenEventCore::FatalStorageError(const Status& status) const
@@ -786,7 +845,7 @@ Status OpenEventCore::FatalStorageError(const Status& status) const
 
 Status OpenEventCore::HandleRpcStatus(const Status& status) const
 {
-    if (status.requires_server_exit() || status.code() == grpc::StatusCode::DATA_LOSS) {
+    if (status.requires_server_exit()) {
         FatalStorageError(status);
     }
     return status;
@@ -794,12 +853,9 @@ Status OpenEventCore::HandleRpcStatus(const Status& status) const
 
 Status OpenEventCore::CleanupPreparingObject(uint64_t object_id, const Status& result)
 {
-    Status file_status = storage_->CleanupObjectFiles(object_id);
+    Status file_status = storage_->CleanupObjectFile(object_id);
     if (!file_status.ok()) {
-        return file_status.requires_server_exit() ||
-                       file_status.code() == grpc::StatusCode::DATA_LOSS
-                   ? FatalStorageError(file_status)
-                   : file_status;
+        return HandleRpcStatus(file_status);
     }
 
     std::lock_guard<std::mutex> lock(coordinator_mu_);
@@ -829,13 +885,13 @@ Status OpenEventCore::WriteObject(const WriteObjectRequest& request, WriteObject
     if (!object_token.ok()) {
         return object_token.status();
     }
-    StoredObject object;
-    object.object_token = std::move(object_token.value());
-    object.creator_principal = request.principal();
-    object.name = request.name();
-    object.type = request.type();
-    object.description = request.description();
-    object.nbytes = request.data().size();
+    ObjectRecord object;
+    object.set_object_token(std::move(object_token.value()));
+    object.set_creator_principal(request.principal());
+    object.set_name(request.name());
+    object.set_type(request.type());
+    object.set_description(request.description());
+    object.set_nbytes(request.data().size());
 
     {
         std::lock_guard<std::mutex> lock(coordinator_mu_);
@@ -852,14 +908,14 @@ Status OpenEventCore::WriteObject(const WriteObjectRequest& request, WriteObject
         if (!next_object_id.ok()) {
             return next_object_id.status();
         }
-        object.object_id = next_object_id.value();
+        object.set_object_id(next_object_id.value());
 
         rocksdb::WriteBatch batch;
         Status status = storage_->PutPreparingObject(&batch, object);
         if (!status.ok()) {
             return status;
         }
-        status = storage_->SetNextObjectId(&batch, object.object_id + 1);
+        status = storage_->SetNextObjectId(&batch, object.object_id() + 1);
         if (!status.ok()) {
             return status;
         }
@@ -869,17 +925,15 @@ Status OpenEventCore::WriteObject(const WriteObjectRequest& request, WriteObject
         }
     }
 
-    Status file_status = storage_->WriteObjectFile(object.object_id, request.data());
+    Status file_status = storage_->WriteObjectFile(object.object_id(), request.data());
     if (!file_status.ok()) {
-        if (file_status.requires_server_exit() ||
-            file_status.code() == grpc::StatusCode::DATA_LOSS) {
+        if (file_status.requires_server_exit()) {
             return FatalStorageError(file_status);
         }
-        return CleanupPreparingObject(object.object_id, file_status);
+        return CleanupPreparingObject(object.object_id(), file_status);
     }
 
     Status final_status = Status::Ok();
-    bool commit_attempted = false;
     {
         std::lock_guard<std::mutex> lock(coordinator_mu_);
         auto snapshot_result = storage_->CreateSnapshot();
@@ -889,15 +943,14 @@ Status OpenEventCore::WriteObject(const WriteObjectRequest& request, WriteObject
             ReadSnapshot snapshot = std::move(snapshot_result.value());
             final_status = Authenticate(snapshot, request.principal(), request.token());
             if (final_status.ok()) {
-                auto preparing = storage_->GetPreparingObject(snapshot, object.object_id);
+                auto preparing = storage_->GetPreparingObject(snapshot, object.object_id());
                 if (!preparing.ok()) {
-                    if (preparing.status().requires_server_exit() ||
-                        preparing.status().code() == grpc::StatusCode::DATA_LOSS) {
+                    if (preparing.status().requires_server_exit()) {
                         return FatalStorageError(preparing.status());
                     }
                     final_status = preparing.status();
                 } else if (!preparing.value().has_value() ||
-                           !SameObject(preparing.value().value(), object)) {
+                           !google::protobuf::util::MessageDifferencer::Equals(*preparing.value(), object)) {
                     return FatalStorageError(Status::StorageCorruption(
                         "commit object metadata",
                         "preparing object metadata changed unexpectedly"));
@@ -905,26 +958,22 @@ Status OpenEventCore::WriteObject(const WriteObjectRequest& request, WriteObject
                     rocksdb::WriteBatch batch;
                     final_status = storage_->PutCommittedObject(&batch, object);
                     if (final_status.ok()) {
-                        commit_attempted = true;
-                        final_status = CommitBatch(&batch);
-                    }
-                    if (final_status.ok()) {
-                        response->set_object_id(object.object_id);
-                        response->set_object_token(object.object_token);
-                        return Status::Ok();
+                        const Status committed = CommitBatch(&batch);
+                        if (committed.ok()) {
+                            response->set_object_id(object.object_id());
+                            response->set_object_token(object.object_token());
+                        }
+                        // A failed commit has an unknown outcome. Recovery handles the file.
+                        return committed;
                     }
                 }
             }
         }
     }
-    if (commit_attempted) {
+    if (final_status.requires_server_exit()) {
         return FatalStorageError(final_status);
     }
-    if (final_status.requires_server_exit() ||
-        final_status.code() == grpc::StatusCode::DATA_LOSS) {
-        return FatalStorageError(final_status);
-    }
-    return CleanupPreparingObject(object.object_id, final_status);
+    return CleanupPreparingObject(object.object_id(), final_status);
 }
 
 Status OpenEventCore::GetObjectMetadata(const GetObjectMetadataRequest& request,
@@ -943,10 +992,7 @@ Status OpenEventCore::GetObjectMetadata(const GetObjectMetadataRequest& request,
     if (!object.ok()) {
         return object.status();
     }
-    response->set_name(object.value().name);
-    response->set_type(object.value().type);
-    response->set_description(object.value().description);
-    response->set_nbytes(object.value().nbytes);
+    FillObjectMetadata(object.value(), response);
     return Status::Ok();
 }
 
@@ -970,17 +1016,20 @@ Status OpenEventCore::BatchGetObjectMetadata(const BatchGetObjectMetadataRequest
         return snapshot_result.status();
     }
     ReadSnapshot snapshot = std::move(snapshot_result.value());
+    const IndexedObjectKeys indexed(request.object_keys());
+    const auto objects = storage_->GetCommittedObjects(snapshot, indexed.ids);
+    const Status read_error = UnifiedStorage::MostSevereReadError(objects);
+    if (!read_error.ok()) {
+        return HandleRpcStatus(read_error);
+    }
     BatchGetObjectMetadataResponse staged;
-    for (const auto& key : request.object_keys()) {
-        auto object = LoadAuthorizedObject(snapshot, key.object_id(), key.object_token());
-        if (!object.ok()) {
-            return object.status();
+    for (int i = 0; i < request.object_keys_size(); ++i) {
+        const auto& object = objects[indexed.positions[i]].value();
+        Status authorized = CheckObjectToken(object, request.object_keys(i).object_token());
+        if (!authorized.ok()) {
+            return authorized;
         }
-        auto* metadata = staged.add_metadata();
-        metadata->set_name(object.value().name);
-        metadata->set_type(object.value().type);
-        metadata->set_description(object.value().description);
-        metadata->set_nbytes(object.value().nbytes);
+        FillObjectMetadata(*object, staged.add_metadata());
     }
     response->Swap(&staged);
     return Status::Ok();
@@ -996,7 +1045,7 @@ Status OpenEventCore::ReadObject(const ReadObjectRequest& request, ReadObjectRes
         return Status(grpc::StatusCode::INVALID_ARGUMENT, "nbytes must be greater than 0");
     }
 
-    StoredObject object;
+    ObjectRecord object;
     {
         auto snapshot_result = CreateLinearizedSnapshot();
         if (!snapshot_result.ok()) {
@@ -1010,15 +1059,12 @@ Status OpenEventCore::ReadObject(const ReadObjectRequest& request, ReadObjectRes
         object = std::move(loaded.value());
     }
 
-    if (request.offset() > object.nbytes) {
+    if (request.offset() > object.nbytes()) {
         return Status(grpc::StatusCode::OUT_OF_RANGE, "offset exceeds object size");
     }
     auto data = storage_->ReadObjectFile(object, request.offset(), request.nbytes());
     if (!data.ok()) {
-        return data.status().requires_server_exit() ||
-                       data.status().code() == grpc::StatusCode::DATA_LOSS
-                   ? FatalStorageError(data.status())
-                   : data.status();
+        return HandleRpcStatus(data.status());
     }
     response->set_data(std::move(data.value()));
     return Status::Ok();
@@ -1042,11 +1088,6 @@ Status OpenEventCore::Fetch(const FetchRequest& request, FetchResponse* response
     if (!auth.ok()) {
         return auth;
     }
-    Status channel_status =
-        ValidateReadableChannels(snapshot, request.principal(), request.channels());
-    if (!channel_status.ok()) {
-        return channel_status;
-    }
     return FetchVisible(snapshot,
                         request.principal(),
                         request.from_seq(),
@@ -1064,6 +1105,10 @@ Status OpenEventCore::FetchVisible(const ReadSnapshot& snapshot,
                                    const google::protobuf::RepeatedField<uint64_t>& channels,
                                    FetchResponse* response) const
 {
+    auto requested_channels = ValidateReadableChannels(snapshot, principal, channels);
+    if (!requested_channels.ok()) {
+        return requested_channels.status();
+    }
     auto max_seq_result = storage_->GetMaxSeq(snapshot);
     if (!max_seq_result.ok()) {
         return max_seq_result.status();
@@ -1076,50 +1121,41 @@ Status OpenEventCore::FetchVisible(const ReadSnapshot& snapshot,
         return Status::Ok();
     }
 
-    const std::unordered_set<uint64_t> requested_channels(channels.begin(), channels.end());
     std::unordered_map<uint64_t, bool> readable_channels;
-    // Both callers already validated every explicit Channel in this snapshot.
-    for (uint64_t channel_id : requested_channels) {
-        readable_channels.emplace(channel_id, true);
-    }
     size_t response_bytes = 0;
     auto next_seq = storage_->ScanMessages(
         snapshot,
         from_seq,
         max_seq,
         max_scan_records_,
-        [&](const EventMessage& message) -> Result<MessageScanAction> {
-            if (!requested_channels.empty() && !requested_channels.contains(message.channel_id())) {
+        [&](EventMessage&& message) -> Result<MessageScanAction> {
+            if (!requested_channels.value().empty()) {
+                if (!requested_channels.value().contains(message.channel_id())) {
+                    return MessageScanAction::kContinue;
+                }
+            } else {
+                auto readable = readable_channels.find(message.channel_id());
+                if (readable == readable_channels.end()) {
+                    auto channel_result = LoadChannel(snapshot, message.channel_id());
+                    if (!channel_result.ok()) {
+                        return channel_result.status();
+                    }
+                    if (!channel_result.value().has_value()) {
+                        return Status::StorageCorruption("scan visible messages",
+                                      "message references a missing channel");
+                    }
+                    const bool can_read = CanRead(channel_result.value().value(), principal);
+                    readable = readable_channels.emplace(message.channel_id(), can_read).first;
+                }
+                if (!readable->second) {
+                    return MessageScanAction::kContinue;
+                }
+            }
+            if (only_my_recipient && !HasRecipient(message, principal)) {
                 return MessageScanAction::kContinue;
             }
-            auto readable = readable_channels.find(message.channel_id());
-            if (readable == readable_channels.end()) {
-                auto channel_result = LoadChannel(snapshot, message.channel_id());
-                if (!channel_result.ok()) {
-                    return channel_result.status();
-                }
-                if (!channel_result.value().has_value()) {
-                    return Status::StorageCorruption("scan visible messages",
-                                  "message references a missing channel");
-                }
-                const bool can_read = CanRead(channel_result.value().value(), principal);
-                readable = readable_channels.emplace(message.channel_id(), can_read).first;
-            }
-            if (!readable->second || (only_my_recipient && !HasRecipient(message, principal))) {
-                return MessageScanAction::kContinue;
-            }
-
-            const size_t message_bytes = message.ByteSizeLong();
-            if (response->messages_size() > 0 &&
-                message_bytes > response_soft_limit_bytes_ - std::min(response_bytes, response_soft_limit_bytes_)) {
-                return MessageScanAction::kStopBefore;
-            }
-            *response->add_messages() = message;
-            response_bytes += message_bytes;
-            if (response->messages_size() >= static_cast<int>(limit)) {
-                return MessageScanAction::kStopAfter;
-            }
-            return MessageScanAction::kContinue;
+            return AppendPageMessage(std::move(message), response->mutable_messages(), limit,
+                                     response_soft_limit_bytes_, response_bytes);
         });
     if (!next_seq.ok()) {
         return next_seq.status();
@@ -1251,24 +1287,23 @@ Status OpenEventCore::ListChannels(const ListChannelsRequest& request, ListChann
     if (request.filter() == CHANNEL_FILTER_ALL) {
         *response->add_channels() = SystemChannel();
     }
-    auto channels = storage_->ListChannels(snapshot);
-    if (!channels.ok()) {
-        return channels.status();
-    }
-    for (const auto& channel : channels.value()) {
+    const Status status = storage_->ScanChannels(snapshot, [&](ChannelInfo&& channel) {
         if (!CanRead(channel, request.principal())) {
-            continue;
+            return;
         }
         if (request.filter() == CHANNEL_FILTER_JOINED && !IsMember(channel, request.principal())) {
-            continue;
+            return;
         }
         if (request.filter() == CHANNEL_FILTER_OWNED &&
             (!channel.has_creator() || channel.creator() != request.principal())) {
-            continue;
+            return;
         }
-        *response->add_channels() = channel;
+        *response->add_channels() = std::move(channel);
+    });
+    if (!status.ok()) {
+        response->clear_channels();
     }
-    return Status::Ok();
+    return status;
 }
 
 Status OpenEventCore::AddMember(const AddMemberRequest& request, AddMemberResponse*)
@@ -1457,35 +1492,14 @@ Status OpenEventCore::ListAllMessages(const ReadSnapshot& snapshot,
     }
 
     size_t response_bytes = 0;
-    std::unordered_set<uint64_t> known_channels;
     auto next_seq = storage_->ScanMessages(
         snapshot,
         start_seq,
         max_seq,
         max_scan_records_,
-        [&](const EventMessage& message) -> Result<MessageScanAction> {
-            if (!known_channels.contains(message.channel_id())) {
-                auto channel = LoadChannel(snapshot, message.channel_id());
-                if (!channel.ok()) {
-                    return channel.status();
-                }
-                if (!channel.value().has_value()) {
-                    return Status::StorageCorruption("scan subscription messages",
-                                  "message references a missing channel");
-                }
-                known_channels.insert(message.channel_id());
-            }
-            const size_t message_bytes = message.ByteSizeLong();
-            if (response->messages_size() > 0 &&
-                message_bytes > response_soft_limit_bytes_ - std::min(response_bytes, response_soft_limit_bytes_)) {
-                return MessageScanAction::kStopBefore;
-            }
-            *response->add_messages() = message;
-            response_bytes += message_bytes;
-            if (response->messages_size() >= static_cast<int>(limit)) {
-                return MessageScanAction::kStopAfter;
-            }
-            return MessageScanAction::kContinue;
+        [&](EventMessage&& message) {
+            return AppendPageMessage(std::move(message), response->mutable_messages(), limit,
+                                     response_soft_limit_bytes_, response_bytes);
         });
     if (!next_seq.ok()) {
         return next_seq.status();
@@ -1513,9 +1527,9 @@ Status OpenEventCore::GetSubscriptionMaxSeq(
     if (!auth.ok()) {
         return auth;
     }
-    Status channel_status = ValidateReadableChannels(snapshot, principal, channels);
-    if (!channel_status.ok()) {
-        return channel_status;
+    auto requested_channels = ValidateReadableChannels(snapshot, principal, channels);
+    if (!requested_channels.ok()) {
+        return requested_channels.status();
     }
     auto result = storage_->GetMaxSeq(snapshot);
     if (!result.ok()) {
@@ -1543,21 +1557,11 @@ Status OpenEventCore::FetchSubscriptionBatch(uint64_t principal,
     if (!auth.ok()) {
         return auth;
     }
-    Status channel_status = ValidateReadableChannels(snapshot, principal, channels);
-    if (!channel_status.ok()) {
-        return channel_status;
-    }
     Status status = FetchVisible(snapshot, principal, from_seq, limit, only_my_recipient, channels, response);
     if (status.ok() && snapshot_version != nullptr) {
         *snapshot_version = snapshot_result.value().version;
     }
     return status;
-}
-
-uint64_t OpenEventCore::SubscriptionSnapshotVersion() const
-{
-    std::lock_guard<std::mutex> lock(subscription_snapshot_mu_);
-    return subscription_snapshot_version_;
 }
 
 bool OpenEventCore::WaitForSubscriptionSnapshot(uint64_t observed_version,
@@ -1577,20 +1581,6 @@ bool OpenEventCore::WaitForSubscriptionSnapshot(uint64_t observed_version,
            (!subscription_snapshot_status_.ok() &&
             subscription_snapshot_attempt_generation_ >
                 subscription_snapshot_generation_);
-}
-
-Result<uint64_t> OpenEventCore::MaxSeq() const
-{
-    Status available = EnsureAvailable();
-    if (!available.ok()) {
-        return available;
-    }
-    auto snapshot_result = storage_->CreateSnapshot();
-    if (!snapshot_result.ok()) {
-        return snapshot_result.status();
-    }
-    ReadSnapshot snapshot = std::move(snapshot_result.value());
-    return storage_->GetMaxSeq(snapshot);
 }
 
 Result<std::optional<ChannelInfo>> OpenEventCore::LoadChannel(const ReadSnapshot& snapshot,
@@ -1613,28 +1603,32 @@ bool OpenEventCore::CanRead(const ChannelInfo& channel, uint64_t principal) cons
     return IsMember(channel, principal);
 }
 
-Status OpenEventCore::ValidateReadableChannels(
+Result<std::unordered_set<uint64_t>> OpenEventCore::ValidateReadableChannels(
     const ReadSnapshot& snapshot,
     uint64_t principal,
     const google::protobuf::RepeatedField<uint64_t>& channels) const
 {
     std::unordered_set<uint64_t> validated;
+    std::vector<uint64_t> stored_ids;
     for (uint64_t channel_id : channels) {
-        if (!validated.insert(channel_id).second) {
-            continue;
-        }
-        auto channel_result = LoadChannel(snapshot, channel_id);
-        if (!channel_result.ok()) {
-            return channel_result.status();
-        }
-        if (!channel_result.value().has_value()) {
-            return Status(grpc::StatusCode::NOT_FOUND, "channel not found");
-        }
-        if (!CanRead(channel_result.value().value(), principal)) {
-            return Status(grpc::StatusCode::PERMISSION_DENIED, "channel not visible");
+        if (validated.insert(channel_id).second && channel_id != 0) {
+            stored_ids.push_back(channel_id);
         }
     }
-    return Status::Ok();
+    const Status status = storage_->CheckChannels(
+        snapshot, stored_ids, [&](const std::optional<ChannelInfo>& channel) {
+            if (!channel) {
+                return Status(grpc::StatusCode::NOT_FOUND, "channel not found");
+            }
+            if (!CanRead(*channel, principal)) {
+                return Status(grpc::StatusCode::PERMISSION_DENIED, "channel not visible");
+            }
+            return Status::Ok();
+        });
+    if (!status.ok()) {
+        return HandleRpcStatus(status);
+    }
+    return validated;
 }
 
 bool OpenEventCore::CanWrite(const ChannelInfo& channel, uint64_t principal) const
@@ -1651,21 +1645,6 @@ bool OpenEventCore::CanWrite(const ChannelInfo& channel, uint64_t principal) con
 bool OpenEventCore::IsMember(const ChannelInfo& channel, uint64_t principal) const
 {
     return Contains(channel.members(), principal);
-}
-
-Status OpenEventCore::ValidateRecipients(const ChannelInfo& channel,
-                                         const google::protobuf::RepeatedField<uint64_t>& recipients) const
-{
-    if (recipients.empty()) {
-        return Status::Ok();
-    }
-    const std::unordered_set<uint64_t> members(channel.members().begin(), channel.members().end());
-    for (uint64_t recipient : recipients) {
-        if (!members.contains(recipient)) {
-            return Status(grpc::StatusCode::INVALID_ARGUMENT, "recipient must be channel member");
-        }
-    }
-    return Status::Ok();
 }
 
 bool OpenEventCore::HasRecipient(const EventMessage& message, uint64_t principal) const

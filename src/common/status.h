@@ -39,7 +39,7 @@ public:
 
     static Status StorageCorruption(std::string operation, std::string error)
     {
-        return Status(grpc::StatusCode::DATA_LOSS, error)
+        return Fatal(grpc::StatusCode::DATA_LOSS, error)
             .WithStorageDiagnostic(std::move(operation), std::move(error));
     }
 

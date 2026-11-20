@@ -11,24 +11,22 @@
 #include <utility>
 #include <vector>
 
-#include <fcntl.h>
 #include <google/protobuf/struct.pb.h>
 #include <google/protobuf/util/json_util.h>
 #include <rocksdb/options.h>
-#include <unistd.h>
 
-#include "object_record.pb.h"
 #include "common/object_limits.h"
 #include "storage/encoding.h"
 #include "storage/rocksdb_status.h"
 
 namespace openevent {
+
+using storage::internal::ObjectRecord;
+
 namespace {
 
-constexpr uint64_t kSchemaVersion = 6;
 constexpr const char* kMessagesColumnFamily = "messages";
 constexpr const char* kObjectsColumnFamily = "objects";
-constexpr const char* kSchemaVersionKey = "meta:schema_version";
 constexpr const char* kMaxSeqKey = "meta:max_seq";
 constexpr const char* kNextUuidKey = "meta:next_uuid";
 constexpr const char* kNextChannelIdKey = "meta:next_channel_id";
@@ -184,7 +182,7 @@ Result<uint64_t> DecodeNumericKey(const rocksdb::Slice& key, const char* prefix,
     return DecodeUint64(std::string(key.data() + prefix_size, sizeof(uint64_t)));
 }
 
-bool IsEmptyDirectory(const std::filesystem::path& path)
+bool IsNewStorageRoot(const std::filesystem::path& path)
 {
     std::error_code ec;
     if (!std::filesystem::exists(path, ec)) {
@@ -194,11 +192,6 @@ bool IsEmptyDirectory(const std::filesystem::path& path)
         return false;
     }
     return std::filesystem::directory_iterator(path, ec) == std::filesystem::directory_iterator() && !ec;
-}
-
-bool IsNewStorageRoot(const std::string& path)
-{
-    return IsEmptyDirectory(path);
 }
 
 Status ValidateStorageRootLayout(const std::filesystem::path& root)
@@ -238,117 +231,24 @@ Status ValidateStorageRootLayout(const std::filesystem::path& root)
     return Status::Ok();
 }
 
-Status SyncDirectory(const std::filesystem::path& path)
+Status ValidateColumnFamilies(const std::filesystem::path& db_path)
 {
-    const int fd = ::open(path.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
-    if (fd < 0) {
-        return Status(grpc::StatusCode::UNAVAILABLE,
-                      "open directory for fsync: " + std::string(std::strerror(errno)));
+    std::vector<std::string> column_families;
+    auto status = rocksdb::DB::ListColumnFamilies(rocksdb::DBOptions(), db_path.string(), &column_families);
+    if (!status.ok()) {
+        return RocksToStatus(status, "list storage column families");
     }
-    if (::fsync(fd) != 0) {
-        const int error = errno;
-        ::close(fd);
-        return Status(grpc::StatusCode::UNAVAILABLE,
-                      "fsync directory: " + std::string(std::strerror(error)));
-    }
-    if (::close(fd) != 0) {
-        return Status(grpc::StatusCode::UNAVAILABLE,
-                      "close directory after fsync: " + std::string(std::strerror(errno)));
+    const std::set<std::string> names(column_families.begin(), column_families.end());
+    const std::set<std::string> supported{
+        rocksdb::kDefaultColumnFamilyName, kMessagesColumnFamily, kObjectsColumnFamily};
+    if (names != supported) {
+        return Status(grpc::StatusCode::INTERNAL, "unsupported storage column family layout");
     }
     return Status::Ok();
 }
 
-Status CreateDirectoryAndSyncParent(const std::filesystem::path& path)
+Result<std::string> SerializeObject(const ObjectRecord& record)
 {
-    std::error_code ec;
-    const bool created = std::filesystem::create_directory(path, ec);
-    if (ec) {
-        return Status(grpc::StatusCode::UNAVAILABLE,
-                      "create storage directory " + path.string() + ": " + ec.message());
-    }
-    if (!created && (!std::filesystem::is_directory(path, ec) || ec)) {
-        return Status(grpc::StatusCode::UNAVAILABLE,
-                      "storage path component is not a directory: " + path.string());
-    }
-    return created ? SyncDirectory(path.parent_path()) : Status::Ok();
-}
-
-Status CreateDirectoryTreeDurably(const std::filesystem::path& root)
-{
-    std::vector<std::filesystem::path> missing;
-    std::filesystem::path current = root;
-    std::error_code ec;
-    while (!std::filesystem::exists(current, ec)) {
-        if (ec) {
-            return Status(grpc::StatusCode::UNAVAILABLE,
-                          "inspect storage directory " + current.string() + ": " + ec.message());
-        }
-        missing.push_back(current);
-        const std::filesystem::path parent = current.parent_path();
-        if (parent.empty() || parent == current) {
-            return Status(grpc::StatusCode::UNAVAILABLE,
-                          "storage path has no existing directory ancestor: " + root.string());
-        }
-        current = parent;
-    }
-    if (ec || !std::filesystem::is_directory(current, ec) || ec) {
-        return Status(grpc::StatusCode::UNAVAILABLE,
-                      "storage path ancestor is not a directory: " + current.string());
-    }
-
-    for (auto it = missing.rbegin(); it != missing.rend(); ++it) {
-        Status status = CreateDirectoryAndSyncParent(*it);
-        if (!status.ok()) {
-            return status;
-        }
-    }
-    return Status::Ok();
-}
-
-Status CreateStorageDirectories(const std::string& root_path)
-{
-    std::error_code ec;
-    const std::filesystem::path root = std::filesystem::absolute(root_path, ec);
-    if (ec) {
-        return Status(grpc::StatusCode::UNAVAILABLE, "resolve storage root: " + ec.message());
-    }
-    Status root_status = CreateDirectoryTreeDurably(root);
-    if (!root_status.ok()) {
-        return root_status;
-    }
-    Status db_status = CreateDirectoryAndSyncParent(root / "db");
-    if (!db_status.ok()) {
-        return db_status;
-    }
-    Status objects_status = CreateDirectoryAndSyncParent(root / "objects");
-    if (!objects_status.ok()) {
-        return objects_status;
-    }
-    return Status::Ok();
-}
-
-Status DestroyHandles(rocksdb::DB* db, std::vector<rocksdb::ColumnFamilyHandle*>* handles)
-{
-    for (auto* handle : *handles) {
-        rocksdb::Status status = db->DestroyColumnFamilyHandle(handle);
-        if (!status.ok()) {
-            return RocksToStatus(status, "destroy column family handle");
-        }
-    }
-    handles->clear();
-    return Status::Ok();
-}
-
-Result<std::string> SerializeObject(const StoredObject& object)
-{
-    storage::internal::ObjectRecord record;
-    record.set_object_id(object.object_id);
-    record.set_object_token(object.object_token);
-    record.set_creator_principal(object.creator_principal);
-    record.set_name(object.name);
-    record.set_type(object.type);
-    record.set_description(object.description);
-    record.set_nbytes(object.nbytes);
     std::string payload;
     if (!record.SerializeToString(&payload)) {
         return Status(grpc::StatusCode::INTERNAL, "serialize object metadata failed");
@@ -365,10 +265,12 @@ bool IsBase64UrlToken(const std::string& token)
            });
 }
 
-Result<StoredObject> ParseObject(const std::string& payload, uint64_t expected_id)
+Result<ObjectRecord> ParseObject(const rocksdb::Slice& payload, uint64_t expected_id)
 {
-    storage::internal::ObjectRecord record;
-    if (!record.ParseFromString(payload) || record.object_id() != expected_id || expected_id == 0 ||
+    ObjectRecord record;
+    if (payload.size() > std::numeric_limits<int>::max() ||
+        !record.ParseFromArray(payload.data(), static_cast<int>(payload.size())) ||
+        record.object_id() != expected_id || expected_id == 0 ||
         !IsBase64UrlToken(record.object_token()) || record.creator_principal() == 0 || record.name().empty() ||
         record.name().size() > kMaxObjectNameBytes || record.type().empty() ||
         record.type().size() > kMaxObjectTypeBytes ||
@@ -376,15 +278,24 @@ Result<StoredObject> ParseObject(const std::string& payload, uint64_t expected_i
         record.nbytes() > kMaxObjectBytes) {
         return Status::StorageCorruption("decode object metadata", "invalid stored object metadata");
     }
-    StoredObject object;
-    object.object_id = record.object_id();
-    object.object_token = record.object_token();
-    object.creator_principal = record.creator_principal();
-    object.name = record.name();
-    object.type = record.type();
-    object.description = record.description();
-    object.nbytes = record.nbytes();
-    return object;
+    return record;
+}
+
+UnifiedStorage::ObjectLookupResult DecodeObjectLookup(const rocksdb::Status& status,
+                                                      const rocksdb::Slice& value,
+                                                      uint64_t object_id)
+{
+    if (status.IsNotFound()) {
+        return std::optional<ObjectRecord>{};
+    }
+    if (!status.ok()) {
+        return RocksToStatus(status, "read object metadata");
+    }
+    auto object = ParseObject(value, object_id);
+    if (!object.ok()) {
+        return object.status();
+    }
+    return std::optional<ObjectRecord>{std::move(object.value())};
 }
 
 bool ValidStoredChannel(const ChannelInfo& channel)
@@ -397,6 +308,60 @@ bool ValidStoredChannel(const ChannelInfo& channel)
                channel.members().end() &&
            std::find(channel.members().begin(), channel.members().end(), uint64_t{0}) ==
                channel.members().end();
+}
+
+UnifiedStorage::ChannelLookupResult DecodeChannelLookup(const rocksdb::Status& status,
+                                                         const rocksdb::Slice& value,
+                                                         uint64_t channel_id)
+{
+    if (status.IsNotFound()) {
+        return std::optional<ChannelInfo>{};
+    }
+    if (!status.ok()) {
+        return RocksToStatus(status, "read channel");
+    }
+    ChannelInfo channel;
+    if (value.size() > std::numeric_limits<int>::max() ||
+        !channel.ParseFromArray(value.data(), static_cast<int>(value.size())) ||
+        channel.channel_id() != channel_id || !ValidStoredChannel(channel)) {
+        return Status::StorageCorruption("read channel", "invalid stored channel");
+    }
+    return std::optional<ChannelInfo>{std::move(channel)};
+}
+
+void RetainReadError(Status& selected, const Status& candidate)
+{
+    if (!candidate.ok() && selected.code() != grpc::StatusCode::DATA_LOSS &&
+        (selected.ok() || candidate.code() == grpc::StatusCode::DATA_LOSS)) {
+        selected = candidate;
+    }
+}
+
+template <typename Decode, typename Visit>
+void MultiGetById(
+    rocksdb::DB& db, const rocksdb::Snapshot* snapshot, rocksdb::ColumnFamilyHandle* cf,
+    const char* prefix, const std::vector<uint64_t>& ids, Decode decode, Visit visit)
+{
+    if (ids.empty()) {
+        return;
+    }
+    std::vector<std::string> keys;
+    keys.reserve(ids.size());
+    for (uint64_t id : ids) {
+        keys.push_back(NumericKey(prefix, id));
+    }
+    std::vector<rocksdb::Slice> key_slices(keys.begin(), keys.end());
+    std::vector<rocksdb::PinnableSlice> values(ids.size());
+    std::vector<rocksdb::Status> statuses(ids.size());
+    rocksdb::ReadOptions options;
+    options.snapshot = snapshot;
+    db.MultiGet(options, cf, ids.size(), key_slices.data(), values.data(), statuses.data());
+
+    for (size_t i = 0; i < ids.size(); ++i) {
+        // Release this record's pin or owned buffer before decoding the next one.
+        auto value = std::move(values[i]);
+        visit(decode(statuses[i], value, ids[i]));
+    }
 }
 
 }  // namespace
@@ -439,13 +404,11 @@ UnifiedStorage::UnifiedStorage(std::unique_ptr<rocksdb::DB> db,
                                rocksdb::ColumnFamilyHandle* meta,
                                rocksdb::ColumnFamilyHandle* messages,
                                rocksdb::ColumnFamilyHandle* objects,
-                               std::unique_ptr<ObjectFileStore> object_files,
                                StorageFaultInjector fault_injector)
     : db_(std::move(db)),
       meta_(meta),
       messages_(messages),
       objects_(objects),
-      object_files_(std::move(object_files)),
       fault_injector_(std::move(fault_injector))
 {
 }
@@ -474,10 +437,17 @@ Result<std::unique_ptr<UnifiedStorage>> UnifiedStorage::Open(
         return Status(grpc::StatusCode::INVALID_ARGUMENT, "storage path must not be empty");
     }
 
-    if (IsNewStorageRoot(path)) {
-        Status status = InitializeNew(path, fault_injector);
-        if (!status.ok()) {
-            return status;
+    const bool create_new = IsNewStorageRoot(path);
+    const auto db_path = DatabasePath(path);
+    const auto objects_path = ObjectsPath(path);
+    if (create_new) {
+        for (const auto& directory : {db_path, objects_path}) {
+            std::error_code ec;
+            std::filesystem::create_directories(directory, ec);
+            if (ec) {
+                return Status(grpc::StatusCode::UNAVAILABLE,
+                              "create storage directory " + directory.string() + ": " + ec.message());
+            }
         }
     }
 
@@ -486,88 +456,18 @@ Result<std::unique_ptr<UnifiedStorage>> UnifiedStorage::Open(
         return layout_status;
     }
 
-    const std::filesystem::path db_path = DatabasePath(path);
-    std::vector<std::string> column_families;
-    rocksdb::Options options;
-    rocksdb::Status list_status = rocksdb::DB::ListColumnFamilies(options, db_path.string(), &column_families);
-    if (!list_status.ok()) {
-        return RocksToStatus(list_status, "list storage column families");
-    }
-    const std::set<std::string> names(column_families.begin(), column_families.end());
-    const std::set<std::string> supported{
-        rocksdb::kDefaultColumnFamilyName, kMessagesColumnFamily, kObjectsColumnFamily};
-    if (names != supported) {
-        return Status(grpc::StatusCode::INTERNAL, "unsupported storage column family layout");
-    }
-    return OpenExisting(path, std::move(fault_injector));
-}
-
-Status UnifiedStorage::InitializeNew(const std::string& path, const StorageFaultInjector& fault_injector)
-{
-    Status directory_status = CreateStorageDirectories(path);
-    if (!directory_status.ok()) {
-        return directory_status;
+    if (!create_new) {
+        Status status = ValidateColumnFamilies(db_path);
+        if (!status.ok()) {
+            return status;
+        }
     }
 
-    const std::string db_path = DatabasePath(path).string();
-    rocksdb::Options options;
-    options.create_if_missing = true;
-    rocksdb::DB* raw_db = nullptr;
-    rocksdb::Status open_status = rocksdb::DB::Open(options, db_path, &raw_db);
-    if (!open_status.ok()) {
-        return RocksToStatus(open_status, "create storage");
-    }
-    std::unique_ptr<rocksdb::DB> db(raw_db);
-
-    rocksdb::ColumnFamilyHandle* messages = nullptr;
-    rocksdb::Status status =
-        db->CreateColumnFamily(rocksdb::ColumnFamilyOptions(), kMessagesColumnFamily, &messages);
-    if (!status.ok()) {
-        return RocksToStatus(status, "create messages column family");
-    }
-    rocksdb::ColumnFamilyHandle* objects = nullptr;
-    status = db->CreateColumnFamily(rocksdb::ColumnFamilyOptions(), kObjectsColumnFamily, &objects);
-    if (!status.ok()) {
-        db->DestroyColumnFamilyHandle(messages);
-        return RocksToStatus(status, "create objects column family");
-    }
-
-    rocksdb::WriteBatch batch;
-    batch.Put(kSchemaVersionKey, EncodeUint64(kSchemaVersion));
-    batch.Put(kMaxSeqKey, EncodeUint64(uint64_t{0}));
-    batch.Put(kNextUuidKey, EncodeUint64(uint64_t{1}));
-    batch.Put(kNextChannelIdKey, EncodeUint64(uint64_t{1}));
-    batch.Put(kNextObjectIdKey, EncodeUint64(uint64_t{1}));
-    batch.Put(NumericKey(kUuidPrefix, 0), EncodeUint64(0));
-    batch.Put(messages, NumericKey(kMessagePrefix, 0), InitializationMessage().SerializeAsString());
-    Status injected = InjectStorageFault(fault_injector, StorageFaultPoint::kBeforeInitializationCommit);
-    Status init_status = injected.ok()
-                             ? RocksToStatus(db->Write(SynchronousWriteOptions(), &batch),
-                                             "finish storage initialization")
-                             : injected;
-    if (init_status.ok()) {
-        // The complete initial state is durably committed. Initialization is complete.
-        init_status = InjectStorageFault(fault_injector, StorageFaultPoint::kAfterInitializationCommit);
-    }
-    rocksdb::Status objects_destroy = db->DestroyColumnFamilyHandle(objects);
-    rocksdb::Status messages_destroy = db->DestroyColumnFamilyHandle(messages);
-    if (!init_status.ok()) {
-        return init_status;
-    }
-    if (!objects_destroy.ok()) {
-        return RocksToStatus(objects_destroy, "destroy objects column family handle");
-    }
-    if (!messages_destroy.ok()) {
-        return RocksToStatus(messages_destroy, "destroy messages column family handle");
-    }
-    return Status::Ok();
-}
-
-Result<std::unique_ptr<UnifiedStorage>> UnifiedStorage::OpenExisting(
-    const std::string& root_path,
-    StorageFaultInjector fault_injector)
-{
     rocksdb::DBOptions options;
+    options.wal_recovery_mode = rocksdb::WALRecoveryMode::kTolerateCorruptedTailRecords;
+    options.create_if_missing = create_new;
+    options.create_missing_column_families = create_new;
+    options.error_if_exists = create_new;
     std::vector<rocksdb::ColumnFamilyDescriptor> descriptors{
         {rocksdb::kDefaultColumnFamilyName, rocksdb::ColumnFamilyOptions()},
         {kMessagesColumnFamily, rocksdb::ColumnFamilyOptions()},
@@ -576,29 +476,28 @@ Result<std::unique_ptr<UnifiedStorage>> UnifiedStorage::OpenExisting(
     std::vector<rocksdb::ColumnFamilyHandle*> handles;
     rocksdb::DB* raw_db = nullptr;
     rocksdb::Status open_status = rocksdb::DB::Open(
-        options, DatabasePath(root_path).string(), descriptors, &handles, &raw_db);
+        options, db_path.string(), descriptors, &handles, &raw_db);
     if (!open_status.ok()) {
-        return RocksToStatus(open_status, "open unified storage");
-    }
-    if (handles.size() != 3) {
-        std::unique_ptr<rocksdb::DB> db(raw_db);
-        DestroyHandles(db.get(), &handles);
-        return Status(grpc::StatusCode::INTERNAL, "unified storage column family count mismatch");
+        return RocksToStatus(open_status, create_new ? "create storage" : "open unified storage");
     }
 
-    auto object_files = ObjectFileStore::Open(ObjectsPath(root_path).string(), fault_injector);
-    if (!object_files.ok()) {
-        std::unique_ptr<rocksdb::DB> db(raw_db);
-        DestroyHandles(db.get(), &handles);
-        return object_files.status();
-    }
     auto storage = std::unique_ptr<UnifiedStorage>(new UnifiedStorage(
         std::unique_ptr<rocksdb::DB>(raw_db),
         handles[0],
         handles[1],
         handles[2],
-        std::move(object_files.value()),
         std::move(fault_injector)));
+    if (create_new) {
+        Status status = storage->WriteInitialState();
+        if (!status.ok()) {
+            return status;
+        }
+    }
+    auto object_files = ObjectFileStore::Open(objects_path.string(), storage->fault_injector_);
+    if (!object_files.ok()) {
+        return object_files.status();
+    }
+    storage->object_files_ = std::move(object_files.value());
     Status validation = storage->Validate();
     if (!validation.ok()) {
         return validation;
@@ -608,6 +507,26 @@ Result<std::unique_ptr<UnifiedStorage>> UnifiedStorage::OpenExisting(
         return recovery;
     }
     return storage;
+}
+
+Status UnifiedStorage::WriteInitialState()
+{
+    rocksdb::WriteBatch batch;
+    batch.Put(kMaxSeqKey, EncodeUint64(uint64_t{0}));
+    batch.Put(kNextUuidKey, EncodeUint64(uint64_t{1}));
+    batch.Put(kNextChannelIdKey, EncodeUint64(uint64_t{1}));
+    batch.Put(kNextObjectIdKey, EncodeUint64(uint64_t{1}));
+    batch.Put(NumericKey(kUuidPrefix, 0), EncodeUint64(0));
+    batch.Put(messages_, NumericKey(kMessagePrefix, 0), InitializationMessage().SerializeAsString());
+    Status injected = InjectStorageFault(fault_injector_, StorageFaultPoint::kBeforeInitializationCommit);
+    if (!injected.ok()) {
+        return injected;
+    }
+    auto status = db_->Write(SynchronousWriteOptions(), &batch);
+    if (!status.ok()) {
+        return RocksToStatus(status, "finish storage initialization");
+    }
+    return InjectStorageFault(fault_injector_, StorageFaultPoint::kAfterInitializationCommit);
 }
 
 Result<ReadSnapshot> UnifiedStorage::CreateSnapshot() const
@@ -718,31 +637,39 @@ Result<bool> UnifiedStorage::HasToken(const ReadSnapshot& snapshot, uint64_t pri
     return true;
 }
 
-Result<std::optional<ChannelInfo>> UnifiedStorage::GetChannel(const ReadSnapshot& snapshot, uint64_t channel_id) const
+UnifiedStorage::ChannelLookupResult UnifiedStorage::GetChannel(const ReadSnapshot& snapshot,
+                                                              uint64_t channel_id) const
 {
     rocksdb::ReadOptions options;
     options.snapshot = snapshot.snapshot_;
-    std::string value;
+    rocksdb::PinnableSlice value;
     rocksdb::Status status = db_->Get(options, meta_, NumericKey(kChannelPrefix, channel_id), &value);
-    if (status.IsNotFound()) {
-        return std::optional<ChannelInfo>{};
-    }
-    if (!status.ok()) {
-        return RocksToStatus(status, "read channel");
-    }
-    ChannelInfo channel;
-    if (!channel.ParseFromString(value) || channel.channel_id() != channel_id || !ValidStoredChannel(channel)) {
-        return Status::StorageCorruption("read channel", "invalid stored channel");
-    }
-    return std::optional<ChannelInfo>{std::move(channel)};
+    return DecodeChannelLookup(status, value, channel_id);
 }
 
-Result<std::vector<ChannelInfo>> UnifiedStorage::ListChannels(const ReadSnapshot& snapshot) const
+Status UnifiedStorage::CheckChannels(
+    const ReadSnapshot& snapshot, const std::vector<uint64_t>& channel_ids,
+    const std::function<Status(const std::optional<ChannelInfo>&)>& check) const
+{
+    Status read_error;
+    Status check_error;
+    MultiGetById(*db_, snapshot.snapshot_, meta_, kChannelPrefix, channel_ids, DecodeChannelLookup,
+                 [&](const ChannelLookupResult& result) {
+                     if (!result.ok()) {
+                         RetainReadError(read_error, result.status());
+                     } else if (read_error.ok() && check_error.ok()) {
+                         check_error = check(result.value());
+                     }
+                 });
+    return read_error.ok() ? check_error : read_error;
+}
+
+Status UnifiedStorage::ScanChannels(const ReadSnapshot& snapshot,
+                                    const std::function<void(ChannelInfo&&)>& visit) const
 {
     rocksdb::ReadOptions options;
     options.snapshot = snapshot.snapshot_;
     std::unique_ptr<rocksdb::Iterator> it(db_->NewIterator(options, meta_));
-    std::vector<ChannelInfo> channels;
     for (it->Seek(kChannelPrefix); it->Valid() && it->key().starts_with(kChannelPrefix); it->Next()) {
         auto channel_id = DecodeNumericKey(it->key(), kChannelPrefix, "channel");
         if (!channel_id.ok()) {
@@ -753,12 +680,9 @@ Result<std::vector<ChannelInfo>> UnifiedStorage::ListChannels(const ReadSnapshot
             !ValidStoredChannel(channel)) {
             return Status::StorageCorruption("list channels", "invalid stored channel");
         }
-        channels.push_back(std::move(channel));
+        visit(std::move(channel));
     }
-    if (!it->status().ok()) {
-        return RocksToStatus(it->status(), "list channels");
-    }
-    return channels;
+    return RocksToStatus(it->status(), "list channels");
 }
 
 Result<uint64_t> UnifiedStorage::ScanMessages(const ReadSnapshot& snapshot,
@@ -790,8 +714,11 @@ Result<uint64_t> UnifiedStorage::ScanMessages(const ReadSnapshot& snapshot,
             break;
         }
 
+        const rocksdb::Slice value = it->value();
         EventMessage message;
-        if (!message.ParseFromString(it->value().ToString()) || message.seq() != seq.value()) {
+        if (value.size() > std::numeric_limits<int>::max() ||
+            !message.ParseFromArray(value.data(), static_cast<int>(value.size())) ||
+            message.seq() != seq.value()) {
             return Status::StorageCorruption("scan messages", "invalid stored message");
         }
         if (seq.value() == 0 ? !ValidInitializationMessage(message)
@@ -811,7 +738,7 @@ Result<uint64_t> UnifiedStorage::ScanMessages(const ReadSnapshot& snapshot,
                         })) {
             return Status::StorageCorruption("scan messages", "invalid stored message object reference");
         }
-        auto action = visitor(message);
+        auto action = visitor(std::move(message));
         if (!action.ok()) {
             return action.status();
         }
@@ -836,83 +763,47 @@ Result<uint64_t> UnifiedStorage::ScanMessages(const ReadSnapshot& snapshot,
     return next_seq;
 }
 
-Result<std::optional<StoredObject>> UnifiedStorage::GetObject(const ReadSnapshot& snapshot,
+Result<std::optional<ObjectRecord>> UnifiedStorage::GetObject(const ReadSnapshot& snapshot,
                                                               const char* prefix,
                                                               uint64_t object_id) const
 {
     rocksdb::ReadOptions options;
     options.snapshot = snapshot.snapshot_;
-    std::string value;
+    rocksdb::PinnableSlice value;
     rocksdb::Status status = db_->Get(options, objects_, NumericKey(prefix, object_id), &value);
-    if (status.IsNotFound()) {
-        return std::optional<StoredObject>{};
-    }
-    if (!status.ok()) {
-        return RocksToStatus(status, "read object metadata");
-    }
-    auto object = ParseObject(value, object_id);
-    if (!object.ok()) {
-        return object.status();
-    }
-    return std::optional<StoredObject>{std::move(object.value())};
+    return DecodeObjectLookup(status, value, object_id);
 }
 
-Result<std::optional<StoredObject>> UnifiedStorage::GetPreparingObject(const ReadSnapshot& snapshot,
+Result<std::optional<ObjectRecord>> UnifiedStorage::GetPreparingObject(const ReadSnapshot& snapshot,
                                                                        uint64_t object_id) const
 {
     return GetObject(snapshot, kPreparingObjectPrefix, object_id);
 }
 
-Result<std::optional<StoredObject>> UnifiedStorage::GetCommittedObject(const ReadSnapshot& snapshot,
+Result<std::optional<ObjectRecord>> UnifiedStorage::GetCommittedObject(const ReadSnapshot& snapshot,
                                                                        uint64_t object_id) const
 {
     return GetObject(snapshot, kCommittedObjectPrefix, object_id);
 }
 
-Result<std::vector<std::optional<StoredObject>>> UnifiedStorage::GetCommittedObjects(
+std::vector<UnifiedStorage::ObjectLookupResult> UnifiedStorage::GetCommittedObjects(
     const ReadSnapshot& snapshot,
     const std::vector<uint64_t>& object_ids) const
 {
-    if (object_ids.empty()) {
-        return std::vector<std::optional<StoredObject>>{};
-    }
+    std::vector<ObjectLookupResult> results;
+    results.reserve(object_ids.size());
+    MultiGetById(*db_, snapshot.snapshot_, objects_, kCommittedObjectPrefix, object_ids, DecodeObjectLookup,
+                 [&](ObjectLookupResult&& result) { results.push_back(std::move(result)); });
+    return results;
+}
 
-    std::vector<std::string> keys;
-    keys.reserve(object_ids.size());
-    for (uint64_t object_id : object_ids) {
-        keys.push_back(NumericKey(kCommittedObjectPrefix, object_id));
+Status UnifiedStorage::MostSevereReadError(const std::vector<ObjectLookupResult>& results)
+{
+    Status selected;
+    for (const auto& result : results) {
+        RetainReadError(selected, result.status());
     }
-
-    std::vector<rocksdb::Slice> key_slices;
-    key_slices.reserve(keys.size());
-    for (const auto& key : keys) {
-        key_slices.emplace_back(key);
-    }
-
-    rocksdb::ReadOptions options;
-    options.snapshot = snapshot.snapshot_;
-    std::vector<rocksdb::ColumnFamilyHandle*> column_families(object_ids.size(), objects_);
-    std::vector<std::string> values;
-    std::vector<rocksdb::Status> statuses =
-        db_->MultiGet(options, column_families, key_slices, &values);
-
-    std::vector<std::optional<StoredObject>> objects;
-    objects.reserve(object_ids.size());
-    for (size_t i = 0; i < object_ids.size(); ++i) {
-        if (statuses[i].IsNotFound()) {
-            objects.emplace_back(std::nullopt);
-            continue;
-        }
-        if (!statuses[i].ok()) {
-            return RocksToStatus(statuses[i], "read object metadata");
-        }
-        auto object = ParseObject(values[i], object_ids[i]);
-        if (!object.ok()) {
-            return object.status();
-        }
-        objects.emplace_back(std::move(object.value()));
-    }
-    return objects;
+    return selected;
 }
 
 Status UnifiedStorage::SetMaxSeq(rocksdb::WriteBatch* batch, uint64_t seq) const
@@ -982,24 +873,24 @@ void UnifiedStorage::DeleteToken(rocksdb::WriteBatch* batch, uint64_t principal,
     batch->Delete(meta_, TokenKey(principal, token));
 }
 
-Status UnifiedStorage::PutPreparingObject(rocksdb::WriteBatch* batch, const StoredObject& object) const
+Status UnifiedStorage::PutPreparingObject(rocksdb::WriteBatch* batch, const ObjectRecord& object) const
 {
     auto payload = SerializeObject(object);
     if (!payload.ok()) {
         return payload.status();
     }
-    batch->Put(objects_, NumericKey(kPreparingObjectPrefix, object.object_id), payload.value());
+    batch->Put(objects_, NumericKey(kPreparingObjectPrefix, object.object_id()), payload.value());
     return Status::Ok();
 }
 
-Status UnifiedStorage::PutCommittedObject(rocksdb::WriteBatch* batch, const StoredObject& object) const
+Status UnifiedStorage::PutCommittedObject(rocksdb::WriteBatch* batch, const ObjectRecord& object) const
 {
     auto payload = SerializeObject(object);
     if (!payload.ok()) {
         return payload.status();
     }
-    batch->Delete(objects_, NumericKey(kPreparingObjectPrefix, object.object_id));
-    batch->Put(objects_, NumericKey(kCommittedObjectPrefix, object.object_id), payload.value());
+    batch->Delete(objects_, NumericKey(kPreparingObjectPrefix, object.object_id()));
+    batch->Put(objects_, NumericKey(kCommittedObjectPrefix, object.object_id()), payload.value());
     return Status::Ok();
 }
 
@@ -1013,22 +904,22 @@ Status UnifiedStorage::WriteObjectFile(uint64_t object_id, const std::string& da
     return object_files_->Write(object_id, data);
 }
 
-Status UnifiedStorage::CleanupObjectFiles(uint64_t object_id) const
+Status UnifiedStorage::CleanupObjectFile(uint64_t object_id) const
 {
     return object_files_->Cleanup(object_id);
 }
 
-Result<std::string> UnifiedStorage::ReadObjectFile(const StoredObject& object,
+Result<std::string> UnifiedStorage::ReadObjectFile(const ObjectRecord& object,
                                                    uint64_t offset,
                                                    uint64_t nbytes) const
 {
-    return object_files_->ReadRange(object.object_id, object.nbytes, offset, nbytes);
+    return object_files_->ReadRange(object.object_id(), object.nbytes(), offset, nbytes);
 }
 
-Result<std::vector<StoredObject>> UnifiedStorage::ListPreparingObjects() const
+Result<std::vector<uint64_t>> UnifiedStorage::ListPreparingObjectIds() const
 {
     std::unique_ptr<rocksdb::Iterator> it(db_->NewIterator(rocksdb::ReadOptions(), objects_));
-    std::vector<StoredObject> objects;
+    std::vector<uint64_t> ids;
     for (it->Seek(kPreparingObjectPrefix);
          it->Valid() && it->key().starts_with(kPreparingObjectPrefix);
          it->Next()) {
@@ -1036,25 +927,26 @@ Result<std::vector<StoredObject>> UnifiedStorage::ListPreparingObjects() const
         if (!object_id.ok()) {
             return object_id.status();
         }
-        auto object = ParseObject(it->value().ToString(), object_id.value());
+        auto object = ParseObject(it->value(), object_id.value());
         if (!object.ok()) {
             return object.status();
         }
-        objects.push_back(std::move(object.value()));
+        ids.push_back(object_id.value());
     }
     if (!it->status().ok()) {
         return RocksToStatus(it->status(), "list preparing objects");
     }
-    return objects;
+    return ids;
 }
 
 Status UnifiedStorage::RecoverPreparingObjects()
 {
-    auto objects = ListPreparingObjects();
-    if (!objects.ok()) {
-        return objects.status();
+    auto ids = ListPreparingObjectIds();
+    if (!ids.ok()) {
+        return ids.status();
     }
-    if (objects.value().empty()) {
+    const auto& object_ids = ids.value();
+    if (object_ids.empty()) {
         return Status::Ok();
     }
     {
@@ -1063,8 +955,8 @@ Status UnifiedStorage::RecoverPreparingObjects()
             return snapshot_result.status();
         }
         ReadSnapshot snapshot = std::move(snapshot_result.value());
-        for (const auto& object : objects.value()) {
-            auto committed = GetCommittedObject(snapshot, object.object_id);
+        for (uint64_t object_id : object_ids) {
+            auto committed = GetCommittedObject(snapshot, object_id);
             if (!committed.ok()) {
                 return committed.status();
             }
@@ -1074,18 +966,13 @@ Status UnifiedStorage::RecoverPreparingObjects()
             }
         }
     }
-    std::vector<uint64_t> object_ids;
-    object_ids.reserve(objects.value().size());
-    for (const auto& object : objects.value()) {
-        object_ids.push_back(object.object_id);
-    }
     Status file_cleanup = object_files_->Cleanup(object_ids);
     if (!file_cleanup.ok()) {
         return file_cleanup;
     }
     rocksdb::WriteBatch batch;
-    for (const auto& object : objects.value()) {
-        DeletePreparingObject(&batch, object.object_id);
+    for (uint64_t object_id : object_ids) {
+        DeletePreparingObject(&batch, object_id);
     }
     return Commit(&batch);
 }
@@ -1100,13 +987,6 @@ Status UnifiedStorage::Validate() const
 
     rocksdb::ReadOptions options;
     options.snapshot = snapshot.snapshot_;
-    auto schema = GetRequiredUint64(snapshot, kSchemaVersionKey);
-    if (!schema.ok()) {
-        return schema.status();
-    }
-    if (schema.value() != kSchemaVersion) {
-        return Status::StorageCorruption("validate storage", "unsupported storage schema version");
-    }
     auto max_seq = GetMaxSeq(snapshot);
     if (!max_seq.ok()) {
         return max_seq.status();
